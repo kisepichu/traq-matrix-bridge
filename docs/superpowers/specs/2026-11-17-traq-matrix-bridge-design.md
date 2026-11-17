@@ -150,6 +150,8 @@ traQ の WebSocket は event ごとに届く相手が違う。
 - **今読んでいるチャンネル**: Matrix で read receipt (または message の送信、reaction の追加・取り消し) があった room のチャンネルに
   `viewstate:<channel>:monitoring` を送る。そのチャンネルの編集・削除・スタンプは WebSocket で届く。
   `view_idle_timeout` の間 Matrix で操作が無ければ `viewstate:null` を送る (traQ の閲覧者の表示に残り続けない)。
+  viewstate を別のチャンネルに向けた (再接続で送り直したときも) 直後に、そのチャンネルを 1 回だけ下の poller と
+  同じ方法で読む (200ms 空けてから)。向ける前のスタンプの変更は WebSocket で届かず、閲覧中は poller も読まないため。
 - **それ以外のチャンネル** (poller): 新着は全部 bridge に届くので、bridge は portal ごとの最終書き込み時刻を
   知っている (起動時は database の最新 message から、その後は受け取った event から)。`poll.interval` ごとに、
   最終書き込みが `poll.window` 内で、今 viewstate を向けていない portal を新しい順に最大 `poll.max_channels` 件選び、

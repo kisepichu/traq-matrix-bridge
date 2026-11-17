@@ -82,6 +82,9 @@ type TraQClient struct {
 	running *session // the last session started by Connect; nil before the first Connect
 
 	view *viewState // the channel traQ is told the user is viewing
+	// viewPolls holds the channel the viewstate last switched to, for the poll loop to poll once (see
+	// requestViewPoll). Size 1.
+	viewPolls chan string
 	// resyncs paces the portal resyncs of the running session; nil between sessions.
 	resyncs atomic.Pointer[resyncPacer]
 

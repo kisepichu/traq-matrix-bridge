@@ -18,10 +18,15 @@ const viewStateTickInterval = 30 * time.Second
 //
 // The lock is held while send runs, so the channel sent last is always the one Current reports; send must
 // therefore return in bounded time.
+//
+// Stamps changed in a channel before it became the viewed one were never sent on the WebSocket, and the poller
+// leaves the viewed channel alone, so switched is called, under the lock (it must not block), each time a send
+// makes a channel the viewed one; the client then polls that channel once.
 type viewState struct {
-	idle time.Duration
-	send func(ctx context.Context, channelID string) error
-	now  func() time.Time
+	idle     time.Duration
+	send     func(ctx context.Context, channelID string) error
+	now      func() time.Time
+	switched func(channelID string) // may be nil
 
 	mu           sync.Mutex
 	current      string    // the channel traQ was last told about, "" if none
@@ -29,8 +34,8 @@ type viewState struct {
 	lastActivity time.Time // time of the last Touch
 }
 
-func newViewState(idle time.Duration, send func(ctx context.Context, channelID string) error, now func() time.Time) *viewState {
-	return &viewState{idle: idle, send: send, now: now}
+func newViewState(idle time.Duration, send func(ctx context.Context, channelID string) error, now func() time.Time, switched func(channelID string)) *viewState {
+	return &viewState{idle: idle, send: send, now: now, switched: switched}
 }
 
 // Touch records Matrix activity in channelID and makes it the viewed channel if it is not already. A failed
@@ -99,6 +104,9 @@ func (v *viewState) sendLocked(ctx context.Context, channelID string) bool {
 		return false
 	}
 	zerolog.Ctx(ctx).Debug().Str("traq_channel_id", channelID).Msg("Sent the traQ viewstate")
+	if channelID != "" && channelID != v.current && v.switched != nil {
+		v.switched(channelID)
+	}
 	v.current = channelID
 	return true
 }
