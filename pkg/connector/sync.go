@@ -153,8 +153,18 @@ func channelLogContext(ch channelInfo) func(zerolog.Context) zerolog.Context {
 	return func(c zerolog.Context) zerolog.Context { return c.Str("traq_channel_id", ch.ID) }
 }
 
-// queue queues evt and reports whether bridgev2 accepted it.
+// queue queues evt and reports whether bridgev2 accepted it. A resync of evt's portal that the session's
+// resyncPacer still holds is queued first, so that the portal handles it before evt.
 func (c *TraQClient) queue(evt bridgev2.RemoteEvent) bool {
+	if p := c.resyncs.Load(); p != nil {
+		p.flush(ChannelID(evt.GetPortalKey()))
+	}
+	return c.queueNow(evt)
+}
+
+// queueNow queues evt without waiting for its portal's resync: for the resync itself, and what is queued in
+// its place or right after it.
+func (c *TraQClient) queueNow(evt bridgev2.RemoteEvent) bool {
 	res := c.Login.QueueRemoteEvent(evt)
 	if res.Error != nil {
 		c.Login.Log.Err(res.Error).Stringer("event_type", evt.GetType()).Msg("Failed to queue remote event")
@@ -164,15 +174,16 @@ func (c *TraQClient) queue(evt bridgev2.RemoteEvent) bool {
 }
 
 // queueResync queues the ChatResync that creates the portal of ch or updates its info, and reports whether
-// it was queued. Every portal resync is built here. A non-nil needsBackfill makes bridgev2 check, on an
-// existing room, whether to fetch the messages after the newest bridged one (see newerMessages).
+// it was queued. Every portal resync is built here; the syncs go through addResync to be paced. A non-nil
+// needsBackfill makes bridgev2 check, on an existing room, whether to fetch the messages after the newest
+// bridged one (see newerMessages).
 func (c *TraQClient) queueResync(ctx context.Context, ch channelInfo, needsBackfill backfillCheck) bool {
 	info, err := c.chatInfo(ctx, ch)
 	if err != nil {
 		c.Login.Log.Err(err).Str("traq_channel_id", ch.ID).Msg("Failed to build chat info")
 		return false
 	}
-	return c.queue(&simplevent.ChatResync{
+	return c.queueNow(&simplevent.ChatResync{
 		EventMeta: simplevent.EventMeta{
 			Type:         bridgev2.RemoteEventChatResync,
 			LogContext:   channelLogContext(ch),
@@ -184,10 +195,38 @@ func (c *TraQClient) queueResync(ctx context.Context, ch channelInfo, needsBackf
 	})
 }
 
-// queueLeave queues a ChatDelete that removes this login from the portal. bridgev2 deletes the room when
-// no other login is in it.
+// addResync hands a resync to the session's resyncPacer. Outside a session it is queued at once.
+func (c *TraQClient) addResync(ctx context.Context, r pendingResync) {
+	if p := c.resyncs.Load(); p != nil {
+		p.add(r)
+		return
+	}
+	c.runResync(ctx, &r)
+}
+
+// runResync is the resyncPacer's run function: it queues the resync, then its after events. If the resync
+// cannot be queued, neither are they, and the resync is reverted.
+func (c *TraQClient) runResync(ctx context.Context, r *pendingResync) {
+	if !c.queueResync(ctx, r.ch, r.needsBackfill) {
+		if r.revert != nil {
+			r.revert()
+		}
+		return
+	}
+	c.Login.Log.Debug().Str("traq_channel_id", r.ch.ID).Bool("check_backfill", r.needsBackfill != nil).
+		Msg("Queued a portal resync")
+	for _, evt := range r.after {
+		c.queueNow(evt)
+	}
+}
+
+// queueLeave queues a ChatDelete that removes this login from the portal, instead of a resync still waiting
+// for it. bridgev2 deletes the room when no other login is in it.
 func (c *TraQClient) queueLeave(key networkid.PortalKey) {
-	c.queue(&simplevent.ChatDelete{
+	if p := c.resyncs.Load(); p != nil {
+		p.drop(ChannelID(key))
+	}
+	c.queueNow(&simplevent.ChatDelete{
 		EventMeta: simplevent.EventMeta{
 			Type:      bridgev2.RemoteEventChatDelete,
 			PortalKey: key,
@@ -196,16 +235,45 @@ func (c *TraQClient) queueLeave(key networkid.PortalKey) {
 	})
 }
 
-// initialSync brings the portals in line with the snapshot loaded by Connect: it creates or updates every
-// target portal, leaves the portals of this login that are no longer targets, and marks the targets that
-// have no unread messages as read. Each portal's event loop is serial, so the receipt is handled after the
-// resync. Targets whose resync could not be queued are dropped from c.targets, so the next subscription sync
-// retries them.
+// hasRoom reports whether a portal has a Matrix room. A failed lookup is logged and counts as a room, so that
+// nothing is skipped because of it.
+func (c *TraQClient) hasRoom(ctx context.Context, key networkid.PortalKey) bool {
+	portal, err := c.Login.Bridge.GetExistingPortalByKey(ctx, key)
+	if err != nil {
+		if ctx.Err() == nil {
+			c.Login.Log.Err(err).Stringer("portal_key", key).Msg("Failed to get portal")
+		}
+		return true
+	}
+	return portal != nil && portal.MXID != ""
+}
+
+// hasBridgedMessages reports whether a target channel had a bridged message when the session started (see
+// loadLastActivity) or got one since.
+func (c *TraQClient) hasBridgedMessages(channelID string) bool {
+	c.stateMu.RLock()
+	defer c.stateMu.RUnlock()
+	_, ok := c.lastActivity[channelID]
+	return ok
+}
+
+// initialSync brings the portals in line with the snapshot loaded by Connect: it resyncs the target portals,
+// leaves the portals of this login that are no longer targets, and marks the targets that have no unread
+// messages as read. The resyncs are paced (see resyncPacer); the receipt of a portal is queued right after
+// its resync, which its serial event loop then handles first. Targets whose resync could not be queued are
+// dropped from c.targets, so the next subscription sync retries them. The receipt is left out for portals
+// without a bridged message: there is nothing to mark, and the backfill of a new room marks its own read state.
+//
+// A DM gets its room lazily: traQ creates a DM channel as soon as someone opens the DM page, so most of them
+// are empty. A DM without a room is resynced, which creates the room with its history, only if it has unread
+// messages (traQ tracks the unread messages of every DM); the others stay targets, and their first message
+// creates the room (queueMessage).
 //
 // The resyncs of the channels that may have messages posted while the bridge was not running (see
 // catchUpChannels; every target when the activity timeline cannot be read) carry newerMessages, so bridgev2
-// fetches those messages into existing rooms. They are queued before the WebSocket is read, so each portal
-// handles its catch-up before any live message.
+// fetches those messages into existing rooms. They are added before the WebSocket is read, and every other
+// event of a portal waits for its resync (see queue), so each portal handles its catch-up before any live
+// message.
 func (c *TraQClient) initialSync(ctx context.Context, me *traq.Me, targets map[string]channelInfo, unread []traq.UnreadChannel) {
 	log := c.Login.Log
 	ids := make([]string, 0, len(targets))
@@ -218,19 +286,42 @@ func (c *TraQClient) initialSync(ctx context.Context, me *traq.Me, targets map[s
 	if checkAll && ctx.Err() == nil {
 		log.Warn().Err(err).Msg("Failed to get the activity timeline, checking every channel for messages missed while stopped")
 	}
+	hasUnread := make(map[string]struct{}, len(unread))
+	for _, u := range unread {
+		hasUnread[u.ChannelID] = struct{}{}
+	}
+	now := time.Now()
 	keys := make(map[networkid.PortalKey]struct{}, len(ids))
-	var failed []channelInfo
+	resyncs, lazyDMs := 0, 0
 	for _, id := range ids {
 		ch := targets[id]
-		keys[c.portalKey(ch)] = struct{}{}
-		var needsBackfill backfillCheck
+		key := c.portalKey(ch)
+		keys[key] = struct{}{}
+		_, isUnread := hasUnread[id]
+		if ch.isDM() && !isUnread && !c.hasRoom(ctx, key) {
+			lazyDMs++
+			continue
+		}
+		r := pendingResync{ch: ch, revert: func() { c.revertTargets(nil, []channelInfo{ch}) }}
 		if _, ok := catchUp[id]; ok || checkAll {
-			needsBackfill = c.newerMessages(id)
+			r.needsBackfill = c.newerMessages(id)
 		}
-		if !c.queueResync(ctx, ch, needsBackfill) {
-			failed = append(failed, ch)
+		if !isUnread && c.hasBridgedMessages(id) {
+			r.after = append(r.after, &simplevent.Receipt{
+				EventMeta: simplevent.EventMeta{
+					Type:       bridgev2.RemoteEventReadReceipt,
+					LogContext: channelLogContext(ch),
+					PortalKey:  key,
+					Sender:     c.selfSender(me),
+				},
+				ReadUpTo: now,
+			})
 		}
+		c.addResync(ctx, r)
+		resyncs++
 	}
+	log.Info().Int("resyncs", resyncs).Int("dms_without_room", lazyDMs).Stringer("gap", resyncGap).
+		Msg("Syncing the portals, paced")
 
 	userPortals, err := c.Login.Bridge.DB.UserPortal.GetAllForLogin(ctx, c.Login.UserLogin)
 	if err != nil {
@@ -251,36 +342,14 @@ func (c *TraQClient) initialSync(ctx context.Context, me *traq.Me, targets map[s
 		log.Debug().Stringer("portal_key", up.Portal).Msg("Leaving portal that is no longer subscribed")
 		c.queueLeave(up.Portal)
 	}
-
-	hasUnread := make(map[string]struct{}, len(unread))
-	for _, u := range unread {
-		hasUnread[u.ChannelID] = struct{}{}
-	}
-	now := time.Now()
-	for _, id := range ids {
-		if _, ok := hasUnread[id]; ok {
-			continue
-		}
-		ch := targets[id]
-		c.queue(&simplevent.Receipt{
-			EventMeta: simplevent.EventMeta{
-				Type:       bridgev2.RemoteEventReadReceipt,
-				LogContext: channelLogContext(ch),
-				PortalKey:  c.portalKey(ch),
-				Sender:     c.selfSender(me),
-			},
-			ReadUpTo: now,
-		})
-	}
-	// Last, because targets is c.targets and the loops above read it.
-	c.revertTargets(nil, failed)
 }
 
-// syncSubscriptions re-reads the channels and subscriptions and queues only what changed. Upserts that could
-// not be queued are reverted in c.targets, so the next sync emits them again. Removals that look like a bad
-// answer from traQ are held back (see holdRemovals): those channels stay in c.targets, so the next sync emits
-// them again. It runs on the subscription sync loop (periodically, and when the event worker sees a channel
-// change); syncMu serializes it with the worker's CHANNEL_CREATED handling.
+// syncSubscriptions re-reads the channels and subscriptions and queues only what changed. The upserts are
+// paced (see resyncPacer); one that cannot be queued is reverted in c.targets, so the next sync emits it again.
+// A new DM gets no room until its first message (see initialSync). Removals that look like a bad answer from
+// traQ are held back (see holdRemovals): those channels stay in c.targets, so the next sync emits them again.
+// It runs on the subscription sync loop (periodically, and when the event worker sees a channel change);
+// syncMu serializes it with the worker's CHANNEL_CREATED handling.
 func (c *TraQClient) syncSubscriptions(ctx context.Context) error {
 	c.syncMu.Lock()
 	defer c.syncMu.Unlock()
@@ -307,17 +376,21 @@ func (c *TraQClient) syncSubscriptions(ctx context.Context) error {
 			Msg("Not leaving the portals of many channels at once until the next subscription sync agrees")
 	}
 
-	var failed []channelInfo
 	for _, change := range changes {
+		ch := change.Channel
 		switch change.Kind {
 		case changeUpsert:
-			if !c.queueResync(ctx, change.Channel, nil) {
-				failed = append(failed, change.Channel)
+			if ch.isDM() && !c.hasRoom(ctx, c.portalKey(ch)) {
+				continue
 			}
+			prev := map[string]channelInfo{}
+			if p, ok := old[ch.ID]; ok {
+				prev[ch.ID] = p
+			}
+			c.addResync(ctx, pendingResync{ch: ch, revert: func() { c.revertTargets(prev, []channelInfo{ch}) }})
 		case changeRemove:
-			c.queueLeave(c.portalKey(change.Channel))
+			c.queueLeave(c.portalKey(ch))
 		}
 	}
-	c.revertTargets(old, failed)
 	return nil
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -81,6 +82,8 @@ type TraQClient struct {
 	running *session // the last session started by Connect; nil before the first Connect
 
 	view *viewState // the channel traQ is told the user is viewing
+	// resyncs paces the portal resyncs of the running session; nil between sessions.
+	resyncs atomic.Pointer[resyncPacer]
 
 	wsMu  sync.Mutex
 	ws    *traq.WSConn    // the open WebSocket connection, nil while disconnected
@@ -172,6 +175,9 @@ func (c *TraQClient) run(ctx context.Context) {
 // runLoops loads, syncs and runs the event worker and the subscription sync, viewstate, poll and WebSocket
 // loops until ctx ends. A loop that sees the token rejected cancels ctx through stop with errTokenRejected.
 func (c *TraQClient) runLoops(ctx context.Context, stop context.CancelCauseFunc) {
+	pacer := newResyncPacer(ctx, c.runResync)
+	c.resyncs.Store(pacer)
+	defer c.resyncs.CompareAndSwap(pacer, nil)
 	var wg sync.WaitGroup
 	defer wg.Wait()
 	defer stop(nil)
@@ -182,6 +188,8 @@ func (c *TraQClient) runLoops(ctx context.Context, stop context.CancelCauseFunc)
 	}
 	c.loadLastActivity(ctx, targets)
 	c.initialSync(ctx, me, targets, unread)
+	// After initialSync, which reads targets (c.targets) without the lock, and which a failed resync changes.
+	wg.Go(pacer.loop)
 	// One queue and one worker per session, so events are handled in the order traQ sent them, across
 	// reconnects too.
 	queue := make(chan traq.Event, eventQueueSize)

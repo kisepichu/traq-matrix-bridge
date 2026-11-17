@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 	"time"
 
@@ -64,13 +65,15 @@ func (c *TraQClient) catchUpCandidates(ctx context.Context, unread []traq.Unread
 	return set, err
 }
 
-// catchUp queues, after a reconnect, a ChatResync with newerMessages for each candidate channel that has a
-// Matrix room, so that bridgev2 fetches what was posted while the WebSocket was down. since is the time the
-// previous connection was lost, less catchUpMargin.
+// catchUp adds, after a reconnect, a resync with newerMessages for each candidate channel that has a Matrix
+// room, so that bridgev2 fetches what was posted while the WebSocket was down. A DM without a room that has
+// unread messages gets a resync that creates its room with its history, like at connect (see initialSync).
+// since is the time the previous connection was lost, less catchUpMargin.
 //
-// It runs before the new connection is read, so each portal handles its catch-up before the live messages
-// that follow it: a live message bridged first would become the anchor of the forward fetch, and the missed
-// messages before it would be cut off.
+// The resyncs are paced (see resyncPacer). They are added before the new connection is read, and every other
+// event of a portal waits for its resync (see queue), so each portal handles its catch-up before the live
+// messages that follow it: a live message bridged first would become the anchor of the forward fetch, and the
+// missed messages before it would be cut off.
 func (c *TraQClient) catchUp(ctx context.Context, since time.Time) {
 	log := c.Login.Log
 	unread, err := c.API.Unread(ctx)
@@ -87,8 +90,12 @@ func (c *TraQClient) catchUp(ctx context.Context, since time.Time) {
 		}
 		log.Warn().Err(err).Msg("Failed to get the activity timeline, catching up on unread channels and DMs only")
 	}
-	queued := 0
-	for id := range candidates {
+	hasUnread := make(map[string]struct{}, len(unread))
+	for _, u := range unread {
+		hasUnread[u.ChannelID] = struct{}{}
+	}
+	added := 0
+	for _, id := range slices.Sorted(maps.Keys(candidates)) {
 		ch, ok := c.lookupChannel(id)
 		if !ok {
 			continue
@@ -102,14 +109,17 @@ func (c *TraQClient) catchUp(ctx context.Context, since time.Time) {
 			log.Err(err).Stringer("portal_key", key).Msg("Failed to get portal")
 			continue
 		}
-		if portal == nil || portal.MXID == "" {
+		r := pendingResync{ch: ch}
+		if portal != nil && portal.MXID != "" {
+			r.needsBackfill = c.newerMessages(id)
+		} else if _, ok := hasUnread[id]; !ok || !ch.isDM() {
 			continue // the first message creates the room and brings the history with it
 		}
-		if c.queueResync(ctx, ch, c.newerMessages(id)) {
-			queued++
-		}
+		c.addResync(ctx, r)
+		added++
 	}
-	log.Info().Time("since", since).Int("channels", queued).Msg("Catching up on messages missed while disconnected")
+	log.Info().Time("since", since).Int("channels", added).Stringer("gap", resyncGap).
+		Msg("Catching up on messages missed while disconnected, paced")
 }
 
 // newerMessages is the backfill check of a catch-up: whether the channel's newest message in traQ is newer
