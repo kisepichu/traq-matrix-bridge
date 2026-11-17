@@ -5,10 +5,11 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/bridgev2"
-	"maunium.net/go/mautrix/bridgev2/database"
+	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/simplevent"
 
 	"github.com/kisepichu/traq-matrix-bridge/pkg/traq"
@@ -16,6 +17,9 @@ import (
 
 // eventQueueSize is the number of WebSocket events waiting for the worker before the reader blocks.
 const eventQueueSize = 256
+
+// maxLoggedEventBody is the number of bytes of an event body that the failure log shows.
+const maxLoggedEventBody = 1024
 
 // enqueueEvent hands evt to the session's event worker. It runs on the WebSocket reader goroutine, which
 // must keep reading for keepAlive's pongs to be processed, so the handling itself happens on the worker.
@@ -38,36 +42,49 @@ func (c *TraQClient) enqueueEvent(ctx context.Context, queue chan<- traq.Event, 
 	}
 }
 
+// recentMessagesSize is the number of messages queued for creation whose portal the worker remembers.
+const recentMessagesSize = 1024
+
+// workerState is the state of one session's event worker. Only the worker goroutine uses it.
+type workerState struct {
+	// recent remembers where the last messages were queued, for events about a message whose creation is
+	// still waiting in its portal's event loop and so is not in the database yet.
+	recent *recentMessages
+	// syncRequests asks the subscription sync loop for a sync.
+	syncRequests chan<- struct{}
+}
+
 // eventWorker handles the queued events one at a time, in order, until ctx (the session) ends. Events still
-// queued then are dropped.
-func (c *TraQClient) eventWorker(ctx context.Context, queue <-chan traq.Event) {
+// queued then are dropped. Channel changes are passed to the subscription sync loop through syncRequests.
+func (c *TraQClient) eventWorker(ctx context.Context, queue <-chan traq.Event, syncRequests chan<- struct{}) {
+	w := &workerState{recent: newRecentMessages(recentMessagesSize), syncRequests: syncRequests}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case evt := <-queue:
-			c.handleEvent(ctx, evt)
+			c.handleEvent(ctx, w, evt)
 		}
 	}
 }
 
 // handleEvent does the REST fetches an event needs and queues the resulting remote events. A failure is
 // logged and does not stop the worker. Events without a handler are ignored.
-func (c *TraQClient) handleEvent(ctx context.Context, evt traq.Event) {
+func (c *TraQClient) handleEvent(ctx context.Context, w *workerState, evt traq.Event) {
 	log := c.Login.Log.With().Str("event_type", evt.Type).Logger()
 	ctx = log.WithContext(ctx)
 	var err error
 	switch evt.Type {
 	case "MESSAGE_CREATED":
-		err = c.handleMessageCreated(ctx, evt)
+		err = c.handleMessageCreated(ctx, w, evt)
 	case "MESSAGE_UPDATED":
 		err = c.handleMessageUpdated(ctx, evt)
 	case "MESSAGE_DELETED":
-		err = c.handleMessageDeleted(ctx, evt)
+		err = c.handleMessageDeleted(ctx, w, evt)
 	case "MESSAGE_STAMPED":
-		err = c.handleMessageStamped(ctx, evt)
+		err = c.handleMessageStamped(ctx, w, evt)
 	case "MESSAGE_UNSTAMPED":
-		err = c.handleMessageUnstamped(ctx, evt)
+		err = c.handleMessageUnstamped(ctx, w, evt)
 	case "MESSAGE_READ":
 		err = c.handleMessageRead(ctx, evt)
 	case "USER_UPDATED", "USER_ICON_UPDATED":
@@ -75,7 +92,7 @@ func (c *TraQClient) handleEvent(ctx context.Context, evt traq.Event) {
 	case "CHANNEL_CREATED":
 		err = c.handleChannelCreated(ctx, evt)
 	case "CHANNEL_UPDATED", "CHANNEL_DELETED":
-		err = c.syncSubscriptions(ctx)
+		w.requestSync()
 	case "STAMP_CREATED", "STAMP_UPDATED":
 		err = c.handleStampUpdated(ctx, evt)
 	case "STAMP_DELETED":
@@ -85,8 +102,30 @@ func (c *TraQClient) handleEvent(ctx context.Context, evt traq.Event) {
 		return
 	}
 	if err != nil && ctx.Err() == nil {
-		log.Err(err).RawJSON("event_body", evt.Body).Msg("Failed to handle traQ event")
+		log.Err(err).Str("event_body", logBody(evt.Body)).Msg("Failed to handle traQ event")
 	}
+}
+
+// requestSync asks the subscription sync loop for a sync without waiting for it. A request already pending
+// covers this one, so a burst of channel events causes one sync (plus the one already running, if any).
+func (w *workerState) requestSync() {
+	select {
+	case w.syncRequests <- struct{}{}:
+	default:
+	}
+}
+
+// logBody is an event body for the log: a string, because the body may not be valid JSON, of at most
+// maxLoggedEventBody bytes (cut at a UTF-8 character boundary).
+func logBody(body []byte) string {
+	if len(body) <= maxLoggedEventBody {
+		return string(body)
+	}
+	n := maxLoggedEventBody
+	for n > 0 && !utf8.RuneStart(body[n]) {
+		n--
+	}
+	return string(body[:n]) + "…"
 }
 
 func decodeEvent[T any](evt traq.Event) (T, error) {
@@ -103,7 +142,7 @@ func messageLogContext(msg *traq.Message) func(zerolog.Context) zerolog.Context 
 	}
 }
 
-func (c *TraQClient) handleMessageCreated(ctx context.Context, evt traq.Event) error {
+func (c *TraQClient) handleMessageCreated(ctx context.Context, w *workerState, evt traq.Event) error {
 	body, err := decodeEvent[traq.MessageCreatedEvent](evt)
 	if err != nil {
 		return err
@@ -132,6 +171,7 @@ func (c *TraQClient) handleMessageCreated(ctx context.Context, evt traq.Event) e
 		ID:                 MessageID(msg.ID),
 		ConvertMessageFunc: c.convertMessage,
 	})
+	w.recent.add(msg.ID, messageTarget{portal: key, userID: msg.UserID})
 	return nil
 }
 
@@ -172,52 +212,64 @@ func (c *TraQClient) handleMessageUpdated(ctx context.Context, evt traq.Event) e
 	return nil
 }
 
-// bridgedMessage returns the first part of a bridged message in a portal of this login (a public channel or
-// this login's DM), or nil if it was not bridged.
-func (c *TraQClient) bridgedMessage(ctx context.Context, messageID string) (*database.Message, error) {
-	msg, err := c.Login.Bridge.DB.Message.GetFirstPartByID(ctx, c.Login.ID, MessageID(messageID))
-	if err != nil {
-		return nil, fmt.Errorf("look up message %s: %w", messageID, err)
-	}
-	if msg == nil {
-		zerolog.Ctx(ctx).Debug().Str("traq_message_id", messageID).Msg("Ignoring event for a message that was not bridged")
-	}
-	return msg, nil
+// messageTarget is where the remote events about a bridged message go.
+type messageTarget struct {
+	portal networkid.PortalKey
+	userID string // the traQ user who posted the message
 }
 
-func (c *TraQClient) handleMessageDeleted(ctx context.Context, evt traq.Event) error {
+// findMessage returns the portal of a message bridged to a portal of this login (a public channel or this
+// login's DM). A message not in the database yet may still be waiting in its portal's event loop; then the
+// worker's recent messages tell the portal, and the portal's loop handles the event after the creation.
+// The bool is false if the message was not bridged.
+func (c *TraQClient) findMessage(ctx context.Context, w *workerState, messageID string) (messageTarget, bool, error) {
+	row, err := c.Login.Bridge.DB.Message.GetFirstPartByID(ctx, c.Login.ID, MessageID(messageID))
+	if err != nil {
+		return messageTarget{}, false, fmt.Errorf("look up message %s: %w", messageID, err)
+	}
+	if row != nil {
+		return messageTarget{portal: row.Room, userID: TraQUserID(row.SenderID)}, true, nil
+	}
+	if t, ok := w.recent.get(messageID); ok {
+		return t, true, nil
+	}
+	zerolog.Ctx(ctx).Debug().Str("traq_message_id", messageID).Msg("Ignoring event for a message that was not bridged")
+	return messageTarget{}, false, nil
+}
+
+func (c *TraQClient) handleMessageDeleted(ctx context.Context, w *workerState, evt traq.Event) error {
 	body, err := decodeEvent[traq.IDEvent](evt)
 	if err != nil {
 		return err
 	}
-	target, err := c.bridgedMessage(ctx, body.ID)
-	if err != nil || target == nil {
+	target, ok, err := c.findMessage(ctx, w, body.ID)
+	if err != nil || !ok {
 		return err
 	}
 	c.queue(&simplevent.MessageRemove{
 		EventMeta: simplevent.EventMeta{
 			Type:       bridgev2.RemoteEventMessageRemove,
 			LogContext: func(lc zerolog.Context) zerolog.Context { return lc.Str("traq_message_id", body.ID) },
-			PortalKey:  target.Room,
-			Sender:     c.sender(TraQUserID(target.SenderID)),
+			PortalKey:  target.portal,
+			Sender:     c.sender(target.userID),
 		},
-		TargetMessage: target.ID,
+		TargetMessage: MessageID(body.ID),
 	})
 	return nil
 }
 
-func (c *TraQClient) handleMessageStamped(ctx context.Context, evt traq.Event) error {
+func (c *TraQClient) handleMessageStamped(ctx context.Context, w *workerState, evt traq.Event) error {
 	body, err := decodeEvent[traq.MessageStampedEvent](evt)
 	if err != nil {
 		return err
 	}
-	target, err := c.bridgedMessage(ctx, body.MessageID)
-	if err != nil || target == nil {
+	target, ok, err := c.findMessage(ctx, w, body.MessageID)
+	if err != nil || !ok {
 		return err
 	}
-	emoji, ok := c.reactionKey(ctx, body.StampID)
-	if !ok {
-		return fmt.Errorf("unknown stamp %s", body.StampID)
+	emoji, err := c.reactionKey(ctx, body.StampID)
+	if err != nil {
+		return err
 	}
 	// A count increase (the same user stamping again) has the same EmojiID, and bridgev2 drops it as a
 	// duplicate.
@@ -225,34 +277,34 @@ func (c *TraQClient) handleMessageStamped(ctx context.Context, evt traq.Event) e
 		EventMeta: simplevent.EventMeta{
 			Type:       bridgev2.RemoteEventReaction,
 			LogContext: stampLogContext(body.MessageID, body.StampID),
-			PortalKey:  target.Room,
+			PortalKey:  target.portal,
 			Sender:     c.sender(body.UserID),
 			Timestamp:  body.CreatedAt,
 		},
-		TargetMessage: target.ID,
+		TargetMessage: MessageID(body.MessageID),
 		EmojiID:       EmojiID(body.StampID),
 		Emoji:         emoji,
 	})
 	return nil
 }
 
-func (c *TraQClient) handleMessageUnstamped(ctx context.Context, evt traq.Event) error {
+func (c *TraQClient) handleMessageUnstamped(ctx context.Context, w *workerState, evt traq.Event) error {
 	body, err := decodeEvent[traq.MessageUnstampedEvent](evt)
 	if err != nil {
 		return err
 	}
-	target, err := c.bridgedMessage(ctx, body.MessageID)
-	if err != nil || target == nil {
+	target, ok, err := c.findMessage(ctx, w, body.MessageID)
+	if err != nil || !ok {
 		return err
 	}
 	c.queue(&simplevent.Reaction{
 		EventMeta: simplevent.EventMeta{
 			Type:       bridgev2.RemoteEventReactionRemove,
 			LogContext: stampLogContext(body.MessageID, body.StampID),
-			PortalKey:  target.Room,
+			PortalKey:  target.portal,
 			Sender:     c.sender(body.UserID),
 		},
-		TargetMessage: target.ID,
+		TargetMessage: MessageID(body.MessageID),
 		EmojiID:       EmojiID(body.StampID),
 	})
 	return nil

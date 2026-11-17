@@ -218,8 +218,9 @@ func (c *TraQClient) initialSync(ctx context.Context, me *traq.Me, targets map[s
 }
 
 // syncSubscriptions re-reads the channels and subscriptions and queues only what changed. Upserts that could
-// not be queued are reverted in c.targets, so the next sync emits them again. It runs from the sync loop and
-// from the event worker (channel changes), serialized by syncMu.
+// not be queued are reverted in c.targets, so the next sync emits them again. It runs on the subscription
+// sync loop (periodically, and when the event worker sees a channel change); syncMu serializes it with the
+// worker's CHANNEL_CREATED handling.
 func (c *TraQClient) syncSubscriptions(ctx context.Context) error {
 	c.syncMu.Lock()
 	defer c.syncMu.Unlock()

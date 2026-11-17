@@ -164,8 +164,10 @@ func (c *TraQClient) runLoops(ctx context.Context, stop context.CancelCauseFunc)
 	// One queue and one worker per session, so events are handled in the order traQ sent them, across
 	// reconnects too.
 	queue := make(chan traq.Event, eventQueueSize)
-	wg.Go(func() { c.eventWorker(ctx, queue) })
-	wg.Go(func() { c.subscriptionSyncLoop(ctx, stop) })
+	// Size 1: the channel events of a burst add up to at most one pending sync.
+	syncRequests := make(chan struct{}, 1)
+	wg.Go(func() { c.eventWorker(ctx, queue, syncRequests) })
+	wg.Go(func() { c.subscriptionSyncLoop(ctx, stop, syncRequests) })
 	c.websocketLoop(ctx, stop, queue)
 }
 
@@ -338,9 +340,10 @@ func keepAlive(ctx context.Context, ws *traq.WSConn, fail context.CancelCauseFun
 	}
 }
 
-// subscriptionSyncLoop re-syncs the subscriptions every subscription_sync_interval. A rejected token stops the
-// session with errTokenRejected.
-func (c *TraQClient) subscriptionSyncLoop(ctx context.Context, stop context.CancelCauseFunc) {
+// subscriptionSyncLoop re-syncs the subscriptions every subscription_sync_interval and when the event worker
+// asks for it through requests (a channel was changed or deleted). A rejected token stops the session with
+// errTokenRejected.
+func (c *TraQClient) subscriptionSyncLoop(ctx context.Context, stop context.CancelCauseFunc, requests <-chan struct{}) {
 	t := time.NewTicker(c.Main.Config.SubscriptionSyncInterval)
 	defer t.Stop()
 	for {
@@ -348,6 +351,7 @@ func (c *TraQClient) subscriptionSyncLoop(ctx context.Context, stop context.Canc
 		case <-ctx.Done():
 			return
 		case <-t.C:
+		case <-requests:
 		}
 		err := c.syncSubscriptions(ctx)
 		switch {

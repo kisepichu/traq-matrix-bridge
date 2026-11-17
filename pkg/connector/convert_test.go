@@ -1,12 +1,16 @@
 package connector
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
@@ -24,12 +28,23 @@ const (
 	fileB      = "0193a1b2-0000-7000-8000-00000000000b"
 )
 
-// fakeUploader returns an m.file content named after the file ID, or the error set for that ID.
+// fakeUploader returns an m.file content named after the file ID, or the error set for that ID. A slow file
+// takes until ctx ends (or a second). It records the files it was asked for.
 type fakeUploader struct {
-	errs map[string]error
+	errs  map[string]error
+	slow  map[string]bool
+	calls []string
 }
 
-func (f *fakeUploader) upload(_ context.Context, fileID string) (*event.MessageEventContent, error) {
+func (f *fakeUploader) upload(ctx context.Context, fileID string) (*event.MessageEventContent, error) {
+	f.calls = append(f.calls, fileID)
+	if f.slow[fileID] {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
 	if err := f.errs[fileID]; err != nil {
 		return nil, err
 	}
@@ -47,7 +62,7 @@ func partIDs(parts []*bridgev2.ConvertedMessagePart) []networkid.PartID {
 func TestBuildMessageParts(t *testing.T) {
 	res := msgconv.ToMatrixResult{Body: "hi", HTML: "<b>hi</b>", FileIDs: []string{fileA, fileB}, ReplyTo: testUUID}
 	up := &fakeUploader{}
-	cm, err := buildMessage(context.Background(), res, "**hi** files", testOrigin, up)
+	cm, err := buildMessage(context.Background(), res, "**hi** files", testOrigin, up, time.Minute)
 	if err != nil {
 		t.Fatalf("buildMessage: %v", err)
 	}
@@ -71,7 +86,7 @@ func TestBuildMessageParts(t *testing.T) {
 
 func TestBuildMessageWithoutBody(t *testing.T) {
 	res := msgconv.ToMatrixResult{FileIDs: []string{fileA}}
-	cm, err := buildMessage(context.Background(), res, testOrigin+"/files/"+fileA, testOrigin, &fakeUploader{})
+	cm, err := buildMessage(context.Background(), res, testOrigin+"/files/"+fileA, testOrigin, &fakeUploader{}, time.Minute)
 	if err != nil {
 		t.Fatalf("buildMessage: %v", err)
 	}
@@ -84,7 +99,7 @@ func TestBuildMessageWithoutBody(t *testing.T) {
 }
 
 func TestBuildMessageEmpty(t *testing.T) {
-	_, err := buildMessage(context.Background(), msgconv.ToMatrixResult{}, "", testOrigin, &fakeUploader{})
+	_, err := buildMessage(context.Background(), msgconv.ToMatrixResult{}, "", testOrigin, &fakeUploader{}, time.Minute)
 	if !errors.Is(err, bridgev2.ErrIgnoringRemoteEvent) {
 		t.Fatalf("err = %v, want ErrIgnoringRemoteEvent", err)
 	}
@@ -93,7 +108,7 @@ func TestBuildMessageEmpty(t *testing.T) {
 // A file that cannot be re-uploaded keeps its traQ URL in the text, and the text part is created for it.
 func TestBuildMessageFileNotUploaded(t *testing.T) {
 	up := &fakeUploader{errs: map[string]error{fileA: errFileTooLarge}}
-	cm, err := buildMessage(context.Background(), msgconv.ToMatrixResult{FileIDs: []string{fileA, fileB}}, "x", testOrigin, up)
+	cm, err := buildMessage(context.Background(), msgconv.ToMatrixResult{FileIDs: []string{fileA, fileB}}, "x", testOrigin, up, time.Minute)
 	if err != nil {
 		t.Fatalf("buildMessage: %v", err)
 	}
@@ -105,7 +120,7 @@ func TestBuildMessageFileNotUploaded(t *testing.T) {
 		t.Errorf("text body = %q, want %q", got, url)
 	}
 
-	cm, err = buildMessage(context.Background(), msgconv.ToMatrixResult{Body: "look", HTML: "look", FileIDs: []string{fileA}}, "x", testOrigin, up)
+	cm, err = buildMessage(context.Background(), msgconv.ToMatrixResult{Body: "look", HTML: "look", FileIDs: []string{fileA}}, "x", testOrigin, up, time.Minute)
 	if err != nil {
 		t.Fatalf("buildMessage: %v", err)
 	}
@@ -114,6 +129,103 @@ func TestBuildMessageFileNotUploaded(t *testing.T) {
 	}
 	if got, want := cm.Parts[0].Content.FormattedBody, `look<br><a href="`+url+`">`+url+`</a>`; got != want {
 		t.Errorf("text HTML = %q, want %q", got, want)
+	}
+}
+
+// The timeout covers all files of a message together: a file not uploaded by then is linked, and the files
+// after it are linked without being tried.
+func TestBuildMessageFilesTimeout(t *testing.T) {
+	up := &fakeUploader{slow: map[string]bool{fileA: true}}
+	cm, err := buildMessage(context.Background(), msgconv.ToMatrixResult{FileIDs: []string{fileA, fileB}}, "x", testOrigin, up, 20*time.Millisecond)
+	if err != nil {
+		t.Fatalf("buildMessage: %v", err)
+	}
+	if got, want := partIDs(cm.Parts), []networkid.PartID{""}; !slices.Equal(got, want) {
+		t.Fatalf("part IDs = %q, want %q", got, want)
+	}
+	if got, want := cm.Parts[0].Content.Body, testOrigin+"/files/"+fileA+"\n"+testOrigin+"/files/"+fileB; got != want {
+		t.Errorf("text body = %q, want %q", got, want)
+	}
+	if want := []string{fileA}; !slices.Equal(up.calls, want) {
+		t.Errorf("uploads tried = %q, want %q", up.calls, want)
+	}
+}
+
+// fakeIntent streams the upload into data and returns url and file, as bridgev2's UploadMediaStream does:
+// in an encrypted room the mxc URI is only in file.URL.
+type fakeIntent struct {
+	url  id.ContentURIString
+	file *event.EncryptedFileInfo
+	data bytes.Buffer
+}
+
+func (f *fakeIntent) UploadMediaStream(_ context.Context, _ id.RoomID, _ int64, _ bool, cb bridgev2.FileStreamCallback) (id.ContentURIString, *event.EncryptedFileInfo, error) {
+	if _, err := cb(&f.data); err != nil {
+		return "", nil, err
+	}
+	return f.url, f.file, nil
+}
+
+func TestPortalUploaderContentURL(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v3/files/"+fileA+"/meta", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"` + fileA + `","name":"a.png","mime":"image/png","size":4}`))
+	})
+	mux.HandleFunc("GET /api/v3/files/"+fileA, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("data"))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	api, err := traq.NewClient(srv.URL, srv.Client(), "token", userAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, tc := range map[string]struct {
+		intent   *fakeIntent
+		wantURL  id.ContentURIString
+		wantFile id.ContentURIString
+	}{
+		"plain":     {intent: &fakeIntent{url: "mxc://x/plain"}, wantURL: "mxc://x/plain"},
+		"encrypted": {intent: &fakeIntent{file: &event.EncryptedFileInfo{URL: "mxc://x/y"}}, wantFile: "mxc://x/y"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			up := &portalUploader{api: api, files: api, limit: 1 << 20, roomID: "!room:example.org", intent: tc.intent}
+			content, err := up.upload(context.Background(), fileA)
+			if err != nil {
+				t.Fatalf("upload: %v", err)
+			}
+			if content.MsgType != event.MsgImage || content.Body != "a.png" || tc.intent.data.String() != "data" {
+				t.Errorf("content = %+v, uploaded %q", content, tc.intent.data.String())
+			}
+			if content.URL != tc.wantURL {
+				t.Errorf("URL = %q, want %q", content.URL, tc.wantURL)
+			}
+			switch {
+			case tc.wantFile == "" && content.File != nil:
+				t.Errorf("File = %+v, want nil", content.File)
+			case tc.wantFile != "" && (content.File == nil || content.File.URL != tc.wantFile):
+				t.Errorf("File = %+v, want URL %q", content.File, tc.wantFile)
+			}
+		})
+	}
+}
+
+// A stamp that cannot be fetched is reported to the caller, which logs it; reactionKey itself logs nothing.
+func TestReactionKeyUnknownStamp(t *testing.T) {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(srv.Close)
+	api, err := traq.NewClient(srv.URL, srv.Client(), "token", userAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &TraQClient{Main: &TraQConnector{Stamps: stampconv.NewTable(nil, false)}, API: api}
+	var logs bytes.Buffer
+	ctx := zerolog.New(&logs).WithContext(context.Background())
+	if _, err := c.reactionKey(ctx, "s1"); !traq.IsStatus(err, http.StatusNotFound) {
+		t.Errorf("err = %v, want the 404", err)
+	}
+	if logs.Len() != 0 {
+		t.Errorf("reactionKey logged %q, want nothing", logs.String())
 	}
 }
 

@@ -22,11 +22,12 @@ import (
 	"github.com/kisepichu/traq-matrix-bridge/pkg/traq"
 )
 
-// fileDownloadTimeout bounds one file download and re-upload.
-const fileDownloadTimeout = 5 * time.Minute
+// messageFilesTimeout bounds the download and re-upload of all files of one message together, so one
+// message cannot hold the portal's event loop for longer. Files not done by then are linked.
+const messageFilesTimeout = 5 * time.Minute
 
 // fileHTTPClient downloads files. It has no total timeout, unlike httpClient, because a large file on a
-// slow link can take longer than httpTimeout; each download has a fileDownloadTimeout deadline instead.
+// slow link can take longer than httpTimeout; messageFilesTimeout bounds the downloads instead.
 var fileHTTPClient = &http.Client{}
 
 // errFileTooLarge: the file is larger than the homeserver accepts, so it is linked instead.
@@ -48,8 +49,8 @@ type mediaUploader interface {
 // followed by one part per file. ReplyTo is set from msgconv's ReplyTo.
 func (c *TraQClient) convertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *traq.Message) (*bridgev2.ConvertedMessage, error) {
 	res := msgconv.ToMatrix(c.toMatrixInput(msg.Content), &resolver{ctx: ctx, c: c, portal: portal})
-	up := &portalUploader{c: c, portal: portal, intent: intent}
-	return buildMessage(ctx, res, msg.Content, c.origin(), up)
+	up := &portalUploader{api: c.API, files: c.Files, limit: c.Main.maxFileSize(), roomID: portal.MXID, intent: intent}
+	return buildMessage(ctx, res, msg.Content, c.origin(), up, messageFilesTimeout)
 }
 
 // convertEdit replaces the text part of an edited message. v1 neither adds nor removes file parts: a file new
@@ -79,20 +80,33 @@ func (c *TraQClient) toMatrixInput(content string) msgconv.ToMatrixInput {
 func (c *TraQClient) origin() string { return c.API.ServerURL().String() }
 
 // buildMessage assembles the parts of a new message. A file that cannot be uploaded (too large, or the
-// download or upload failed) keeps its traQ URL at the end of the text instead.
-func buildMessage(ctx context.Context, res msgconv.ToMatrixResult, content, origin string, up mediaUploader) (*bridgev2.ConvertedMessage, error) {
+// download or upload failed) keeps its traQ URL at the end of the text instead, and so do the files not
+// uploaded within filesTimeout, which bounds all uploads of the message together.
+func buildMessage(ctx context.Context, res msgconv.ToMatrixResult, content, origin string, up mediaUploader, filesTimeout time.Duration) (*bridgev2.ConvertedMessage, error) {
 	files := make([]*bridgev2.ConvertedMessagePart, 0, len(res.FileIDs))
 	var links []string
-	for _, fileID := range res.FileIDs {
-		fc, err := up.upload(ctx, fileID)
-		if err != nil {
-			if !errors.Is(err, errFileTooLarge) {
+	if len(res.FileIDs) > 0 {
+		filesCtx, cancel := context.WithTimeout(ctx, filesTimeout)
+		defer cancel()
+		for _, fileID := range res.FileIDs {
+			if filesCtx.Err() != nil {
+				links = append(links, fileURL(origin, fileID))
+				continue
+			}
+			fc, err := up.upload(filesCtx, fileID)
+			if err == nil {
+				files = append(files, &bridgev2.ConvertedMessagePart{ID: filePartID(fileID), Type: event.EventMessage, Content: fc})
+				continue
+			}
+			// A timeout is logged once below, for all files it cut off.
+			if filesCtx.Err() == nil && !errors.Is(err, errFileTooLarge) {
 				zerolog.Ctx(ctx).Warn().Err(err).Str("traq_file_id", fileID).Msg("Failed to bridge a traQ file, linking it instead")
 			}
 			links = append(links, fileURL(origin, fileID))
-			continue
 		}
-		files = append(files, &bridgev2.ConvertedMessagePart{ID: filePartID(fileID), Type: event.EventMessage, Content: fc})
+		if ctx.Err() == nil && filesCtx.Err() != nil {
+			zerolog.Ctx(ctx).Warn().Dur("timeout", filesTimeout).Msg("Bridging the files of a traQ message took too long, linking the rest instead")
+		}
 	}
 	cm := &bridgev2.ConvertedMessage{Parts: make([]*bridgev2.ConvertedMessagePart, 0, len(files)+1)}
 	if text := textContent(res, links); text != nil {
@@ -178,25 +192,29 @@ func textPart(content *event.MessageEventContent, traqContent string) *bridgev2.
 	}
 }
 
+// mediaStreamUploader is the part of bridgev2.MatrixAPI that portalUploader uses.
+type mediaStreamUploader interface {
+	UploadMediaStream(ctx context.Context, roomID id.RoomID, size int64, requireFile bool, cb bridgev2.FileStreamCallback) (id.ContentURIString, *event.EncryptedFileInfo, error)
+}
+
 // portalUploader downloads traQ files and uploads them to the portal's room (encrypted if the room is).
 type portalUploader struct {
-	c      *TraQClient
-	portal *bridgev2.Portal
-	intent bridgev2.MatrixAPI
+	api    *traq.Client // file metadata
+	files  *traq.Client // downloads, without httpTimeout
+	limit  int64        // the homeserver's upload size limit
+	roomID id.RoomID
+	intent mediaStreamUploader
 }
 
 func (u *portalUploader) upload(ctx context.Context, fileID string) (*event.MessageEventContent, error) {
-	meta, err := u.c.API.FileMeta(ctx, fileID)
+	meta, err := u.api.FileMeta(ctx, fileID)
 	if err != nil {
 		return nil, fmt.Errorf("get file meta: %w", err)
 	}
-	limit := u.c.Main.maxFileSize()
-	if meta.Size > limit {
+	if meta.Size > u.limit {
 		return nil, errFileTooLarge
 	}
-	ctx, cancel := context.WithTimeout(ctx, fileDownloadTimeout)
-	defer cancel()
-	body, err := u.c.Files.DownloadFile(ctx, fileID)
+	body, err := u.files.DownloadFile(ctx, fileID)
 	if err != nil {
 		return nil, fmt.Errorf("download file: %w", err)
 	}
@@ -205,9 +223,10 @@ func (u *portalUploader) upload(ctx context.Context, fileID string) (*event.Mess
 	if mime == "" {
 		mime = "application/octet-stream"
 	}
-	url, file, err := u.intent.UploadMediaStream(ctx, u.portal.MXID, meta.Size, false, func(w io.Writer) (*bridgev2.FileStreamResult, error) {
-		// The limit stops a body longer than announced from filling memory; the upload then rejects it.
-		if _, err := io.Copy(w, io.LimitReader(body, limit+1)); err != nil {
+	url, file, err := u.intent.UploadMediaStream(ctx, u.roomID, meta.Size, false, func(w io.Writer) (*bridgev2.FileStreamResult, error) {
+		// Copy at most limit+1 bytes: a body over the homeserver's upload limit, whatever size was announced,
+		// stops there instead of filling the buffer or temp file, and the upload's own size check rejects it.
+		if _, err := io.Copy(w, io.LimitReader(body, u.limit+1)); err != nil {
 			return nil, err
 		}
 		return &bridgev2.FileStreamResult{FileName: meta.Name, MimeType: mime}, nil
@@ -223,8 +242,8 @@ func (u *portalUploader) upload(ctx context.Context, fileID string) (*event.Mess
 	if strings.HasPrefix(mime, "image/") {
 		content.MsgType = event.MsgImage
 	}
+	// In an encrypted room, the mxc URI is in file.URL and url is empty.
 	if file != nil {
-		file.URL = url
 		content.File = file
 	} else {
 		content.URL = url
@@ -336,8 +355,9 @@ func (c *TraQClient) stampReactions(ctx context.Context, msg *traq.Message) []*b
 			continue
 		}
 		seen[key] = true
-		emoji, ok := c.reactionKey(ctx, s.StampID)
-		if !ok {
+		emoji, err := c.reactionKey(ctx, s.StampID)
+		if err != nil {
+			zerolog.Ctx(ctx).Warn().Err(err).Str("traq_stamp_id", s.StampID).Msg("Skipping a stamp whose reaction key is unknown")
 			continue
 		}
 		reactions = append(reactions, &bridgev2.BackfillReaction{
@@ -351,19 +371,18 @@ func (c *TraQClient) stampReactions(ctx context.Context, msg *traq.Message) []*b
 }
 
 // reactionKey returns the Matrix reaction key of a stamp. A stamp missing from the table is fetched with
-// Stamp() and added to it.
-func (c *TraQClient) reactionKey(ctx context.Context, stampID string) (string, bool) {
+// Stamp() and added to it. A failure is returned, not logged.
+func (c *TraQClient) reactionKey(ctx context.Context, stampID string) (string, error) {
 	if s, ok := c.Main.Stamps.ByID(stampID); ok {
-		return stampconv.ReactionKey(s), true
+		return stampconv.ReactionKey(s), nil
 	}
 	st, err := c.API.Stamp(ctx, stampID)
 	if err != nil {
-		zerolog.Ctx(ctx).Warn().Err(err).Str("traq_stamp_id", stampID).Msg("Failed to get traQ stamp")
-		return "", false
+		return "", fmt.Errorf("get stamp %s: %w", stampID, err)
 	}
 	s := stampFromTraQ(st)
 	c.Main.Stamps.Put(s)
-	return stampconv.ReactionKey(s), true
+	return stampconv.ReactionKey(s), nil
 }
 
 // stampFromTraQ converts a traQ stamp for the table. Emoji stays empty: Unicode stamps are resolved to their
