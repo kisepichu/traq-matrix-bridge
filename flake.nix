@@ -33,7 +33,7 @@
             version = "0.1.0";
             src = self;
             subPackages = [ "cmd/traq-matrix-bridge" ];
-            vendorHash = "sha256-UMFNqPn0oxUPbi8vyqORbowPf+OpiXkOWkUdPc6MeBg=";
+            vendorHash = "sha256-38q4HK6mkCXMpnaZvmbevdUEKIX7jveGEzarhXDD4ZA=";
             buildInputs = [ pkgs.olm ];
             ldflags = [
               "-s"
