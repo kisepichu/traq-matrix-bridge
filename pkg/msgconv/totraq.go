@@ -7,6 +7,7 @@ import (
 	"html"
 	"net/url"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"maunium.net/go/mautrix/event"
@@ -74,8 +75,8 @@ func ToTraQ(ctx context.Context, in ToTraQInput, r TraQResolver) (string, error)
 			return "", errors.New("reply target without a traQ server URL")
 		}
 		// A quote-only message keeps its quote visible in Matrix as a link to the reply target, which
-		// converts back to this URL: it is the quote already.
-		if quote := in.ServerURL.JoinPath("messages", in.ReplyTo).String(); text != quote && !strings.HasPrefix(text, quote+"\n") {
+		// converts back to this URL: a text that starts with it, as a word, has the quote already.
+		if quote := in.ServerURL.JoinPath("messages", in.ReplyTo).String(); !startsWithWord(text, quote) {
 			text = quote + "\n" + text
 		}
 	}
@@ -155,6 +156,16 @@ func separatePills(text string, start, end rune) string {
 // isTraQNameRune reports whether c may appear in a traQ user name.
 func isTraQNameRune(c rune) bool {
 	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-'
+}
+
+// startsWithWord reports whether text starts with word followed by the end of text or whitespace.
+func startsWithWord(text, word string) bool {
+	rest, ok := strings.CutPrefix(text, word)
+	if !ok {
+		return false
+	}
+	r, _ := utf8.DecodeRuneInString(rest)
+	return rest == "" || unicode.IsSpace(r)
 }
 
 // trimReplyFallbackBody drops the "> <@user> ..." quote and the blank line
