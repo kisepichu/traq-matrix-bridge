@@ -157,6 +157,14 @@ func (c *TraQClient) handleMessageCreated(ctx context.Context, w *workerState, e
 		return nil
 	}
 	c.noteActivity(msg.ChannelID, msg.CreatedAt)
+	c.queueMessage(key, msg)
+	w.recent.add(msg.ID, messageTarget{portal: key, userID: msg.UserID})
+	return nil
+}
+
+// queueMessage queues a new traQ message. bridgev2 drops one already bridged (by its ID) in the portal's
+// serial event loop, so the poller may queue a message the WebSocket also delivers.
+func (c *TraQClient) queueMessage(key networkid.PortalKey, msg *traq.Message) {
 	c.queue(&simplevent.Message[*traq.Message]{
 		EventMeta: simplevent.EventMeta{
 			Type:       bridgev2.RemoteEventMessage,
@@ -171,8 +179,6 @@ func (c *TraQClient) handleMessageCreated(ctx context.Context, w *workerState, e
 		ID:                 MessageID(msg.ID),
 		ConvertMessageFunc: c.convertMessage,
 	})
-	w.recent.add(msg.ID, messageTarget{portal: key, userID: msg.UserID})
-	return nil
 }
 
 func (c *TraQClient) handleMessageUpdated(ctx context.Context, evt traq.Event) error {

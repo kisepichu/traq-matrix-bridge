@@ -62,7 +62,7 @@ func partIDs(parts []*bridgev2.ConvertedMessagePart) []networkid.PartID {
 func TestBuildMessageParts(t *testing.T) {
 	res := msgconv.ToMatrixResult{Body: "hi", HTML: "<b>hi</b>", FileIDs: []string{fileA, fileB}, ReplyTo: testUUID}
 	up := &fakeUploader{}
-	cm, err := buildMessage(context.Background(), res, "**hi** files", testOrigin, up, time.Minute)
+	cm, err := buildMessage(context.Background(), res, metaOf("**hi** files"), testOrigin, up, time.Minute)
 	if err != nil {
 		t.Fatalf("buildMessage: %v", err)
 	}
@@ -86,7 +86,7 @@ func TestBuildMessageParts(t *testing.T) {
 
 func TestBuildMessageWithoutBody(t *testing.T) {
 	res := msgconv.ToMatrixResult{FileIDs: []string{fileA}}
-	cm, err := buildMessage(context.Background(), res, testOrigin+"/files/"+fileA, testOrigin, &fakeUploader{}, time.Minute)
+	cm, err := buildMessage(context.Background(), res, metaOf(testOrigin+"/files/"+fileA), testOrigin, &fakeUploader{}, time.Minute)
 	if err != nil {
 		t.Fatalf("buildMessage: %v", err)
 	}
@@ -99,7 +99,7 @@ func TestBuildMessageWithoutBody(t *testing.T) {
 }
 
 func TestBuildMessageEmpty(t *testing.T) {
-	_, err := buildMessage(context.Background(), msgconv.ToMatrixResult{}, "", testOrigin, &fakeUploader{}, time.Minute)
+	_, err := buildMessage(context.Background(), msgconv.ToMatrixResult{}, metaOf(""), testOrigin, &fakeUploader{}, time.Minute)
 	if !errors.Is(err, bridgev2.ErrIgnoringRemoteEvent) {
 		t.Fatalf("err = %v, want ErrIgnoringRemoteEvent", err)
 	}
@@ -108,7 +108,7 @@ func TestBuildMessageEmpty(t *testing.T) {
 // A file that cannot be re-uploaded keeps its traQ URL in the text, and the text part is created for it.
 func TestBuildMessageFileNotUploaded(t *testing.T) {
 	up := &fakeUploader{errs: map[string]error{fileA: errFileTooLarge}}
-	cm, err := buildMessage(context.Background(), msgconv.ToMatrixResult{FileIDs: []string{fileA, fileB}}, "x", testOrigin, up, time.Minute)
+	cm, err := buildMessage(context.Background(), msgconv.ToMatrixResult{FileIDs: []string{fileA, fileB}}, metaOf("x"), testOrigin, up, time.Minute)
 	if err != nil {
 		t.Fatalf("buildMessage: %v", err)
 	}
@@ -120,7 +120,7 @@ func TestBuildMessageFileNotUploaded(t *testing.T) {
 		t.Errorf("text body = %q, want %q", got, url)
 	}
 
-	cm, err = buildMessage(context.Background(), msgconv.ToMatrixResult{Body: "look", HTML: "look", FileIDs: []string{fileA}}, "x", testOrigin, up, time.Minute)
+	cm, err = buildMessage(context.Background(), msgconv.ToMatrixResult{Body: "look", HTML: "look", FileIDs: []string{fileA}}, metaOf("x"), testOrigin, up, time.Minute)
 	if err != nil {
 		t.Fatalf("buildMessage: %v", err)
 	}
@@ -136,7 +136,7 @@ func TestBuildMessageFileNotUploaded(t *testing.T) {
 // after it are linked without being tried.
 func TestBuildMessageFilesTimeout(t *testing.T) {
 	up := &fakeUploader{slow: map[string]bool{fileA: true}}
-	cm, err := buildMessage(context.Background(), msgconv.ToMatrixResult{FileIDs: []string{fileA, fileB}}, "x", testOrigin, up, 20*time.Millisecond)
+	cm, err := buildMessage(context.Background(), msgconv.ToMatrixResult{FileIDs: []string{fileA, fileB}}, metaOf("x"), testOrigin, up, 20*time.Millisecond)
 	if err != nil {
 		t.Fatalf("buildMessage: %v", err)
 	}
@@ -229,14 +229,19 @@ func TestReactionKeyUnknownStamp(t *testing.T) {
 	}
 }
 
+// metaOf is the text part metadata of a message with content, which has no updatedAt.
+func metaOf(content string) *MessageMetadata {
+	return messageMetadata(&traq.Message{Content: content})
+}
+
 func textPartRow(content string) *database.Message {
-	return &database.Message{ID: "m", PartID: "", MXID: "$text", Metadata: &MessageMetadata{ContentHash: ContentHash(content)}}
+	return &database.Message{ID: "m", PartID: "", MXID: "$text", Metadata: metaOf(content)}
 }
 
 func TestBuildEditReplacesTextPart(t *testing.T) {
 	existing := []*database.Message{textPartRow("old"), {ID: "m", PartID: "file:" + fileA, MXID: "$file"}}
 	res := msgconv.ToMatrixResult{Body: "new", HTML: "new", FileIDs: []string{fileA}}
-	edit, err := buildEdit(existing, res, "new", testOrigin)
+	edit, err := buildEdit(existing, res, metaOf("new"), testOrigin)
 	if err != nil {
 		t.Fatalf("buildEdit: %v", err)
 	}
@@ -255,16 +260,52 @@ func TestBuildEditReplacesTextPart(t *testing.T) {
 }
 
 func TestBuildEditUnchangedContent(t *testing.T) {
-	_, err := buildEdit([]*database.Message{textPartRow("same")}, msgconv.ToMatrixResult{Body: "same"}, "same", testOrigin)
+	_, err := buildEdit([]*database.Message{textPartRow("same")}, msgconv.ToMatrixResult{Body: "same"}, metaOf("same"), testOrigin)
 	if !errors.Is(err, bridgev2.ErrIgnoringRemoteEvent) {
 		t.Fatalf("err = %v, want ErrIgnoringRemoteEvent", err)
+	}
+}
+
+// An edit is bridged only if traQ's updatedAt is newer than that of the version last bridged, so a stale poll
+// does not undo a newer edit that the WebSocket delivered. A row without a stored updatedAt uses only the hash.
+func TestBuildEditUpdatedAt(t *testing.T) {
+	t1 := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	t2 := t1.Add(time.Second)
+	res := msgconv.ToMatrixResult{Body: "other", HTML: "other"}
+	for name, tc := range map[string]struct {
+		stored, incoming time.Time
+		bridged          bool
+	}{
+		"older":                {stored: t2, incoming: t1},
+		"same":                 {stored: t2, incoming: t2},
+		"newer":                {stored: t1, incoming: t2, bridged: true},
+		"nothing stored":       {incoming: t1, bridged: true},
+		"nothing stored, zero": {bridged: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			row := textPartRow("old")
+			row.Metadata.(*MessageMetadata).UpdatedAt = tc.stored
+			edit, err := buildEdit([]*database.Message{row}, res, messageMetadata(&traq.Message{Content: "other", UpdatedAt: tc.incoming}), testOrigin)
+			if !tc.bridged {
+				if !errors.Is(err, bridgev2.ErrIgnoringRemoteEvent) {
+					t.Fatalf("err = %v, want ErrIgnoringRemoteEvent", err)
+				}
+				return
+			}
+			if err != nil || len(edit.ModifiedParts) != 1 {
+				t.Fatalf("edit = %+v, %v, want the text part modified", edit, err)
+			}
+			if got := row.Metadata.(*MessageMetadata).UpdatedAt; !got.Equal(tc.incoming) {
+				t.Errorf("stored UpdatedAt = %v, want %v", got, tc.incoming)
+			}
+		})
 	}
 }
 
 // v1 does not add or remove file parts in an edit: a file new to the message is linked in the text.
 func TestBuildEditNewFileLinked(t *testing.T) {
 	existing := []*database.Message{textPartRow("old")}
-	edit, err := buildEdit(existing, msgconv.ToMatrixResult{Body: "new", HTML: "new", FileIDs: []string{fileB}}, "new2", testOrigin)
+	edit, err := buildEdit(existing, msgconv.ToMatrixResult{Body: "new", HTML: "new", FileIDs: []string{fileB}}, metaOf("new2"), testOrigin)
 	if err != nil {
 		t.Fatalf("buildEdit: %v", err)
 	}
@@ -276,7 +317,7 @@ func TestBuildEditNewFileLinked(t *testing.T) {
 // A message that had only files gets its text as an added part.
 func TestBuildEditAddsTextPart(t *testing.T) {
 	existing := []*database.Message{{ID: "m", PartID: "file:" + fileA, MXID: "$file"}}
-	edit, err := buildEdit(existing, msgconv.ToMatrixResult{Body: "caption", HTML: "caption", FileIDs: []string{fileA}}, "caption", testOrigin)
+	edit, err := buildEdit(existing, msgconv.ToMatrixResult{Body: "caption", HTML: "caption", FileIDs: []string{fileA}}, metaOf("caption"), testOrigin)
 	if err != nil {
 		t.Fatalf("buildEdit: %v", err)
 	}
@@ -288,7 +329,7 @@ func TestBuildEditAddsTextPart(t *testing.T) {
 // Removing the whole text of a message with files deletes the text part.
 func TestBuildEditRemovesTextPart(t *testing.T) {
 	existing := []*database.Message{textPartRow("old"), {ID: "m", PartID: "file:" + fileA, MXID: "$file"}}
-	edit, err := buildEdit(existing, msgconv.ToMatrixResult{FileIDs: []string{fileA}}, testOrigin+"/files/"+fileA, testOrigin)
+	edit, err := buildEdit(existing, msgconv.ToMatrixResult{FileIDs: []string{fileA}}, metaOf(testOrigin+"/files/"+fileA), testOrigin)
 	if err != nil {
 		t.Fatalf("buildEdit: %v", err)
 	}

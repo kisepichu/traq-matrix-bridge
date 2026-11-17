@@ -4,6 +4,8 @@ import (
 	"reflect"
 	"testing"
 	"time"
+
+	"maunium.net/go/mautrix/bridgev2/database"
 )
 
 func TestPollCandidates(t *testing.T) {
@@ -54,5 +56,29 @@ func TestPollCandidates(t *testing.T) {
 				t.Errorf("pollCandidates = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// A message's time is that of its earliest part: a text part added to a file-only message by an edit has
+// the edit's time, and the message would otherwise look newer than it is (and deleted once out of the fetch).
+func TestGroupKnown(t *testing.T) {
+	base := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	at := func(min int) time.Time { return base.Add(time.Duration(min) * time.Minute) }
+	// Newest first, as GetLastNInPortal returns them.
+	parts := []*database.Message{
+		{ID: MessageID("m"), PartID: textPartID, Timestamp: at(5), SenderID: UserID("u"), Metadata: metaOf("caption")},
+		{ID: MessageID("n"), PartID: textPartID, Timestamp: at(3), SenderID: UserID("v"), Metadata: metaOf("N")},
+		{ID: MessageID("m"), PartID: filePartID(fileA), Timestamp: at(0), SenderID: UserID("u"), Metadata: &MessageMetadata{}},
+	}
+	known, senders := groupKnown(parts)
+	want := []knownMessage{
+		{ID: "m", Timestamp: at(0), ContentHash: ContentHash("caption")},
+		{ID: "n", Timestamp: at(3), ContentHash: ContentHash("N")},
+	}
+	if !reflect.DeepEqual(known, want) {
+		t.Errorf("known = %+v, want %+v", known, want)
+	}
+	if want := map[string]string{"m": "u", "n": "v"}; !reflect.DeepEqual(senders, want) {
+		t.Errorf("senders = %v, want %v", senders, want)
 	}
 }

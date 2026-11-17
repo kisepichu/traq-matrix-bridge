@@ -65,7 +65,7 @@ func (c *TraQClient) convertMessage(ctx context.Context, portal *bridgev2.Portal
 func (c *TraQClient) convertMessageAfter(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *traq.Message, earlier map[string]struct{}) (*bridgev2.ConvertedMessage, error) {
 	res := msgconv.ToMatrix(c.toMatrixInput(msg.Content), &resolver{ctx: ctx, c: c, portal: portal, earlier: earlier})
 	up := &portalUploader{api: c.API, files: c.Files, limit: c.Main.maxFileSize(), roomID: portal.MXID, intent: intent}
-	return buildMessage(ctx, res, msg.Content, c.origin(), up, messageFilesTimeout)
+	return buildMessage(ctx, res, messageMetadata(msg), c.origin(), up, messageFilesTimeout)
 }
 
 // convertEdit replaces the text part of an edited message. v1 neither adds nor removes file parts: a file new
@@ -80,7 +80,7 @@ func (c *TraQClient) convertEdit(ctx context.Context, portal *bridgev2.Portal, _
 		}
 	}
 	res := msgconv.ToMatrix(c.toMatrixInput(msg.Content), r)
-	return buildEdit(existing, res, msg.Content, c.origin())
+	return buildEdit(existing, res, messageMetadata(msg), c.origin())
 }
 
 func (c *TraQClient) toMatrixInput(content string) msgconv.ToMatrixInput {
@@ -94,10 +94,10 @@ func (c *TraQClient) toMatrixInput(content string) msgconv.ToMatrixInput {
 // origin is the traQ origin without a trailing slash.
 func (c *TraQClient) origin() string { return c.API.ServerURL().String() }
 
-// buildMessage assembles the parts of a new message. A file that cannot be uploaded (too large, or the
-// download or upload failed) keeps its traQ URL at the end of the text instead, and so do the files not
-// uploaded within filesTimeout, which bounds all uploads of the message together.
-func buildMessage(ctx context.Context, res msgconv.ToMatrixResult, content, origin string, up mediaUploader, filesTimeout time.Duration) (*bridgev2.ConvertedMessage, error) {
+// buildMessage assembles the parts of a new message; meta is the text part's metadata. A file that cannot be
+// uploaded (too large, or the download or upload failed) keeps its traQ URL at the end of the text instead,
+// and so do the files not uploaded within filesTimeout, which bounds all uploads of the message together.
+func buildMessage(ctx context.Context, res msgconv.ToMatrixResult, meta *MessageMetadata, origin string, up mediaUploader, filesTimeout time.Duration) (*bridgev2.ConvertedMessage, error) {
 	files := make([]*bridgev2.ConvertedMessagePart, 0, len(res.FileIDs))
 	var links []string
 	if len(res.FileIDs) > 0 {
@@ -125,7 +125,7 @@ func buildMessage(ctx context.Context, res msgconv.ToMatrixResult, content, orig
 	}
 	cm := &bridgev2.ConvertedMessage{Parts: make([]*bridgev2.ConvertedMessagePart, 0, len(files)+1)}
 	if text := textContent(res, links); text != nil {
-		cm.Parts = append(cm.Parts, textPart(text, content))
+		cm.Parts = append(cm.Parts, textPart(text, meta))
 	}
 	cm.Parts = append(cm.Parts, files...)
 	if len(cm.Parts) == 0 {
@@ -137,9 +137,11 @@ func buildMessage(ctx context.Context, res msgconv.ToMatrixResult, content, orig
 	return cm, nil
 }
 
-// buildEdit computes the edit of the text part. Content the text part was last bridged from is ignored, so
-// the same edit seen by several logins is bridged once. Files that have no part are linked in the text.
-func buildEdit(existing []*database.Message, res msgconv.ToMatrixResult, content, origin string) (*bridgev2.ConvertedEdit, error) {
+// buildEdit computes the edit of the text part to the version meta describes. A version not newer than the
+// one last bridged (by traQ's updatedAt, when the text part has one stored) is ignored, so an older read (a
+// stale poll) does not undo a newer edit. So is content the text part was last bridged from, so the same
+// edit seen by several logins is bridged once. Files that have no part are linked in the text.
+func buildEdit(existing []*database.Message, res msgconv.ToMatrixResult, meta *MessageMetadata, origin string) (*bridgev2.ConvertedEdit, error) {
 	var text *database.Message
 	hasPart := make(map[networkid.PartID]bool, len(existing))
 	for _, part := range existing {
@@ -149,8 +151,10 @@ func buildEdit(existing []*database.Message, res msgconv.ToMatrixResult, content
 		}
 	}
 	if text != nil {
-		if meta, ok := text.Metadata.(*MessageMetadata); ok && meta.ContentHash == ContentHash(content) {
-			return nil, bridgev2.ErrIgnoringRemoteEvent
+		if stored, ok := text.Metadata.(*MessageMetadata); ok {
+			if !stored.UpdatedAt.IsZero() && !meta.UpdatedAt.After(stored.UpdatedAt) || stored.ContentHash == meta.ContentHash {
+				return nil, bridgev2.ErrIgnoringRemoteEvent
+			}
 		}
 	}
 	var links []string
@@ -166,10 +170,10 @@ func buildEdit(existing []*database.Message, res msgconv.ToMatrixResult, content
 	case newText == nil:
 		return &bridgev2.ConvertedEdit{DeletedParts: []*database.Message{text}}, nil
 	case text == nil:
-		return &bridgev2.ConvertedEdit{AddedParts: &bridgev2.ConvertedMessage{Parts: []*bridgev2.ConvertedMessagePart{textPart(newText, content)}}}, nil
+		return &bridgev2.ConvertedEdit{AddedParts: &bridgev2.ConvertedMessage{Parts: []*bridgev2.ConvertedMessagePart{textPart(newText, meta)}}}, nil
 	default:
-		// ToEditPart stores the new ContentHash in the existing part's metadata.
-		return &bridgev2.ConvertedEdit{ModifiedParts: []*bridgev2.ConvertedEditPart{textPart(newText, content).ToEditPart(text)}}, nil
+		// ToEditPart stores meta in the existing part.
+		return &bridgev2.ConvertedEdit{ModifiedParts: []*bridgev2.ConvertedEditPart{textPart(newText, meta).ToEditPart(text)}}, nil
 	}
 }
 
@@ -198,12 +202,12 @@ func textContent(res msgconv.ToMatrixResult, links []string) *event.MessageEvent
 	}
 }
 
-func textPart(content *event.MessageEventContent, traqContent string) *bridgev2.ConvertedMessagePart {
+func textPart(content *event.MessageEventContent, meta *MessageMetadata) *bridgev2.ConvertedMessagePart {
 	return &bridgev2.ConvertedMessagePart{
 		ID:         textPartID,
 		Type:       event.EventMessage,
 		Content:    content,
-		DBMetadata: &MessageMetadata{ContentHash: ContentHash(traqContent)},
+		DBMetadata: meta,
 	}
 }
 

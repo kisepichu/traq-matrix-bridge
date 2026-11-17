@@ -47,12 +47,12 @@ func catchUpChannels(targets map[string]channelInfo, unread []traq.UnreadChannel
 	return ids
 }
 
-// catchUpCandidates reads the activity timeline and returns catchUpChannels of the current targets. A failed
-// read is logged and leaves the timeline's channels out.
-func (c *TraQClient) catchUpCandidates(ctx context.Context, unread []traq.UnreadChannel, since time.Time) map[string]struct{} {
+// catchUpCandidates reads the activity timeline and returns catchUpChannels of the current targets. If the
+// read fails, the error comes with the candidates without the timeline's channels.
+func (c *TraQClient) catchUpCandidates(ctx context.Context, unread []traq.UnreadChannel, since time.Time) (map[string]struct{}, error) {
 	timeline, err := c.API.ActivityTimeline(ctx, true)
-	if err != nil && ctx.Err() == nil {
-		c.Login.Log.Warn().Err(err).Msg("Failed to get the activity timeline, catching up on unread channels and DMs only")
+	if err != nil {
+		err = fmt.Errorf("get the activity timeline: %w", err)
 	}
 	c.stateMu.RLock()
 	ids := catchUpChannels(c.targets, unread, timeline, since)
@@ -61,7 +61,7 @@ func (c *TraQClient) catchUpCandidates(ctx context.Context, unread []traq.Unread
 	for _, id := range ids {
 		set[id] = struct{}{}
 	}
-	return set
+	return set, err
 }
 
 // catchUp queues, after a reconnect, a ChatResync with newerMessages for each candidate channel that has a
@@ -80,7 +80,13 @@ func (c *TraQClient) catchUp(ctx context.Context, since time.Time) {
 		}
 		log.Warn().Err(err).Msg("Failed to get the unread channels for the catch-up")
 	}
-	candidates := c.catchUpCandidates(ctx, unread, since)
+	candidates, err := c.catchUpCandidates(ctx, unread, since)
+	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		log.Warn().Err(err).Msg("Failed to get the activity timeline, catching up on unread channels and DMs only")
+	}
 	queued := 0
 	for id := range candidates {
 		ch, ok := c.lookupChannel(id)
@@ -115,13 +121,19 @@ func (c *TraQClient) newerMessages(channelID string) backfillCheck {
 		if err != nil {
 			return false, fmt.Errorf("get the newest message of channel %s: %w", channelID, err)
 		}
-		if len(msgs) == 0 {
-			return false, nil
-		}
-		if latest == nil {
-			return true, nil
-		}
-		// Not After: a message posted at the same time as the newest bridged one is new too.
-		return TraQMessageID(latest.ID) != msgs[0].ID && !msgs[0].CreatedAt.Before(latest.Timestamp), nil
+		return hasNewerMessage(msgs, latest), nil
 	}
+}
+
+// hasNewerMessage reports whether newest (the channel's newest message, or none) is newer than latest, the
+// newest bridged message (nil in an empty room). A different message at the same time as latest is newer:
+// it was posted at the same instant.
+func hasNewerMessage(newest []traq.Message, latest *database.Message) bool {
+	if len(newest) == 0 {
+		return false
+	}
+	if latest == nil {
+		return true
+	}
+	return TraQMessageID(latest.ID) != newest[0].ID && !newest[0].CreatedAt.Before(latest.Timestamp)
 }

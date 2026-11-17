@@ -160,8 +160,9 @@ func (c *TraQClient) queueLeave(key networkid.PortalKey) {
 // retries them.
 //
 // The resyncs of the channels that may have messages posted while the bridge was not running (see
-// catchUpChannels) carry newerMessages, so bridgev2 fetches those messages into existing rooms. They are
-// queued before the WebSocket is read, so each portal handles its catch-up before any live message.
+// catchUpChannels; every target when the activity timeline cannot be read) carry newerMessages, so bridgev2
+// fetches those messages into existing rooms. They are queued before the WebSocket is read, so each portal
+// handles its catch-up before any live message.
 func (c *TraQClient) initialSync(ctx context.Context, me *traq.Me, targets map[string]channelInfo, unread []traq.UnreadChannel) {
 	log := c.Login.Log
 	ids := make([]string, 0, len(targets))
@@ -169,14 +170,18 @@ func (c *TraQClient) initialSync(ctx context.Context, me *traq.Me, targets map[s
 		ids = append(ids, id)
 	}
 	slices.Sort(ids)
-	catchUp := c.catchUpCandidates(ctx, unread, time.Time{})
+	catchUp, err := c.catchUpCandidates(ctx, unread, time.Time{})
+	checkAll := err != nil
+	if checkAll && ctx.Err() == nil {
+		log.Warn().Err(err).Msg("Failed to get the activity timeline, checking every channel for messages missed while stopped")
+	}
 	keys := make(map[networkid.PortalKey]struct{}, len(ids))
 	var failed []channelInfo
 	for _, id := range ids {
 		ch := targets[id]
 		keys[c.portalKey(ch)] = struct{}{}
 		var needsBackfill backfillCheck
-		if _, ok := catchUp[id]; ok {
+		if _, ok := catchUp[id]; ok || checkAll {
 			needsBackfill = c.newerMessages(id)
 		}
 		if !c.queueResync(ctx, ch, needsBackfill) {

@@ -33,9 +33,10 @@ func TestDiffMessages(t *testing.T) {
 	}
 
 	for name, tc := range map[string]struct {
-		fetched                []traq.Message
-		known                  []knownMessage
-		edited, deleted, stamp []string
+		fetched                     []traq.Message
+		complete                    bool // the fetch is the channel's whole history (more == false)
+		known                       []knownMessage
+		new, edited, deleted, stamp []string
 	}{
 		"no change": {
 			fetched: []traq.Message{msg("b", 2, "B", stamp("u", "s", 1)), msg("a", 1, "A")},
@@ -99,12 +100,55 @@ func TestDiffMessages(t *testing.T) {
 			known: []knownMessage{known("a", 1, "A")},
 		},
 		"fetched but not bridged": {
+			// Missed by the WebSocket (a dead connection not noticed yet).
 			fetched: []traq.Message{msg("b", 2, "B", stamp("u", "s", 1)), msg("a", 1, "A")},
 			known:   []knownMessage{known("a", 1, "A")},
+			new:     []string{"b"},
+		},
+		"not bridged, oldest first": {
+			fetched: []traq.Message{msg("d", 4, "D"), msg("b", 2, "B"), msg("c", 3, "C"), msg("a", 1, "A")},
+			known:   []knownMessage{known("a", 1, "A"), known("c", 3, "C")},
+			new:     []string{"b", "d"},
+		},
+		"not bridged and older than every fetched bridged message": {
+			// History from before the room, or beyond the rows read: not posted as new messages.
+			fetched: []traq.Message{msg("c", 3, "C"), msg("b", 2, "B"), msg("a", 1, "A")},
+			known:   []knownMessage{known("b", 2, "B")},
+			new:     []string{"c"},
+		},
+		"not bridged and no fetched message is bridged": {
+			// More messages than the fetch holds came since the newest bridged one: the catch-up's to fetch.
+			fetched: []traq.Message{msg("c", 3, "C"), msg("b", 2, "B")},
+			known:   []knownMessage{known("a", 1, "A")},
+		},
+		"reactions not read are not compared": {
+			fetched: []traq.Message{msg("a", 1, "A", stamp("u", "s", 1))},
+			known:   []knownMessage{{ID: "a", Timestamp: at(1), ContentHash: ContentHash("A")}},
+		},
+		"whole history: older than the fetched ones": {
+			fetched:  []traq.Message{msg("c", 3, "C"), msg("b", 2, "B")},
+			complete: true,
+			known:    []knownMessage{known("a", 1, "A"), known("b", 2, "B"), known("c", 3, "C")},
+			deleted:  []string{"a"},
+		},
+		"whole history: at the oldest fetched time": {
+			fetched:  []traq.Message{msg("b", 2, "B")},
+			complete: true,
+			known:    []knownMessage{known("a", 2, "A"), known("b", 2, "B")},
+			deleted:  []string{"a"},
+		},
+		"whole history: nothing fetched": {
+			// A DM whose only message was deleted.
+			complete: true,
+			known:    []knownMessage{known("a", 1, "A")},
+			deleted:  []string{"a"},
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			d := diffMessages(tc.fetched, tc.known)
+			d := diffMessages(tc.fetched, tc.known, !tc.complete)
+			if got := ids(d.New); !reflect.DeepEqual(got, tc.new) {
+				t.Errorf("New = %q, want %q", got, tc.new)
+			}
 			if got := ids(d.Edited); !reflect.DeepEqual(got, tc.edited) {
 				t.Errorf("Edited = %q, want %q", got, tc.edited)
 			}

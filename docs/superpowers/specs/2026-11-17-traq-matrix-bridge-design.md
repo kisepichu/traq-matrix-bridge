@@ -146,17 +146,27 @@ traQ の WebSocket は event ごとに届く相手が違う。
 - **それ以外のチャンネル** (poller): 新着は全部 bridge に届くので、bridge は portal ごとの最終書き込み時刻を
   知っている (起動時は database の最新 message から、その後は受け取った event から)。`poll.interval` ごとに、
   最終書き込みが `poll.window` 内で、今 viewstate を向けていない portal を新しい順に最大 `poll.max_channels` 件選び、
-  `/channels/{id}/messages?limit=<poll.depth>` を読む。DM もこれで対象になる。取れたメッセージと database の
-  状態を比べて、次の remote event を出す。
-  - 本文か `updatedAt` が変わった → 編集
+  `/channels/{id}/messages?limit=<poll.depth>` を読む。DM もこれで対象になる。取る前に database の状態
+  (bridge 済みの message と reaction) を読み、取れたメッセージと比べて、次の remote event を出す。
+  message の時刻は part のうち最も古いもの (編集で足した本文の part は編集の時刻を持つため)。
+  - 本文が変わった → 編集。ただし traQ の `updatedAt` が bridge 済みのもの (本文の part に保存) より新しくなければ
+    捨てる (古い poll の結果が、WebSocket で届いた新しい編集を戻さないため)
   - database にある (取る前に読む) のに、取れた最古より新しいのに無い → 削除 (取る前から traQ にあった
-    message なので、取れた最新より新しいもの、つまりチャンネルの最新の message の削除も拾う)
+    message なので、取れた最新より新しいもの、つまりチャンネルの最新の message の削除も拾う)。traQ が
+    続きが無い (`more` が false、取れたのがチャンネルの全部) と言うときは、取れなかったものは全部削除
+    (1 件も取れないとき、たとえば唯一の message を消した DM も)
+  - database に無いのに取れた (WebSocket が切れていたのに気付いていない間の新着) → 新着として bridge する
+    (順番は前後しうるが失われない。bridge 済みの ID は bridgev2 が捨てる)。ただし、取れた中で bridge 済みの
+    最古の message より古いものは除く (room より前の過去ログか、読んだ範囲の外)。取れた中に bridge 済みのものが
+    無ければ何もしない (取れる件数より多く来ているので、再接続の取り込みに任せる)
   - stamp の (user, stamp) の組が増えた・減った → reaction の追加・削除
   
   `/activity/timeline` は候補選びに使わない。`limit` が最大 50 で、public チャンネルしか返さない (DM が漏れる) ため。
 - **再接続**: WebSocket が切れたら指数 backoff で繋ぎ直す。繋がったら、切れていた間の新着を拾うため、
-  `/users/me/unread` に出ているチャンネルと `/activity/timeline?per_channel=true` (購読チャンネル) に出ている
-  チャンネルのうち、最終書き込みが切断時刻より後の portal について、database の最新 message より後を取り込む。
+  `/users/me/unread` に出ているチャンネル、`/activity/timeline?per_channel=true` (購読チャンネル) で最後の
+  投稿が切断時刻 (気付くまでの遅れと時計のずれの分を引く) 以後のチャンネル、全 DM のうち、room のある portal に
+  ついて、traQ の最新が database の最新 message より新しければ、その後を取り込む。bridge を起動したときは
+  unread・activity timeline (時刻で絞らない)・全 DM について同じことをする (activity timeline が読めなければ全 portal)。
   `PING` を定期的に送り、応答が無ければ切って繋ぎ直す。
 - **user / stamp の変更**: `USER_UPDATED` / `USER_ICON_UPDATED` で ghost の表示名とアイコンを、
   `STAMP_CREATED` / `UPDATED` / `DELETED` で stamp の cache を更新する。
@@ -267,7 +277,7 @@ traQ の WebSocket は event ごとに届く相手が違う。
 
 1. **単体テスト** (`go test ./...`): `pkg/msgconv` (mention・channel link・group・spoiler・引用 → reply の
    判定・Matrix HTML → traQ Markdown)、`pkg/stampconv` (絵文字・`:name:`・未知の key)、検索 query の解釈、
-   poller の差分 (編集・削除・stamp 増減・取れた範囲外を削除と誤認しないこと)。
+   poller の差分 (新着・編集・削除・stamp 増減・取れた範囲外を削除と誤認しないこと・全部取れたときの削除)。
 2. **結合テスト** (`go test -tags integration ./pkg/traq/...`): `testenv/compose.yaml` で
    `ghcr.io/traptitech/traq:3.32.1`、MariaDB、Elasticsearch を立てる。テストの中で管理者 (`traq`/`traq`) で
    login し、OAuth client を作り、PKCE で認可して token に換える。その token で投稿・編集・削除、stamp、

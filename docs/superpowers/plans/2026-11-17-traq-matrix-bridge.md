@@ -1445,7 +1445,8 @@ type PortalMetadata struct {
 	DMUserID string `json:"dm_user_id,omitempty"` // the other party of a DM
 }
 type MessageMetadata struct {
-	ContentHash string `json:"content_hash,omitempty"` // hex sha256 of the traQ content as last bridged (first part only)
+	ContentHash string    `json:"content_hash,omitempty"` // hex sha256 of the traQ content as last bridged (first part only)
+	UpdatedAt   time.Time `json:"updated_at,omitzero"`    // traQ's updatedAt of the version last bridged; zero in older rows
 }
 func ContentHash(content string) string
 
@@ -1579,11 +1580,11 @@ func (c *TraQClient) reactionKey(stampID string) (string, bool)                 
 - part: 本文の part は `PartID ""`、file の part は `PartID "file:<fileID>"`。本文が空なら file の part だけ。どれも無い (空の message) なら `bridgev2.ErrIgnoringRemoteEvent`。
 - file: `FileMeta` → size が homeserver の upload 上限 (bridgev2 の matrix connector が持つ media config。確かめて使う) 以下なら `DownloadFile` して `intent.UploadMedia` (portal が暗号化なら暗号化される)。画像 (`mime` が `image/`) は `m.image`、他は `m.file`、`Info{MimeType, Size}`、body は file 名。上限を超えたら file の part を作らず、本文の末尾に `<origin>/files/<id>` を戻す。
 - `msgconv.Resolver` の実装: `UserMXID` は ghost の MXID (`Bridge.Matrix.GhostIntent(UserID(u)).GetMXID()` 相当) か、自分なら login の Matrix user の MXID。`ChannelLink` は portal の room があれば `id.RoomID.URI().MatrixToURL()`。`MessageLink` は `br.DB.Message.GetFirstPartByID` で引いた event の matrix.to URL。`CanReplyTo` は同じ portal に bridge 済み。
-- part の metadata: 本文の part の `MessageMetadata.ContentHash = ContentHash(msg.Content)`。
+- part の metadata: 本文の part の `MessageMetadata{ContentHash: ContentHash(msg.Content), UpdatedAt: msg.UpdatedAt}` (Task 12 が `UpdatedAt` を足した。作成・traQ からの編集・backfill で同じ)。
 - 送信者: `EventSender{Sender: UserID(msg.UserID), IsFromMe: msg.UserID == me.ID, SenderLogin: 自分なら LoginID}`。`Timestamp` = `CreatedAt`。
 - WebSocket event の扱い (`handle_traq.go`):
   - `MESSAGE_CREATED`: `Message(id)` → `portalKeyFor(channelID)` が無ければ無視 (購読していない public チャンネル)。`simplevent.Message[*traq.Message]{Type: RemoteEventMessage, CreatePortal: DM のときだけ true, ID, ConvertMessageFunc}`。最終書き込み時刻 (Task 12 が使う) を更新する。
-  - `MESSAGE_UPDATED`: `Message(id)` → `Type: RemoteEventEdit, TargetMessage: ID, ConvertEditFunc` (本文の part を差し替え、`ContentHash` を更新。file の増減は v1 では本文の part の差し替えだけで扱う)。
+  - `MESSAGE_UPDATED`: `Message(id)` → `Type: RemoteEventEdit, TargetMessage: ID, ConvertEditFunc` (本文の part を差し替え、`ContentHash` と `UpdatedAt` を更新。保存した `UpdatedAt` より新しくない版は捨てる (保存が無い古い行は hash だけで判定)。file の増減は v1 では本文の part の差し替えだけで扱う)。
   - `MESSAGE_DELETED`: database の message から portal を引き (`GetFirstPartByID`、receiver は DM なら login、public なら空)、`simplevent.MessageRemove`。見つからなければ無視。
   - `MESSAGE_STAMPED`: `Type: RemoteEventReaction`、`EmojiID(stampID)`、`Emoji = reactionKey`、`Sender = sender(user_id)`、portal は message から引く。`MESSAGE_UNSTAMPED`: `Type: RemoteEventReactionRemove`。count の増加 (同じ user が同じ stamp を重ねる) は同じ EmojiID なので bridgev2 が重複として捨てる。
   - `MESSAGE_READ` (id = channel): `simplevent.Receipt{Type: RemoteEventReadReceipt, Sender: IsFromMe, ReadUpTo: now}`。
@@ -1633,7 +1634,7 @@ func (v *viewState) Resend(ctx context.Context)                  // after a WebS
 決まり:
 
 - `HandleMatrixMessage`: msgtype が `m.text` / `m.emote` / `m.notice` 以外 (file、画像など) は `bridgev2.ErrUnsupportedMessageType`。`m.emote` は先頭に `/me ` を付けず、本文の先頭に `*` と表示名を付けない (traQ に emote が無いので本文そのまま)。reply 先は `msg.ReplyTo` の `database.Message.ID`。`ToTraQ` の `ErrTooLong` は `bridgev2.WrapErrorInStatus(err).WithSendNotice(true).WithIsCertain(true).WithErrorAsMessage().WithStatus(event.MessageStatusFail)`。成功したら `PostMessage` の戻りから `MatrixMessageResponse{DB: &database.Message{ID: MessageID(m.ID), SenderID: UserID(me.ID), Timestamp: m.CreatedAt, Metadata: &MessageMetadata{ContentHash: ContentHash(m.Content)}}}` (traQ が埋め込みに直した後の本文の hash)。`viewState.Touch`。
-- `HandleMatrixEdit`: 対象が自分の message でなければ `bridgev2.ErrEditsNotSupported` 相当の拒否 (traQ は他人の message を編集できない)。`ToTraQ` (reply 先は `EditTarget.ReplyTo` から引き直して先頭の引用行を保つ) → `EditMessage` → `Message(id)` で本文を読み直し、`EditTarget.Metadata` の `ContentHash` を更新する (poller が自分の編集を traQ 側の編集と誤認しないため)。
+- `HandleMatrixEdit`: 対象が自分の message でなければ `bridgev2.ErrEditsNotSupported` 相当の拒否 (traQ は他人の message を編集できない)。`ToTraQ` (reply 先は `EditTarget.ReplyTo` から引き直して先頭の引用行を保つ) → `EditMessage` → `Message(id)` で本文を読み直し、`EditTarget.Metadata` の `ContentHash` と `UpdatedAt` を更新する (poller が自分の編集を traQ 側の編集と誤認しないため)。`HandleMatrixMessage` の `Metadata` も `PostMessage` の戻りの `UpdatedAt` を持つ。
 - `HandleMatrixMessageRemove`: 自分の message だけ `DeleteMessage`。他人のものは error (traQ の権限が無い)。
 - `PreHandleMatrixReaction`: `Table.Resolve(key)` → `MatrixReactionPreResponse{SenderID: UserID(me.ID), EmojiID: EmojiID(stamp.ID), Emoji: ReactionKey(stamp)}`。未知の key、表が未完成で絵文字の key は error (message status で返る)。
 - `HandleMatrixReaction`: `AddStamp`。`HandleMatrixReactionRemove`: `RemoveStamp`。
@@ -1652,7 +1653,7 @@ func (v *viewState) Resend(ctx context.Context)                  // after a WebS
 **Files:**
 - Create: `pkg/connector/poller.go`、`pkg/connector/pollerdiff.go` (副作用の無い差分計算)、`pkg/connector/catchup.go`
 - Modify: `pkg/connector/client.go` (poller の goroutine、最終書き込み時刻の map、再接続時に catch-up)、`pkg/connector/sync.go` (`ChatResync` に `CheckNeedsBackfillFunc`)
-- Test: `pkg/connector/pollerdiff_test.go`、`pkg/connector/poller_test.go` (候補選び)
+- Test: `pkg/connector/pollerdiff_test.go`、`pkg/connector/poller_test.go` (候補選び、`groupKnown`)、`pkg/connector/catchup_test.go`、`pkg/connector/convert_test.go` (`buildEdit` の `UpdatedAt`)
 
 **Interfaces:**
 - Consumes: Task 9、10。bridgev2 §3 (`ReactionSync`、`MessageRemove`、edit)、§11 (`ChatResync` の backfill 判定)。
@@ -1662,19 +1663,20 @@ func (v *viewState) Resend(ctx context.Context)                  // after a WebS
 // pollerdiff.go
 type knownMessage struct {
 	ID          string
-	Timestamp   time.Time
+	Timestamp   time.Time          // the earliest of its parts (a text part added by an edit has the edit's time)
 	ContentHash string
-	Reactions   map[[2]string]bool // (userID, stampID) currently bridged
+	Reactions   map[[2]string]bool // (userID, stampID) currently bridged; nil when not read, then not compared
 }
 type pollDiff struct {
+	New             []traq.Message // fetched, not known, not older than the oldest fetched known message; oldest first
 	Edited          []traq.Message // content hash differs
-	Deleted         []string       // known IDs inside the fetched time range but not fetched
+	Deleted         []string       // known IDs that the fetch covers but did not return
 	ReactionChanged []traq.Message // (user, stamp) set differs
 }
-// diffMessages compares fetched (any order, from GET /channels/{id}/messages) with known (bridged).
-// Known messages outside [oldest fetched CreatedAt, newest fetched CreatedAt] are never reported as deleted.
-// If fetched is empty nothing is reported.
-func diffMessages(fetched []traq.Message, known []knownMessage) pollDiff
+// diffMessages compares fetched (any order, from GET /channels/{id}/messages) with known (bridged, read
+// before the fetch). more is the fetch's more flag. A known message not fetched is deleted if it is newer
+// than the oldest fetched one, or whatever its time when more is false (also when nothing was fetched).
+func diffMessages(fetched []traq.Message, known []knownMessage, more bool) pollDiff
 
 // poller.go
 // pollCandidates picks channels whose last activity is within window, excluding the viewed channel,
@@ -1685,15 +1687,17 @@ func pollCandidates(lastActivity map[string]time.Time, viewed string, now time.T
 決まり:
 
 - 最終書き込み時刻の map (`channelID → time`): `Connect` のとき各 portal の `br.DB.Message.GetLastNInPortal(ctx, key, 1)` の Timestamp で初期化し、`MESSAGE_CREATED` と poller・catch-up で取り込んだ message で更新する。
-- poller は `poll.interval` ごとに `pollCandidates` の各チャンネルについて `Messages(Limit: poll.depth, Order: desc)` を読み、database から `known` を作る: `GetLastNInPortal(key, poll.depth*4)` を message ID でまとめ (file の part があるので)、本文の part の `ContentHash`、`br.DB.Reaction.GetAllToMessage` の (sender, emoji) の組。`GetLastNInPortal` は `Messages` より先に読む (known の message はどれも取る時点で traQ にあったので、取れた最古より新しいのに無ければ消えている。チャンネルの最新の message の削除もこれで拾う)。
-- 差分の出し方: `Edited` → `RemoteEventEdit` (Task 10 と同じ `convertEdit`)、`Deleted` → `MessageRemove`、`ReactionChanged` → `simplevent.ReactionSync{Reactions: {Users: 全 user 分, HasAllUsers: true}}` (bridgev2 が足し引きを計算する)。
+- poller は `poll.interval` ごとに `pollCandidates` の各チャンネルについて `Messages(Limit: poll.depth, Order: desc)` を読み、database から `known` を作る: `GetLastNInPortal(key, poll.depth*4)` を message ID でまとめ (file の part があるので。時刻は part の最も古いもの)、本文の part の `ContentHash`、新しい `poll.depth` 件の `br.DB.Reaction.GetAllToMessage` の (sender, emoji) の組。message と reaction は `Messages` より先に読む (known の message はどれも取る時点で traQ にあったので、取れた最古より新しいのに無ければ消えている。チャンネルの最新の message の削除もこれで拾う。取った後に Matrix から付け外しした reaction を変化と取らない)。`Deleted` に出たものは削除の前に `GetAllPartsByID` で全 part の時刻を見直す (読んだ行の外に古い part があるかもしれないため)。
+- 差分の出し方: `New` → `RemoteEventMessage` (WebSocket と同じ変換。bridge 済みの ID は bridgev2 が portal の直列 loop で捨てる)、`Edited` → `RemoteEventEdit` (Task 10 と同じ `convertEdit`。保存した `UpdatedAt` より新しくない版は `convertEdit` が捨てる)、`Deleted` → `MessageRemove`、`ReactionChanged` → `simplevent.ReactionSync{Reactions: {Users: 全 user 分, HasAllUsers: true}}` (bridgev2 が足し引きを計算する)。
 - 1 回の poll の中で、チャンネルごとの失敗は log に残して次のチャンネルへ。REST の負荷を抑えるため、チャンネルの間で 200ms 空ける。
-- 再接続の catch-up (`catchup.go`): 切断時刻を覚えておき、繋がったら `Unread` のチャンネル、`ActivityTimeline(perChannel: true)` のチャンネル、全 DM のうち portal のあるものに `ChatResync{CheckNeedsBackfillFunc}` を queue する。`CheckNeedsBackfillFunc` は `Messages(Limit: 1, Order: desc)` の最新が database の最新 (`latestMessage`) より新しいかを返す (true なら bridgev2 が `FetchMessages` の forward で `max_catchup_messages` まで取り込む。Task 13)。
-- 初回の `Connect` (bridge が止まっていた間の分): 新しく queue を作らず、Task 9 の手順 3 で queue する `ChatResync` のうち、上の候補 (Unread・activity timeline・DM) に当たるものに同じ `CheckNeedsBackfillFunc` を付ける。
+- 再接続の catch-up (`catchup.go`): 切断時刻を覚えておき、繋がったら `Unread` のチャンネル、`ActivityTimeline(perChannel: true)` で `CreatedAt` が切断時刻 − (ping の間隔 + timeout + 1 分) 以後のチャンネル、全 DM のうち room のある portal に `ChatResync{CheckNeedsBackfillFunc}` を queue する。`CheckNeedsBackfillFunc` は `Messages(Limit: 1, Order: desc)` の最新が database の最新 (`latestMessage`) と別の ID で、時刻がそれより前でないかを返す (true なら bridgev2 が `FetchMessages` の forward で `max_catchup_messages` まで取り込む。Task 13)。
+- 初回の `Connect` (bridge が止まっていた間の分): 新しく queue を作らず、Task 9 の手順 3 で queue する `ChatResync` のうち、上の候補 (Unread・activity timeline を時刻で絞らず・DM) に当たるものに同じ `CheckNeedsBackfillFunc` を付ける。activity timeline が読めなければ全部に付ける (1 portal に小さな request 1 回)。
 
 - [ ] **Step 1: 失敗するテストを書く**
-  - `pollerdiff_test.go` (table test): 変化なし → 空。本文の hash が違う → Edited。範囲内で消えた → Deleted。範囲より古い known → Deleted にしない。取れた最新より新しい known (取る前に読んだので、消えた最新の message) → Deleted。stamp の組が増えた / 減った → ReactionChanged。count だけ増えた → 変化なし。fetched が空 → 空。known に無い fetched (poller の前に未 bridge) → 何も出さない (新着は WebSocket と catch-up の担当)。
-  - `poller_test.go`: window 外を除く、viewed を除く、新しい順、max で切る、同時刻の順は channel ID の順 (安定)。
+  - `pollerdiff_test.go` (table test): 変化なし → 空。本文の hash が違う → Edited。範囲内で消えた → Deleted。範囲より古い known → Deleted にしない。取れた最新より新しい known (取る前に読んだので、消えた最新の message) → Deleted。`more` が false → 範囲より古いもの・最古と同時刻のもの・fetched が空のときの known も Deleted。stamp の組が増えた / 減った → ReactionChanged。count だけ増えた → 変化なし。reaction を読んでいない known → 比べない。fetched が空 → 空。known に無い fetched → New (古い順)。ただし取れた bridge 済みの最古より古いものは除き、取れた中に bridge 済みが無ければ New も空。
+  - `poller_test.go`: window 外を除く、viewed を除く、新しい順、max で切る、同時刻の順は channel ID の順 (安定)。`groupKnown`: 編集で足した本文の part より古い file の part の時刻を取る。
+  - `catchup_test.go`: `catchUpChannels` (`since` ちょうどは含む、より前は除く、zero なら全部、DM は常に、target でないものは除く)。`hasNewerMessage` (同じ ID、同時刻の別 ID、`latest` が nil、traQ に無い、古いものだけ)。
+  - `convert_test.go`: `buildEdit` は保存した `UpdatedAt` より新しくない版を捨てる (保存が無ければ hash だけ)。
 - [ ] **Step 2: 失敗を確かめる** — `go test ./pkg/connector/ -run 'Diff|Candidates'` → FAIL
 - [ ] **Step 3: 実装する**
 - [ ] **Step 4: 通す** — `go test -race ./...` → PASS

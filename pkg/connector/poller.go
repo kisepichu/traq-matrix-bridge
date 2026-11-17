@@ -79,8 +79,9 @@ func (c *TraQClient) loadLastActivity(ctx context.Context, targets map[string]ch
 }
 
 // pollLoop re-reads the recently active channels every poll.interval until ctx ends, to bridge the edits,
-// deletions and stamp changes that the WebSocket does not deliver: it sends stamps only for the viewed
-// channel, and nothing but new messages for DMs. A rejected token stops the session with errTokenRejected.
+// deletions and stamp changes that the WebSocket does not deliver (it sends stamps only for the viewed
+// channel, and nothing but new messages for DMs), and the new messages it missed while its connection was
+// dead but not noticed yet. A rejected token stops the session with errTokenRejected.
 func (c *TraQClient) pollLoop(ctx context.Context, stop context.CancelCauseFunc) {
 	t := time.NewTicker(c.Main.Config.Poll.Interval)
 	ctx = c.Login.Log.With().Str("action", "poll").Logger().WithContext(ctx)
@@ -147,33 +148,41 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 }
 
 // pollChannel reads the newest poll.depth messages of a channel, compares them with what is bridged and
-// queues an edit, a removal or a reaction sync for each difference.
+// queues a message, an edit, a removal or a reaction sync for each difference.
 func (c *TraQClient) pollChannel(ctx context.Context, channelID string) error {
 	key, ok := c.portalKeyFor(channelID)
 	if !ok {
 		return nil
 	}
 	depth := c.Main.Config.Poll.Depth
-	// Read before the fetch, so each of these messages was in traQ when it was fetched (see diffMessages).
+	// Read before the fetch, so each of these messages was in traQ when it was fetched (see diffMessages),
+	// and a reaction bridged from Matrix after the fetch is not taken for a change in traQ.
 	parts, err := c.Login.Bridge.DB.Message.GetLastNInPortal(ctx, key, depth*knownRowsPerMessage)
 	if err != nil {
 		return fmt.Errorf("get bridged messages: %w", err)
 	}
-	fetched, _, err := c.API.Messages(ctx, channelID, traq.MessagesQuery{Limit: depth, Order: "desc"})
+	known, senders := groupKnown(parts)
+	if err := c.readReactions(ctx, key, known, depth); err != nil {
+		return err
+	}
+	fetched, more, err := c.API.Messages(ctx, channelID, traq.MessagesQuery{Limit: depth, Order: "desc"})
 	if err != nil {
 		return fmt.Errorf("get messages: %w", err)
-	}
-	if len(fetched) == 0 {
-		return nil
 	}
 	for _, m := range fetched {
 		c.noteActivity(channelID, m.CreatedAt)
 	}
-	known, senders, err := c.knownMessages(ctx, key, parts, fetched)
-	if err != nil {
-		return err
+	d := diffMessages(fetched, known, more)
+	if more && len(d.Deleted) > 0 {
+		// The rows read may have left out the earliest part of a message to delete; check all its parts.
+		if err := c.completeTimestamps(ctx, key, known, d.Deleted); err != nil {
+			return err
+		}
+		d = diffMessages(fetched, known, more)
 	}
-	d := diffMessages(fetched, known)
+	for i := range d.New {
+		c.queueMessage(key, &d.New[i])
+	}
 	for i := range d.Edited {
 		c.queueEdit(key, &d.Edited[i])
 	}
@@ -183,9 +192,10 @@ func (c *TraQClient) pollChannel(ctx context.Context, channelID string) error {
 	for i := range d.ReactionChanged {
 		c.queueReactionSync(ctx, key, &d.ReactionChanged[i])
 	}
-	if len(d.Edited)+len(d.Deleted)+len(d.ReactionChanged) > 0 {
+	if len(d.New)+len(d.Edited)+len(d.Deleted)+len(d.ReactionChanged) > 0 {
 		zerolog.Ctx(ctx).Debug().
 			Str("traq_channel_id", channelID).
+			Int("new", len(d.New)).
 			Int("edited", len(d.Edited)).
 			Int("deleted", len(d.Deleted)).
 			Int("reactions_changed", len(d.ReactionChanged)).
@@ -194,14 +204,9 @@ func (c *TraQClient) pollChannel(ctx context.Context, channelID string) error {
 	return nil
 }
 
-// knownMessages groups the rows bridged to the portal by message. The reactions are read only for the
-// messages that were fetched, the only ones diffMessages compares them for. senders maps each message ID to
-// its traQ author.
-func (c *TraQClient) knownMessages(ctx context.Context, key networkid.PortalKey, parts []*database.Message, fetched []traq.Message) (known []knownMessage, senders map[string]string, err error) {
-	wasFetched := make(map[string]bool, len(fetched))
-	for _, m := range fetched {
-		wasFetched[m.ID] = true
-	}
+// groupKnown groups the rows bridged to a portal by message, without reactions. A message's Timestamp is
+// that of its earliest part. senders maps each message ID to its traQ author.
+func groupKnown(parts []*database.Message) (known []knownMessage, senders map[string]string) {
 	index := make(map[string]int)
 	senders = make(map[string]string)
 	for _, part := range parts {
@@ -212,25 +217,55 @@ func (c *TraQClient) knownMessages(ctx context.Context, key networkid.PortalKey,
 			index[id] = i
 			known = append(known, knownMessage{ID: id, Timestamp: part.Timestamp})
 			senders[id] = TraQUserID(part.SenderID)
+		} else if part.Timestamp.Before(known[i].Timestamp) {
+			known[i].Timestamp = part.Timestamp
 		}
 		if meta, ok := part.Metadata.(*MessageMetadata); ok && part.PartID == textPartID {
 			known[i].ContentHash = meta.ContentHash
 		}
 	}
-	for i := range known {
-		if !wasFetched[known[i].ID] {
-			continue
-		}
+	return known, senders
+}
+
+// readReactions reads the bridged reactions of the newest n known messages: a fetch of the newest n messages
+// returns no older known message unless newer ones were deleted, and the others keep nil Reactions (not
+// compared) until those deletions are bridged.
+func (c *TraQClient) readReactions(ctx context.Context, key networkid.PortalKey, known []knownMessage, n int) error {
+	newest := make([]int, len(known))
+	for i := range newest {
+		newest[i] = i
+	}
+	slices.SortFunc(newest, func(a, b int) int { return known[b].Timestamp.Compare(known[a].Timestamp) })
+	for _, i := range newest[:min(n, len(newest))] {
 		reactions, err := c.Login.Bridge.DB.Reaction.GetAllToMessage(ctx, key.Receiver, MessageID(known[i].ID))
 		if err != nil {
-			return nil, nil, fmt.Errorf("get reactions of message %s: %w", known[i].ID, err)
+			return fmt.Errorf("get reactions of message %s: %w", known[i].ID, err)
 		}
 		known[i].Reactions = make(map[[2]string]bool, len(reactions))
 		for _, r := range reactions {
 			known[i].Reactions[[2]string{TraQUserID(r.SenderID), StampID(r.EmojiID)}] = true
 		}
 	}
-	return known, senders, nil
+	return nil
+}
+
+// completeTimestamps sets the Timestamp of each known message in ids from all of its parts.
+func (c *TraQClient) completeTimestamps(ctx context.Context, key networkid.PortalKey, known []knownMessage, ids []string) error {
+	for i := range known {
+		if !slices.Contains(ids, known[i].ID) {
+			continue
+		}
+		parts, err := c.Login.Bridge.DB.Message.GetAllPartsByID(ctx, key.Receiver, MessageID(known[i].ID))
+		if err != nil {
+			return fmt.Errorf("get the parts of message %s: %w", known[i].ID, err)
+		}
+		for _, p := range parts {
+			if p.Timestamp.Before(known[i].Timestamp) {
+				known[i].Timestamp = p.Timestamp
+			}
+		}
+	}
+	return nil
 }
 
 // queueReactionSync queues the full set of msg's stamps as its reactions. Every user and each user's every
