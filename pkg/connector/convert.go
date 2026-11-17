@@ -426,7 +426,8 @@ func (c *TraQClient) stampReactions(ctx context.Context, msg *traq.Message) []*b
 // reactionKey returns the Matrix reaction key of a stamp. A stamp missing from the table is read with Stamp()
 // and stored; a failure to read it is returned, not logged. The emoji of a pending Unicode stamp is resolved
 // on demand (resolveEmoji), so its reactions get the emoji rather than ":name:" also while the stamp sync job
-// has not got to it; if that fails, the failure is logged and the key is ":name:".
+// has not got to it; if that fails, the failure is logged and the key is ":name:". A stamp the job has given
+// up on for now is not tried before its retry time, and a failure sets the next one.
 func (c *TraQClient) reactionKey(ctx context.Context, stampID string) (string, error) {
 	s, ok := c.Main.Stamps.ByID(stampID)
 	if !ok {
@@ -439,15 +440,23 @@ func (c *TraQClient) reactionKey(ctx context.Context, stampID string) (string, e
 			return stampconv.ReactionKey(s), nil
 		}
 	}
-	if s.EmojiPending() {
-		resolved, err := c.Main.resolveEmoji(ctx, c.API, stampID)
-		if err != nil {
-			zerolog.Ctx(ctx).Warn().Err(err).Str("traq_stamp_id", stampID).
-				Msg("Failed to resolve the emoji of a Unicode stamp, using its name")
+	if !s.EmojiPending() {
+		return stampconv.ReactionKey(s), nil
+	}
+	retryAt, retried := c.Main.Stamps.RetryAfter(stampID)
+	if retried && time.Now().Before(retryAt) {
+		return stampconv.ReactionKey(s), nil
+	}
+	resolved, err := c.Main.resolveEmoji(ctx, c.API, stampID)
+	if err != nil {
+		zerolog.Ctx(ctx).Warn().Err(err).Str("traq_stamp_id", stampID).
+			Msg("Failed to resolve the emoji of a Unicode stamp, using its name")
+		if retried {
+			c.Main.Stamps.SetRetryAfter(stampID, time.Now().Add(stampOnDemandRetryDelay))
 		}
-		if resolved.ID != "" { // else deleted meanwhile: keep the stamp the reaction was made with
-			s = resolved
-		}
+	}
+	if resolved.ID != "" { // else deleted meanwhile: keep the stamp the reaction was made with
+		s = resolved
 	}
 	return stampconv.ReactionKey(s), nil
 }

@@ -19,10 +19,13 @@ import (
 // Pace, retries and logging of the stamp sync job.
 const (
 	stampResolveInterval = 100 * time.Millisecond // one FileMeta per interval
-	// stampResolveAttempts is the number of failed FileMeta calls after which the job gives up on a stamp
-	// for this run.
+	// stampResolveAttempts is the number of failed FileMeta calls after which the walk over the pending stamps
+	// gives up on a stamp, to retry it after the walk.
 	stampResolveAttempts = 5
-	stampProgressEvery   = 500 // log the progress every this many Unicode stamps
+	// stampOnDemandRetryDelay is how long the conversions leave a stamp the job has given up on before they try
+	// to resolve it again, so that a traQ that is down is not asked once per conversion.
+	stampOnDemandRetryDelay = time.Minute
+	stampProgressEvery      = 500 // log the progress every this many Unicode stamps
 )
 
 var (
@@ -51,6 +54,9 @@ type stampSync struct {
 	touched map[string]struct{}
 	// resolving makes the conversions that need the emoji of one stamp at the same time share one resolution.
 	resolving singleflight.Group
+	// resolveJoined, if set, is called with the stamp ID once a caller of resolveEmoji has joined the
+	// resolution. It is for the tests.
+	resolveJoined func(id string)
 
 	mu      sync.Mutex
 	clients []*TraQClient // the logins whose session reached CONNECTED and has not ended, oldest first
@@ -133,11 +139,14 @@ func (c *TraQConnector) runStampSync(ctx context.Context) {
 // syncStamps is the body of the job. It reports whether the job finished. errNoStampLogin means no login was
 // left to continue with.
 //
-// A stamp whose emoji keeps failing to resolve is given up on after stampResolveAttempts failures of any kind,
-// so that one stamp cannot keep the table incomplete. Giving up is for this process only (giveUpEmoji): the
-// failure says nothing definite about the stamp, so the stored stamp stays pending and the next start tries
-// it again. Only a definite answer (see emojiFromFile) is stored as unresolvable. The backoff is not reset by
-// giving up, so a traQ that fails every request slows the job down.
+// The walk over the pending Unicode stamps gives up on a stamp whose emoji fails to resolve
+// stampResolveAttempts times, for any reason, so that one stamp cannot keep the table incomplete: the table is
+// marked complete after the walk. The stamps that the walk leaves pending (given up on, or given another file
+// meanwhile whose meta failed) are then retried in rounds, with the backoff, until each is resolved or gets a
+// definite answer (see emojiFromFile); only then has the job finished. Meanwhile Stamps has them with a retry
+// time (SetRetryAfter), so Resolve does not call an emoji unknown and the conversions do not ask traQ for them
+// at every turn. They stay pending in the store, so a stopped job or the next start retries them too. The
+// backoff is not reset by giving up, so a traQ that fails every request slows the job down.
 func (c *TraQConnector) syncStamps(ctx context.Context) (bool, error) {
 	log := zerolog.Ctx(ctx)
 	retry := backoff{min: c.stampSync.retryMin}
@@ -182,39 +191,82 @@ func (c *TraQConnector) syncStamps(ctx context.Context) (bool, error) {
 	}
 	tick := time.NewTicker(stampResolveInterval)
 	defer tick.Stop()
-	unresolvable, givenUp := 0, 0
+	var retrying []string
+	resolved, unresolvable, deleted := 0, 0, 0
 	for i, p := range pending {
 		if s, ok := c.Stamps.ByID(p.ID); ok && s.EmojiPending() { // else resolved on demand or changed meanwhile
-			var res stampconv.Stamp
 			err := call(stampResolveAttempts, func(api *traq.Client) error {
 				select {
 				case <-ctx.Done():
 					return ctx.Err()
 				case <-tick.C:
 				}
-				var err error
-				res, err = c.resolveEmoji(ctx, api, p.ID)
+				_, err := c.resolveEmoji(ctx, api, p.ID)
 				return err
 			})
 			if errors.Is(err, errRetryBudget) {
 				log.Warn().Err(err).Str("stamp_id", p.ID).
-					Msg("Giving up on the emoji of a Unicode stamp until the bridge restarts")
-				res, err = c.giveUpEmoji(p.ID), nil
-				givenUp++
-			} else if res.Unresolvable {
-				unresolvable++
-			}
-			if err != nil {
+					Msg("Giving up on the emoji of a Unicode stamp for now, it is retried after the others")
+			} else if err != nil {
 				return false, err
 			}
+		}
+		switch s, ok := c.Stamps.ByID(p.ID); {
+		case !ok:
+			deleted++
+		case s.Emoji != "":
+			resolved++
+		case s.Unresolvable:
+			unresolvable++
+		default:
+			c.Stamps.SetRetryAfter(p.ID, time.Now().Add(stampOnDemandRetryDelay))
+			retrying = append(retrying, p.ID)
 		}
 		if n := i + 1; n%stampProgressEvery == 0 {
 			log.Info().Int("done", n).Int("total", len(pending)).Msg("Resolving the emoji of Unicode stamps")
 		}
 	}
 	c.Stamps.SetComplete(true)
-	log.Info().Int("resolved", len(pending)-unresolvable-givenUp).Int("unresolvable", unresolvable).
-		Int("given_up", givenUp).Msg("The stamp table is complete")
+	log.Info().Int("resolved", resolved).Int("unresolvable", unresolvable).Int("deleted", deleted).
+		Int("retrying", len(retrying)).Msg("The stamp table is complete")
+	if len(retrying) == 0 {
+		return true, nil
+	}
+
+	for len(retrying) > 0 {
+		if !retry.wait(ctx, *log) {
+			return false, ctx.Err()
+		}
+		api := c.stampAPI()
+		if api == nil {
+			return false, errNoStampLogin
+		}
+		var failed error
+		left := retrying[:0]
+		for _, id := range retrying {
+			if s, ok := c.Stamps.ByID(id); !ok || !s.EmojiPending() {
+				continue
+			}
+			select {
+			case <-ctx.Done():
+				return false, ctx.Err()
+			case <-tick.C:
+			}
+			if _, err := c.resolveEmoji(ctx, api, id); err != nil {
+				failed = err
+			}
+			if s, ok := c.Stamps.ByID(id); ok && s.EmojiPending() {
+				left = append(left, id)
+			}
+		}
+		retrying = left
+		if failed != nil {
+			log.Warn().Err(failed).Int("left", len(retrying)).Msg("Failed to resolve the emoji of Unicode stamps again")
+		} else {
+			retry.reset()
+		}
+	}
+	log.Info().Msg("Resolved the emoji of the Unicode stamps that were retried")
 	return true, nil
 }
 
@@ -296,12 +348,12 @@ func (c *TraQConnector) reconcileStamps(ctx context.Context, api *traq.Client) e
 
 // resolveEmoji resolves the emoji of a pending Unicode stamp from its file (see emojiFromFile), stores it, and
 // returns the stamp as Stamps then has it. The job and the conversions that meet a pending stamp both use it:
-// concurrent calls for one stamp share one resolution, and a stamp resolved, changed or deleted meanwhile is
-// returned as Stamps has it (the zero Stamp if deleted), without storing the resolution. FileMeta runs
-// without writeMu, so that a slow traQ delays only the callers of this stamp. A failure leaves the stamp
-// pending.
+// concurrent calls for one stamp share one resolution (run with the first caller's ctx), and a stamp
+// resolved, changed or deleted meanwhile is returned as Stamps has it (the zero Stamp if deleted), without
+// storing the resolution. FileMeta runs without writeMu, so that a slow traQ delays only the callers of this
+// stamp. A failure leaves the stamp pending.
 func (c *TraQConnector) resolveEmoji(ctx context.Context, api *traq.Client, id string) (stampconv.Stamp, error) {
-	v, err, _ := c.stampSync.resolving.Do(id, func() (any, error) {
+	ch := c.stampSync.resolving.DoChan(id, func() (any, error) {
 		s, ok := c.Stamps.ByID(id)
 		if !ok || !s.EmojiPending() {
 			return s, nil
@@ -327,7 +379,11 @@ func (c *TraQConnector) resolveEmoji(ctx context.Context, api *traq.Client, id s
 		cur.Emoji, cur.Unresolvable = resolved.Emoji, resolved.Unresolvable
 		return cur, c.putStampLocked(ctx, cur, fileID)
 	})
-	return v.(stampconv.Stamp), err
+	if joined := c.stampSync.resolveJoined; joined != nil {
+		joined(id)
+	}
+	r := <-ch
+	return r.Val.(stampconv.Stamp), r.Err
 }
 
 // emojiFromFile derives the emoji of Unicode stamp s from the name of its image file. A file that does not
@@ -352,22 +408,6 @@ func emojiFromFile(ctx context.Context, api *traq.Client, s stampconv.Stamp, fil
 	}
 	s.Emoji = emoji
 	return s, nil
-}
-
-// giveUpEmoji marks a pending Unicode stamp unresolvable in Stamps only, not in the store, so that neither the
-// job nor the conversions ask traQ for it again in this process, and returns the stamp as Stamps then has it.
-// Nothing writes this mark to the store: a stamp is stored with the emoji and mark that traQ or the store
-// gave, or, by resolveEmoji, only while it is pending in Stamps.
-func (c *TraQConnector) giveUpEmoji(id string) stampconv.Stamp {
-	c.stampSync.writeMu.Lock()
-	defer c.stampSync.writeMu.Unlock()
-	s, ok := c.Stamps.ByID(id)
-	if !ok || !s.EmojiPending() {
-		return s
-	}
-	s.Unresolvable = true
-	c.Stamps.Put(s)
-	return s
 }
 
 // storedFileID returns the ID of the image of a stamp in the store.
