@@ -150,28 +150,29 @@ func (c *TraQClient) handleMessageCreated(ctx context.Context, w *workerState, e
 	if err != nil {
 		return fmt.Errorf("get message %s: %w", body.ID, err)
 	}
-	key, ok := c.portalKeyFor(msg.ChannelID)
+	ch, ok := c.target(msg.ChannelID)
 	if !ok {
 		zerolog.Ctx(ctx).Debug().Str("traq_channel_id", msg.ChannelID).Msg("Ignoring message in a channel without a portal")
 		return nil
 	}
+	key := c.portalKey(ch)
 	c.noteActivity(msg.ChannelID, msg.CreatedAt)
-	c.queueMessage(key, msg)
+	c.queueMessage(key, ch.isDM(), msg)
 	w.recent.add(msg.ID, messageTarget{portal: key, userID: msg.UserID})
 	return nil
 }
 
 // queueMessage queues a new traQ message. bridgev2 drops one already bridged (by its ID) in the portal's
-// serial event loop, so the poller may queue a message the WebSocket also delivers.
-func (c *TraQClient) queueMessage(key networkid.PortalKey, msg *traq.Message) {
+// serial event loop, so the poller may queue a message the WebSocket also delivers. A DM's portal is created
+// by its first message (dm), a public channel's by its resync.
+func (c *TraQClient) queueMessage(key networkid.PortalKey, dm bool, msg *traq.Message) {
 	c.queue(&simplevent.Message[*traq.Message]{
 		EventMeta: simplevent.EventMeta{
-			Type:       bridgev2.RemoteEventMessage,
-			LogContext: messageLogContext(msg),
-			PortalKey:  key,
-			Sender:     c.sender(msg.UserID),
-			// A public channel's portal is created by its resync; a DM's portal by its first message.
-			CreatePortal: key.Receiver != "",
+			Type:         bridgev2.RemoteEventMessage,
+			LogContext:   messageLogContext(msg),
+			PortalKey:    key,
+			Sender:       c.sender(msg.UserID),
+			CreatePortal: dm,
 			Timestamp:    msg.CreatedAt,
 		},
 		Data:               msg,
@@ -236,7 +237,8 @@ type messageTarget struct {
 // findMessage returns the portal of a message bridged to a portal of this login (a public channel or this
 // login's DM). A message not in the database yet may still be waiting in its portal's event loop; then the
 // worker's recent messages tell the portal, and the portal's loop handles the event after the creation.
-// The bool is false if the message was not bridged.
+// The bool is false if the message was not bridged. The lookup uses this login as the receiver: bridgev2's
+// part queries match the receiver or none, which covers shared and split public portals and this login's DMs.
 func (c *TraQClient) findMessage(ctx context.Context, w *workerState, messageID string) (messageTarget, bool, error) {
 	row, err := c.Login.Bridge.DB.Message.GetFirstPartByID(ctx, c.Login.ID, MessageID(messageID))
 	if err != nil {

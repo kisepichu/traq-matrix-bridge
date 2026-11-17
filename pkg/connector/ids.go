@@ -4,14 +4,10 @@ import "maunium.net/go/mautrix/bridgev2/networkid"
 
 // Every ID is the bare traQ UUID. The TraQ* and StampID functions are the inverse conversions.
 
-// PortalKey is the key of a public channel, which is shared by all logins.
-func PortalKey(channelID string) networkid.PortalKey {
-	return networkid.PortalKey{ID: networkid.PortalID(channelID)}
-}
-
-// DMPortalKey is the key of a DM channel. A DM exists once per login, so the login is the receiver.
-func DMPortalKey(channelID string, login networkid.UserLoginID) networkid.PortalKey {
-	return networkid.PortalKey{ID: networkid.PortalID(channelID), Receiver: login}
+// PortalKey is the key of a channel's portal. receiver is "" for a portal shared by all logins, else the
+// login the portal belongs to; TraQClient.portalKey chooses it.
+func PortalKey(channelID string, receiver networkid.UserLoginID) networkid.PortalKey {
+	return networkid.PortalKey{ID: networkid.PortalID(channelID), Receiver: receiver}
 }
 
 func ChannelID(key networkid.PortalKey) string { return string(key.ID) }

@@ -150,10 +150,11 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // pollChannel reads the newest poll.depth messages of a channel, compares them with what is bridged and
 // queues a message, an edit, a removal or a reaction sync for each difference.
 func (c *TraQClient) pollChannel(ctx context.Context, channelID string) error {
-	key, ok := c.portalKeyFor(channelID)
+	ch, ok := c.target(channelID)
 	if !ok {
 		return nil
 	}
+	key := c.portalKey(ch)
 	depth := c.Main.Config.Poll.Depth
 	// Read before the fetch, so each of these messages was in traQ when it was fetched (see diffMessages),
 	// and a reaction bridged from Matrix after the fetch is not taken for a change in traQ.
@@ -181,7 +182,7 @@ func (c *TraQClient) pollChannel(ctx context.Context, channelID string) error {
 		d = diffMessages(fetched, known, more)
 	}
 	for i := range d.New {
-		c.queueMessage(key, &d.New[i])
+		c.queueMessage(key, ch.isDM(), &d.New[i])
 	}
 	for i := range d.Edited {
 		c.queueEdit(key, &d.Edited[i])

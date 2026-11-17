@@ -355,12 +355,18 @@ func (c *TraQClient) sender(userID string) bridgev2.EventSender {
 	}
 }
 
-// portalKeyFor returns the portal key of a channel that has a portal for this login (a DM, or a public
-// channel subscribed at level >= 1), and false for any other channel.
-func (c *TraQClient) portalKeyFor(channelID string) (networkid.PortalKey, bool) {
+// target returns a channel that has a portal for this login (a DM, or a public channel subscribed at level
+// >= 1), and false for any other channel.
+func (c *TraQClient) target(channelID string) (channelInfo, bool) {
 	c.stateMu.RLock()
+	defer c.stateMu.RUnlock()
 	ch, ok := c.targets[channelID]
-	c.stateMu.RUnlock()
+	return ch, ok
+}
+
+// portalKeyFor returns the portal key of a target channel (see target), and false for any other channel.
+func (c *TraQClient) portalKeyFor(channelID string) (networkid.PortalKey, bool) {
+	ch, ok := c.target(channelID)
 	if !ok {
 		return networkid.PortalKey{}, false
 	}
