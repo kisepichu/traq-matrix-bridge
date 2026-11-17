@@ -127,6 +127,38 @@ func TestResyncPacerFlushWaitsForTheRunningResync(t *testing.T) {
 	})
 }
 
+// A portal being left drops the channel's waiting resync and waits for the one being queued, so the leave that
+// follows is not overtaken by it.
+func TestResyncPacerDropWaitsForTheRunningResync(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		rec := newResyncRecorder()
+		release := make(chan struct{})
+		rec.block["a"] = release
+		p := newResyncPacer(t.Context(), rec.run)
+		p.add(resync("a"))
+		go p.loop()
+		synctest.Wait() // the loop is queueing a
+		p.add(resync("a"))
+		dropped := make(chan struct{})
+		go func() {
+			p.drop("a")
+			close(dropped)
+		}()
+		synctest.Wait()
+		select {
+		case <-dropped:
+			t.Error("drop returned while the resync was being queued")
+		default:
+		}
+		close(release)
+		<-dropped
+		time.Sleep(time.Minute)
+		if runs, _ := rec.result(); !slices.Equal(runs, []string{"a"}) {
+			t.Errorf("runs = %v, want [a] (the waiting one dropped)", runs)
+		}
+	})
+}
+
 // A resync added for a channel while flush is queueing its previous one waits for that one: the loop goes on
 // with the others and queues it afterwards, once.
 func TestResyncPacerAddWhileFlushing(t *testing.T) {

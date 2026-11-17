@@ -75,11 +75,13 @@ func (p *resyncPacer) add(r pendingResync) {
 	}
 }
 
-// drop forgets the waiting resync of a channel, if any (the portal is being left).
+// drop forgets the waiting resync of a channel, if any, and waits for one being queued (see flush): the portal
+// is being left, and the leave must not be overtaken by its resync.
 func (p *resyncPacer) drop(channelID string) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	delete(p.waiting, channelID)
+	p.mu.Unlock()
+	p.flush(channelID)
 }
 
 // flush returns once the channel has no resync waiting or being queued: it queues a waiting one itself, and
