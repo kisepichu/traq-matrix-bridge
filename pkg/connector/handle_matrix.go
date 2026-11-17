@@ -259,8 +259,11 @@ func (c *TraQClient) PreHandleMatrixReaction(_ context.Context, msg *bridgev2.Ma
 // reacted part, so the second reaction calls AddStamp too (traQ counts the stamp up), and its row, saved on
 // the first part as well, replaces the first reaction's row. Redacting the first reaction then finds no row
 // and leaves traQ alone; redacting the second removes the stamp.
+//
+// Reacting is Matrix activity in the channel, so it becomes the viewed channel, as for a message.
 func (c *TraQClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.MatrixReaction) (*database.Reaction, error) {
 	target := msg.TargetMessage
+	c.view.Touch(ctx, ChannelID(msg.Portal.PortalKey))
 	if err := c.API.AddStamp(ctx, TraQMessageID(target.ID), StampID(msg.PreHandleResp.EmojiID)); err != nil {
 		return nil, fmt.Errorf("add stamp: %w", err)
 	}
@@ -274,7 +277,8 @@ func (c *TraQClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Mat
 	return reaction, nil
 }
 
-// HandleMatrixReactionRemove removes the stamp, which traQ allows only for the user's own stamps.
+// HandleMatrixReactionRemove removes the stamp, which traQ allows only for the user's own stamps. It is
+// Matrix activity in the channel too.
 func (c *TraQClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2.MatrixReactionRemove) error {
 	me, err := c.requireMe()
 	if err != nil {
@@ -284,6 +288,7 @@ func (c *TraQClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridge
 	if TraQUserID(r.SenderID) != me.ID {
 		return errUnstampNotOwn
 	}
+	c.view.Touch(ctx, ChannelID(msg.Portal.PortalKey))
 	if err := c.API.RemoveStamp(ctx, TraQMessageID(r.MessageID), StampID(r.EmojiID)); err != nil {
 		return fmt.Errorf("remove stamp: %w", err)
 	}

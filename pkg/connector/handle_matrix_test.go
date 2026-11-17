@@ -3,16 +3,76 @@ package connector
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"testing"
 
+	"go.mau.fi/util/dbutil"
+	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
 	"github.com/kisepichu/traq-matrix-bridge/pkg/msgconv"
+	"github.com/kisepichu/traq-matrix-bridge/pkg/traq"
 )
+
+// newTestBridgeDB opens bridgev2's database, upgraded, on an in-memory SQLite database.
+func newTestBridgeDB(t *testing.T) *database.Database {
+	t.Helper()
+	raw, err := dbutil.NewFromConfig("", dbutil.Config{PoolConfig: dbutil.PoolConfig{
+		Type: "sqlite3-fk-wal", URI: ":memory:?_txlock=immediate", MaxOpenConns: 1, MaxIdleConns: 1,
+	}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+	db := database.New("test", (&TraQConnector{}).GetDBMetaTypes(), raw)
+	if err := db.Upgrade(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
+// Reacting and removing a reaction are Matrix activity in the channel, like sending a message, so the channel
+// becomes the viewed one.
+func TestMatrixReactionTouchesView(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+	t.Cleanup(srv.Close)
+	api, err := traq.NewClient(srv.URL, srv.Client(), "token", userAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, sender, _ := newTestViewState()
+	c := &TraQClient{API: api, Login: testLogin("u-me", false), me: &traq.Me{User: traq.User{ID: "u-me"}}, view: view}
+	c.Login.Bridge.DB = newTestBridgeDB(t)
+	portal := func(channelID string) *bridgev2.Portal {
+		return &bridgev2.Portal{Portal: &database.Portal{PortalKey: PortalKey(channelID, "")}}
+	}
+	ctx := context.Background()
+
+	_, err = c.HandleMatrixReaction(ctx, &bridgev2.MatrixReaction{
+		MatrixEventBase: bridgev2.MatrixEventBase[*event.ReactionEventContent]{Portal: portal("ch-a")},
+		TargetMessage:   &database.Message{ID: "m-1"},
+		PreHandleResp:   &bridgev2.MatrixReactionPreResponse{EmojiID: "s-1", Emoji: ":good:"},
+	})
+	if err != nil {
+		t.Fatalf("HandleMatrixReaction: %v", err)
+	}
+	expectSent(t, sender, "ch-a")
+
+	err = c.HandleMatrixReactionRemove(ctx, &bridgev2.MatrixReactionRemove{
+		MatrixEventBase: bridgev2.MatrixEventBase[*event.RedactionEventContent]{Portal: portal("ch-b")},
+		TargetReaction:  &database.Reaction{MessageID: "m-2", EmojiID: "s-1", SenderID: "u-me"},
+	})
+	if err != nil {
+		t.Fatalf("HandleMatrixReactionRemove: %v", err)
+	}
+	expectSent(t, sender, "ch-b")
+}
 
 func TestWithFileURLs(t *testing.T) {
 	// Out of RowID order, as GetAllPartsByID may return them.
