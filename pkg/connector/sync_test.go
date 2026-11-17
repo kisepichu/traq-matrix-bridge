@@ -3,6 +3,7 @@ package connector
 import (
 	"maps"
 	"reflect"
+	"slices"
 	"testing"
 )
 
@@ -173,5 +174,61 @@ func TestHoldRemovals(t *testing.T) {
 				t.Errorf("holdRemovals = %+v, held %v; want %+v, held %v", apply, held, tc.wantApply, tc.wantHeld)
 			}
 		})
+	}
+}
+
+// At startup, the portals with a room that are no longer targets are left by the same rule as at a subscription
+// sync: when that looks like a bad answer from traQ, none is left, and the first subscription sync that agrees
+// (the same removals) leaves them.
+func TestStartupRemovals(t *testing.T) {
+	pub := func(id string) channelInfo { return channelInfo{ID: id, Path: "p/" + id, Level: 1} }
+	dm := func(id string) channelInfo { return channelInfo{ID: id, DMUserID: "user-" + id, Level: dmLevel} }
+	pubs := func(ids ...string) []channelInfo {
+		var chs []channelInfo
+		for _, id := range ids {
+			chs = append(chs, pub(id))
+		}
+		return chs
+	}
+	for name, tc := range map[string]struct {
+		kept, gone []channelInfo
+		noSubs     bool
+		wantHeld   []string
+	}{
+		"a few":                  {pubs("a", "b", "c", "d", "e", "f", "g", "h"), pubs("y", "x"), false, nil},
+		"exactly half":           {pubs("a", "b", "c", "d", "e"), pubs("v", "w", "x", "y", "z"), false, nil},
+		"more than half":         {pubs("a", "b", "c", "d"), pubs("z", "v", "w", "x", "y"), false, []string{"v", "w", "x", "y", "z"}},
+		"fewer than the minimum": {nil, pubs("a", "b", "c", "d"), false, nil},
+		"no subscriptions":       {[]channelInfo{dm("d")}, append(pubs("a"), dm("e")), true, []string{"a", "e"}},
+		"only DMs":               {pubs("a"), []channelInfo{dm("d1"), dm("d2"), dm("d3"), dm("d4"), dm("d5")}, false, nil},
+		"nothing to leave":       {pubs("a"), nil, true, nil},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if held := startupRemovals(tc.kept, tc.gone, tc.noSubs); !reflect.DeepEqual(held, tc.wantHeld) {
+				t.Fatalf("startupRemovals = %v, want %v", held, tc.wantHeld)
+			}
+		})
+	}
+
+	// The first subscription sync after held startup removals: initialSync kept the gone channels in c.targets,
+	// and the sync removes the same ones.
+	kept, gone := pubs("a", "b", "c", "d"), pubs("z", "v", "w", "x", "y")
+	held := startupRemovals(kept, gone, false)
+	targets, snap := map[string]channelInfo{}, map[string]channelInfo{}
+	for _, ch := range kept {
+		targets[ch.ID], snap[ch.ID] = ch, ch
+	}
+	for _, ch := range gone {
+		targets[ch.ID] = ch
+	}
+	apply, nowHeld := holdRemovals(targets, portalDiff(targets, snap), false, held)
+	var left []string
+	for _, change := range apply {
+		if change.Kind == changeRemove {
+			left = append(left, change.Channel.ID)
+		}
+	}
+	if !slices.Equal(left, []string{"v", "w", "x", "y", "z"}) || nowHeld != nil {
+		t.Errorf("agreeing sync leaves %v, holds %v; want [v w x y z], nothing held", left, nowHeld)
 	}
 }

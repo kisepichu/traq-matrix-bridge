@@ -69,16 +69,12 @@ func holdRemovals(old map[string]channelInfo, changes []portalChange, noSubscrip
 			public++
 		}
 	}
-	var removed []string
 	for _, change := range changes {
-		if change.Kind != changeRemove {
-			continue
-		}
-		removed = append(removed, change.Channel.ID)
-		if !change.Channel.isDM() {
+		if change.Kind == changeRemove && !change.Channel.isDM() {
 			removedPublic++
 		}
 	}
+	removed := removedIDs(changes)
 	suspect := removedPublic > 0 && (noSubscriptions || removedPublic*2 > public && removedPublic >= massRemovalMin)
 	if !suspect || slices.Equal(removed, held) {
 		return changes, nil
@@ -89,6 +85,37 @@ func holdRemovals(old map[string]channelInfo, changes []portalChange, noSubscrip
 		}
 	}
 	return apply, removed
+}
+
+// removedIDs returns the channel IDs of the removals in changes, in order.
+func removedIDs(changes []portalChange) []string {
+	var ids []string
+	for _, change := range changes {
+		if change.Kind == changeRemove {
+			ids = append(ids, change.Channel.ID)
+		}
+	}
+	return ids
+}
+
+// startupRemovals tells whether initialSync may leave the portals of gone, by the rule of holdRemovals. kept is
+// the channels of this login's portals with a room that are still targets, gone those of the ones that are
+// not; together they stand for the snapshot of the previous session. held is nil when the portals may be left;
+// otherwise it is the IDs of gone in the order portalDiff removes them, so that the next subscription sync can
+// agree.
+func startupRemovals(kept, gone []channelInfo, noSubscriptions bool) (held []string) {
+	old := make(map[string]channelInfo, len(kept)+len(gone))
+	for _, ch := range kept {
+		old[ch.ID] = ch
+	}
+	changes := make([]portalChange, 0, len(gone))
+	for _, ch := range gone {
+		old[ch.ID] = ch
+		changes = append(changes, portalChange{Channel: ch, Kind: changeRemove})
+	}
+	slices.SortFunc(changes, func(a, b portalChange) int { return cmp.Compare(a.Channel.ID, b.Channel.ID) })
+	_, held = holdRemovals(old, changes, noSubscriptions, nil)
+	return held
 }
 
 // revertFailedUpserts undoes, in the stored snapshot, the upserts that could not be queued, so that the next
@@ -221,7 +248,7 @@ func (c *TraQClient) runResync(ctx context.Context, r *pendingResync) {
 }
 
 // queueLeave queues a ChatDelete that removes this login from the portal, instead of a resync still waiting
-// for it. bridgev2 deletes the room when no other login is in it.
+// for it, and after one being queued. bridgev2 deletes the room when no other login is in it.
 func (c *TraQClient) queueLeave(key networkid.PortalKey) {
 	if p := c.resyncs.Load(); p != nil {
 		p.drop(ChannelID(key))
@@ -274,29 +301,35 @@ func (c *TraQClient) hasBridgedMessages(channelID string) bool {
 // fetches those messages into existing rooms. They are added before the WebSocket is read, and every other
 // event of a portal waits for its resync (see queue), so each portal handles its catch-up before any live
 // message.
-func (c *TraQClient) initialSync(ctx context.Context, me *traq.Me, targets map[string]channelInfo, unread []traq.UnreadChannel) {
+//
+// The portals are not left when that looks like a bad answer from traQ (see startupRemovals): they are kept
+// in c.targets and in c.heldRemovals, as if the previous subscription sync had held their removals back, so
+// the first subscription sync leaves them if it agrees and keeps them otherwise. They get no resync, so no
+// catch-up either.
+func (c *TraQClient) initialSync(ctx context.Context, l loaded) {
 	log := c.Login.Log
+	targets := l.targets
 	ids := make([]string, 0, len(targets))
 	for id := range targets {
 		ids = append(ids, id)
 	}
 	slices.Sort(ids)
-	catchUp, err := c.catchUpCandidates(ctx, unread, time.Time{})
+	catchUp, err := c.catchUpCandidates(ctx, l.unread, time.Time{})
 	checkAll := err != nil
 	if checkAll && ctx.Err() == nil {
 		log.Warn().Err(err).Msg("Failed to get the activity timeline, checking every channel for messages missed while stopped")
 	}
-	hasUnread := make(map[string]struct{}, len(unread))
-	for _, u := range unread {
+	hasUnread := make(map[string]struct{}, len(l.unread))
+	for _, u := range l.unread {
 		hasUnread[u.ChannelID] = struct{}{}
 	}
 	now := time.Now()
-	keys := make(map[networkid.PortalKey]struct{}, len(ids))
+	keys := make(map[networkid.PortalKey]channelInfo, len(ids))
 	resyncs, lazyDMs := 0, 0
 	for _, id := range ids {
 		ch := targets[id]
 		key := c.portalKey(ch)
-		keys[key] = struct{}{}
+		keys[key] = ch
 		_, isUnread := hasUnread[id]
 		if ch.isDM() && !isUnread && !c.hasRoom(ctx, key) {
 			lazyDMs++
@@ -312,7 +345,7 @@ func (c *TraQClient) initialSync(ctx context.Context, me *traq.Me, targets map[s
 					Type:       bridgev2.RemoteEventReadReceipt,
 					LogContext: channelLogContext(ch),
 					PortalKey:  key,
-					Sender:     c.selfSender(me),
+					Sender:     c.selfSender(l.me),
 				},
 				ReadUpTo: now,
 			})
@@ -327,10 +360,9 @@ func (c *TraQClient) initialSync(ctx context.Context, me *traq.Me, targets map[s
 	if err != nil {
 		log.Err(err).Msg("Failed to list the portals of this login")
 	}
+	var kept, gone []channelInfo
+	var goneKeys []networkid.PortalKey
 	for _, up := range userPortals {
-		if _, ok := keys[up.Portal]; ok {
-			continue
-		}
 		portal, err := c.Login.Bridge.GetExistingPortalByKey(ctx, up.Portal)
 		if err != nil {
 			log.Err(err).Stringer("portal_key", up.Portal).Msg("Failed to get portal")
@@ -339,9 +371,47 @@ func (c *TraQClient) initialSync(ctx context.Context, me *traq.Me, targets map[s
 		if portal == nil || portal.MXID == "" {
 			continue // nothing to leave
 		}
-		log.Debug().Stringer("portal_key", up.Portal).Msg("Leaving portal that is no longer subscribed")
-		c.queueLeave(up.Portal)
+		if ch, ok := keys[up.Portal]; ok {
+			kept = append(kept, ch)
+			continue
+		}
+		gone = append(gone, c.formerTarget(portal))
+		goneKeys = append(goneKeys, up.Portal)
 	}
+	if held := startupRemovals(kept, gone, l.subscriptions == 0); held != nil {
+		c.stateMu.Lock()
+		for _, ch := range gone {
+			c.targets[ch.ID] = ch
+		}
+		c.heldRemovals = held
+		c.stateMu.Unlock()
+		log.Warn().Int("portals", len(held)).Int("subscriptions", l.subscriptions).
+			Msg("Not leaving the portals of many channels at once until the next subscription sync agrees")
+		return
+	}
+	for _, key := range goneKeys {
+		log.Debug().Stringer("portal_key", key).Msg("Leaving portal that is no longer subscribed")
+		c.queueLeave(key)
+	}
+}
+
+// formerTarget returns the channel of a portal that is no longer a target, as the target it was, for
+// startupRemovals and c.targets. A channel missing from the channel list is known only by its portal.
+func (c *TraQClient) formerTarget(portal *bridgev2.Portal) channelInfo {
+	id := ChannelID(portal.PortalKey)
+	ch, ok := c.lookupChannel(id)
+	if !ok {
+		ch = channelInfo{ID: id}
+		if meta, _ := portal.Metadata.(*PortalMetadata); meta != nil && meta.IsDM {
+			ch.DMUserID = meta.DMUserID
+		}
+	}
+	if ch.isDM() {
+		ch.Level = dmLevel
+	} else {
+		ch.Level = max(ch.Level, 1)
+	}
+	return ch
 }
 
 // syncSubscriptions re-reads the channels and subscriptions and queues only what changed. The upserts are
@@ -364,16 +434,19 @@ func (c *TraQClient) syncSubscriptions(ctx context.Context) error {
 	tree := buildChannelTree(list)
 	snap := subscriptionSnapshot(tree, subs)
 	c.stateMu.Lock()
-	old := c.targets
-	changes, held := holdRemovals(old, portalDiff(old, snap), len(subs) == 0, c.heldRemovals)
+	old, prevHeld := c.targets, c.heldRemovals
+	changes, held := holdRemovals(old, portalDiff(old, snap), len(subs) == 0, prevHeld)
 	for _, id := range held {
 		snap[id] = old[id]
 	}
 	c.channels, c.targets, c.heldRemovals = tree, snap, held
 	c.stateMu.Unlock()
-	if len(held) > 0 {
+	switch {
+	case len(held) > 0:
 		c.Login.Log.Warn().Int("portals", len(held)).Int("subscriptions", len(subs)).
 			Msg("Not leaving the portals of many channels at once until the next subscription sync agrees")
+	case len(prevHeld) > 0 && slices.Equal(removedIDs(changes), prevHeld):
+		c.Login.Log.Info().Int("portals", len(prevHeld)).Msg("Leaving the portals held back by the previous subscription sync")
 	}
 
 	for _, change := range changes {

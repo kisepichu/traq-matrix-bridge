@@ -67,7 +67,8 @@ type TraQClient struct {
 	// older read cannot overwrite a newer one.
 	syncMu sync.Mutex
 	// heldRemovals is the channels whose removal the last subscription sync held back (see holdRemovals). It is
-	// written by syncSubscriptions under syncMu, and reset by loadOnce before the session's loops start.
+	// written by syncSubscriptions under syncMu, reset by loadOnce and set by initialSync before the session's
+	// loops start.
 	heldRemovals []string
 
 	stateMu  sync.RWMutex
@@ -185,12 +186,12 @@ func (c *TraQClient) runLoops(ctx context.Context, stop context.CancelCauseFunc)
 	defer wg.Wait()
 	defer stop(nil)
 
-	me, targets, unread, ok := c.load(ctx, stop)
+	l, ok := c.load(ctx, stop)
 	if !ok {
 		return
 	}
-	c.loadLastActivity(ctx, targets)
-	c.initialSync(ctx, me, targets, unread)
+	c.loadLastActivity(ctx, l.targets)
+	c.initialSync(ctx, l)
 	// After initialSync, which reads targets (c.targets) without the lock, and which a failed resync changes.
 	wg.Go(pacer.loop)
 	// One queue and one worker per session, so events are handled in the order traQ sent them, across
@@ -205,41 +206,49 @@ func (c *TraQClient) runLoops(ctx context.Context, stop context.CancelCauseFunc)
 	c.websocketLoop(ctx, stop, queue)
 }
 
+// loaded is what a session reads from traQ before it starts.
+type loaded struct {
+	me            *traq.Me
+	targets       map[string]channelInfo // also stored in c.targets
+	unread        []traq.UnreadChannel
+	subscriptions int // the number of subscriptions, of any level
+}
+
 // load reads what the bridge needs from traQ, retrying with backoff. The bool is false when ctx ended or the
 // token was rejected.
-func (c *TraQClient) load(ctx context.Context, stop context.CancelCauseFunc) (*traq.Me, map[string]channelInfo, []traq.UnreadChannel, bool) {
+func (c *TraQClient) load(ctx context.Context, stop context.CancelCauseFunc) (loaded, bool) {
 	var retry backoff
 	for {
-		me, targets, unread, err := c.loadOnce(ctx)
+		l, err := c.loadOnce(ctx)
 		if err == nil {
-			return me, targets, unread, true
+			return l, true
 		}
 		if !c.handleConnectError(ctx, stop, err, errCodeConnectFail, "Failed to load data from traQ") || !retry.wait(ctx, c.Login.Log, "Retrying the connection to traQ") {
-			return nil, nil, nil, false
+			return loaded{}, false
 		}
 	}
 }
 
-func (c *TraQClient) loadOnce(ctx context.Context) (*traq.Me, map[string]channelInfo, []traq.UnreadChannel, error) {
+func (c *TraQClient) loadOnce(ctx context.Context) (loaded, error) {
 	me, err := c.API.Me(ctx)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("get me: %w", err)
+		return loaded{}, fmt.Errorf("get me: %w", err)
 	}
 	users, err := c.API.Users(ctx)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("get users: %w", err)
+		return loaded{}, fmt.Errorf("get users: %w", err)
 	}
 	list, err := c.API.Channels(ctx)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("get channels: %w", err)
+		return loaded{}, fmt.Errorf("get channels: %w", err)
 	}
 	subs, err := c.API.Subscriptions(ctx)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("get subscriptions: %w", err)
+		return loaded{}, fmt.Errorf("get subscriptions: %w", err)
 	}
 	unread, err := c.API.Unread(ctx)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("get unread channels: %w", err)
+		return loaded{}, fmt.Errorf("get unread channels: %w", err)
 	}
 	tree := buildChannelTree(list)
 	targets := subscriptionSnapshot(tree, subs)
@@ -247,7 +256,7 @@ func (c *TraQClient) loadOnce(ctx context.Context) (*traq.Me, map[string]channel
 	c.stateMu.Lock()
 	c.me, c.channels, c.targets, c.heldRemovals = me, tree, targets, nil
 	c.stateMu.Unlock()
-	return me, targets, unread, nil
+	return loaded{me: me, targets: targets, unread: unread, subscriptions: len(subs)}, nil
 }
 
 // handleConnectError reports a failed attempt to reach traQ and tells whether to retry: not when ctx ended
