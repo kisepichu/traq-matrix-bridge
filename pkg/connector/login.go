@@ -97,7 +97,7 @@ func (l *oauthLogin) SubmitUserInput(ctx context.Context, input map[string]strin
 		return nil, loginError("traQ did not accept the authorization code. Start over with the `login` command.")
 	}
 	// From here on, a failure revokes the new token: it is stored nowhere, but would stay valid for a year. A
-	// failed re-login is the exception (see NewLogin below).
+	// re-login that fails once the new token is in use is the exception (see NewLogin below).
 	api, err := traq.NewClient(l.main.Config.ServerURL, httpClient, token.AccessToken, userAgent)
 	if err != nil {
 		l.revoke(ctx, token.AccessToken, "new")
@@ -140,11 +140,13 @@ func (l *oauthLogin) SubmitUserInput(ctx context.Context, input map[string]strin
 	if err != nil {
 		// NewLogin's error may name another Matrix user (a login made meanwhile), so it only goes to the log.
 		log.Err(err).Msg("Failed to save the login")
-		// On a re-login, NewLogin may fail after it copied the new token into the cached login and loaded a
-		// client with it (e.g. when saving to the database fails), so the new token may be in use: neither token
-		// is revoked. Known limit: the old one, which the database still holds, may then stay valid until traQ
-		// expires it, because a later re-login revokes only the token of the cached login.
-		if existing == nil {
+		// On a re-login, bridgev2 reuses the cached login: NewLogin may fail before it put the new token in that
+		// login's metadata (the new token is then unused, so it is revoked) or after (when loading the client or
+		// saving to the database fails; the new token is then the cached login's, so neither token is revoked).
+		// Known limit of the latter: the old client has been disconnected and the new one is not connected until
+		// the bridge restarts, which loads the old token again from the database; the new token then stays valid
+		// until traQ expires it.
+		if existing == nil || !holdsToken(existing, token.AccessToken) {
 			l.revoke(ctx, token.AccessToken, "new")
 		}
 		return nil, loginError("Failed to save the login. Start over with the `login` command.")
@@ -166,6 +168,12 @@ func (l *oauthLogin) SubmitUserInput(ctx context.Context, input map[string]strin
 			UserLogin:   ul,
 		},
 	}, nil
+}
+
+// holdsToken tells whether ul's metadata holds the access token.
+func holdsToken(ul *bridgev2.UserLogin, token string) bool {
+	meta, _ := ul.Metadata.(*UserLoginMetadata)
+	return meta != nil && meta.AccessToken == token
 }
 
 func (l *oauthLogin) Cancel() {}
