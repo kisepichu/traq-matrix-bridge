@@ -17,6 +17,13 @@ type Stamp struct {
 	Unicode bool
 	// Emoji is the emoji text of a Unicode stamp, or "" until its file name has been resolved.
 	Emoji string
+	// Unresolvable marks a Unicode stamp whose emoji cannot be derived from its file; its key stays ":name:".
+	Unresolvable bool
+}
+
+// EmojiPending reports whether s is a Unicode stamp whose emoji is still to be resolved.
+func (s Stamp) EmojiPending() bool {
+	return s.Unicode && s.Emoji == "" && !s.Unresolvable
 }
 
 var (

@@ -423,21 +423,35 @@ func (c *TraQClient) stampReactions(ctx context.Context, msg *traq.Message) []*b
 	return reactions
 }
 
-// reactionKey returns the Matrix reaction key of a stamp. A stamp missing from the table is fetched with
-// Stamp() and added to it. A failure is returned, not logged.
+// reactionKey returns the Matrix reaction key of a stamp. A stamp missing from the table is read with Stamp()
+// and stored; a failure to read it is returned, not logged. The emoji of a pending Unicode stamp is resolved
+// on demand (resolveEmoji), so its reactions get the emoji rather than ":name:" also while the stamp sync job
+// has not got to it; if that fails, the failure is logged and the key is ":name:".
 func (c *TraQClient) reactionKey(ctx context.Context, stampID string) (string, error) {
-	if s, ok := c.Main.Stamps.ByID(stampID); ok {
-		return stampconv.ReactionKey(s), nil
+	s, ok := c.Main.Stamps.ByID(stampID)
+	if !ok {
+		st, err := c.API.Stamp(ctx, stampID)
+		if err != nil {
+			return "", fmt.Errorf("get stamp %s: %w", stampID, err)
+		}
+		if s, err = c.Main.addStamp(ctx, stampFromTraQ(st), st.FileID); err != nil {
+			zerolog.Ctx(ctx).Warn().Err(err).Str("traq_stamp_id", stampID).Msg("Failed to store a stamp")
+			return stampconv.ReactionKey(s), nil
+		}
 	}
-	st, err := c.API.Stamp(ctx, stampID)
-	if err != nil {
-		return "", fmt.Errorf("get stamp %s: %w", stampID, err)
+	if s.EmojiPending() {
+		resolved, err := c.Main.resolveEmoji(ctx, c.API, stampID)
+		if err != nil {
+			zerolog.Ctx(ctx).Warn().Err(err).Str("traq_stamp_id", stampID).
+				Msg("Failed to resolve the emoji of a Unicode stamp, using its name")
+		}
+		s = resolved
 	}
-	return stampconv.ReactionKey(c.Main.tableStamp(stampFromTraQ(st))), nil
+	return stampconv.ReactionKey(s), nil
 }
 
-// stampFromTraQ converts a traQ stamp for the table. Emoji stays empty: the stamp sync job (stamps.go) resolves
-// the emoji of Unicode stamps, and until then their reaction key is ":name:".
+// stampFromTraQ converts a traQ stamp for the table. Emoji stays empty: the emoji of a Unicode stamp is
+// resolved from its file (resolveEmoji, refreshStamp), and until then its reaction key is ":name:".
 func stampFromTraQ(s *traq.Stamp) stampconv.Stamp {
 	return stampconv.Stamp{ID: s.ID, Name: s.Name, Unicode: s.IsUnicode}
 }
