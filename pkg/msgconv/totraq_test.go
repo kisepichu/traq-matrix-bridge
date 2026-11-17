@@ -1,0 +1,76 @@
+package msgconv
+
+import (
+	"context"
+	"errors"
+	"net/url"
+	"strings"
+	"testing"
+
+	"maunium.net/go/mautrix/id"
+)
+
+type fakeTraQUsers map[id.UserID][2]string
+
+func (f fakeTraQUsers) TraQUser(mxid id.UserID) (string, string, bool) {
+	v, ok := f[mxid]
+	return v[0], v[1], ok
+}
+
+var traqUsers = fakeTraQUsers{
+	"@traq_alice:example.org": {uAlice, "alice"},
+	"@traq_odd:example.org":   {uBob, `a"b\c`},
+}
+var origin = &url.URL{Scheme: "https", Host: "q.example.jp"}
+
+func TestToTraQ(t *testing.T) {
+	cases := []struct {
+		name string
+		in   ToTraQInput
+		want string
+	}{
+		{"plain body", ToTraQInput{Body: "hello"}, "hello"},
+		{"html bold", ToTraQInput{Body: "x", Format: "org.matrix.custom.html", FormattedBody: "<strong>x</strong>"}, "**x**"},
+		{"ghost pill", ToTraQInput{Body: "alice: hi", Format: "org.matrix.custom.html",
+			FormattedBody: `<a href="https://matrix.to/#/@traq_alice:example.org">alice</a>: hi`},
+			`!{"type":"user","raw":"@alice","id":"` + uAlice + `"}: hi`},
+		{"ghost pill with a name that needs JSON escaping", ToTraQInput{Body: "x", Format: "org.matrix.custom.html",
+			FormattedBody: `<a href="https://matrix.to/#/@traq_odd:example.org">x</a>`},
+			`!{"type":"user","raw":"@a\"b\\c","id":"` + uBob + `"}`},
+		{"unknown pill", ToTraQInput{Body: "bob", Format: "org.matrix.custom.html",
+			FormattedBody: `<a href="https://matrix.to/#/@bob:example.org">bob</a>`}, "bob"},
+		{"room pill becomes its URL", ToTraQInput{Body: "r", Format: "org.matrix.custom.html",
+			FormattedBody: `<a href="https://matrix.to/#/!room:example.org">some room</a>`}, "https://matrix.to/#/!room:example.org"},
+		{"event pill becomes its URL", ToTraQInput{Body: "e", Format: "org.matrix.custom.html",
+			FormattedBody: `<a href="https://matrix.to/#/!room:example.org/$ev">msg</a>`}, "https://matrix.to/#/!room:example.org/$ev"},
+		{"spoiler", ToTraQInput{Body: "s", Format: "org.matrix.custom.html",
+			FormattedBody: `a <span data-mx-spoiler>s</span>`}, "a !!s!!"},
+		{"reply prefix", ToTraQInput{Body: "yes", ReplyTo: m1}, "https://q.example.jp/messages/" + m1 + "\nyes"},
+		{"reply fallback stripped", ToTraQInput{Body: "> <@a:x> old\n> more\n\nyes", ReplyTo: m1},
+			"https://q.example.jp/messages/" + m1 + "\nyes"},
+		{"quote without a reply target is kept", ToTraQInput{Body: "> <@a:x> old\n\nyes"}, "> <@a:x> old\n\nyes"},
+		{"mx-reply stripped", ToTraQInput{Body: "yes", Format: "org.matrix.custom.html",
+			FormattedBody: "<mx-reply><blockquote>old</blockquote></mx-reply>yes", ReplyTo: m1},
+			"https://q.example.jp/messages/" + m1 + "\nyes"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			c.in.ServerURL = origin
+			got, err := ToTraQ(context.Background(), c.in, traqUsers)
+			if err != nil || got != c.want {
+				t.Errorf("ToTraQ = %q, %v; want %q", got, err, c.want)
+			}
+		})
+	}
+}
+
+func TestToTraQLength(t *testing.T) {
+	ok := strings.Repeat("あ", MaxTraQLength)
+	if _, err := ToTraQ(context.Background(), ToTraQInput{Body: ok, ServerURL: origin}, traqUsers); err != nil {
+		t.Errorf("10000 code points rejected: %v", err)
+	}
+	_, err := ToTraQ(context.Background(), ToTraQInput{Body: ok + "あ", ServerURL: origin}, traqUsers)
+	if !errors.Is(err, ErrTooLong) {
+		t.Errorf("10001 code points: err = %v, want ErrTooLong", err)
+	}
+}
