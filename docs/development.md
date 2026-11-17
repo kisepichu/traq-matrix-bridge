@@ -24,7 +24,7 @@ testenv/dev.sh tail
 
 ### bot に login する
 
-login の流れは bot の `login` command (Task 8 以降) が案内する。bot が表示する authorize URL を traQ user に承認させ、できた redirect URL を bot に貼る。
+login の流れは bot の `login` command が案内する。bot が表示する authorize URL を traQ user に承認させ、できた redirect URL を bot に貼る。login 済みの一覧は `list-logins`、解除は `logout <login ID>` (token を traQ 側でも revoke する)。
 
 ```sh
 testenv/dev.sh bot login                                  # bot が authorize URL を返す

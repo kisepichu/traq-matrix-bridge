@@ -2,7 +2,6 @@ package connector
 
 import (
 	"context"
-	"errors"
 
 	"go.mau.fi/util/configupgrade"
 	"maunium.net/go/mautrix/bridgev2"
@@ -41,7 +40,11 @@ func (c *TraQConnector) GetName() bridgev2.BridgeName {
 }
 
 func (c *TraQConnector) GetDBMetaTypes() database.MetaTypes {
-	return database.MetaTypes{}
+	return database.MetaTypes{
+		Portal:    func() any { return &PortalMetadata{} },
+		Message:   func() any { return &MessageMetadata{} },
+		UserLogin: func() any { return &UserLoginMetadata{} },
+	}
 }
 
 func (c *TraQConnector) GetCapabilities() *bridgev2.NetworkGeneralCapabilities {
@@ -54,18 +57,6 @@ func (c *TraQConnector) GetConfig() (string, any, configupgrade.Upgrader) {
 
 func (c *TraQConnector) ValidateConfig() error {
 	return c.Config.Validate()
-}
-
-func (c *TraQConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLogin) error {
-	return errors.New("traq: logins are not implemented yet")
-}
-
-func (c *TraQConnector) GetLoginFlows() []bridgev2.LoginFlow {
-	return nil
-}
-
-func (c *TraQConnector) CreateLogin(ctx context.Context, user *bridgev2.User, flowID string) (bridgev2.LoginProcess, error) {
-	return nil, bridgev2.ErrInvalidLoginFlowID
 }
 
 func (c *TraQConnector) GetBridgeInfoVersion() (info, capabilities int) {
