@@ -203,8 +203,7 @@ func (c *TraQClient) hitLink(ctx context.Context, tree *channelTree, hit traq.Me
 
 // bridgedEventLink is the bridgedLinkFunc that reads the bridge's database.
 func (c *TraQClient) bridgedEventLink(ctx context.Context, receiver networkid.UserLoginID, messageID string) (string, bool) {
-	br := c.Login.Bridge
-	row, err := br.DB.Message.GetFirstPartByID(ctx, receiver, MessageID(messageID))
+	row, err := c.Login.Bridge.DB.Message.GetFirstPartByID(ctx, receiver, MessageID(messageID))
 	if err != nil {
 		zerolog.Ctx(ctx).Warn().Err(err).Str("traq_message_id", messageID).Msg("Failed to look up a bridged message")
 		return "", false
@@ -212,9 +211,5 @@ func (c *TraQClient) bridgedEventLink(ctx context.Context, receiver networkid.Us
 	if row == nil {
 		return "", false
 	}
-	portal, err := br.GetExistingPortalByKey(ctx, row.Room)
-	if err != nil || portal == nil || portal.MXID == "" {
-		return "", false
-	}
-	return portal.MXID.EventURI(row.MXID, br.Matrix.ServerName()).MatrixToURL(), true
+	return c.eventLink(ctx, row, nil)
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -47,6 +48,10 @@ var errWSNotConnected = errors.New("the traQ WebSocket is not connected")
 // viewStateSendWait bounds how long a caller waits for a viewstate write (see sendViewState).
 const viewStateSendWait = 5 * time.Second
 
+// eventSyncSpacing is the least time between the start of a subscription sync and that of a sync triggered by
+// channel events (see subscriptionSyncLoop).
+const eventSyncSpacing = 30 * time.Second
+
 // errTokenRejected is the cancel cause of a session whose token traQ rejected (HTTP 401).
 var errTokenRejected = errors.New("traq: access token rejected")
 
@@ -61,6 +66,10 @@ type TraQClient struct {
 	// syncMu serializes the changes of channels and targets that are based on a fresh read from traQ, so an
 	// older read cannot overwrite a newer one.
 	syncMu sync.Mutex
+	// heldRemovals is the channels whose removal the last subscription sync held back (see holdRemovals). It is
+	// written by syncSubscriptions under syncMu, reset by loadOnce and set by initialSync before the session's
+	// loops start.
+	heldRemovals []string
 
 	stateMu  sync.RWMutex
 	me       *traq.Me               // nil until Connect has loaded it
@@ -74,6 +83,11 @@ type TraQClient struct {
 	running *session // the last session started by Connect; nil before the first Connect
 
 	view *viewState // the channel traQ is told the user is viewing
+	// viewPolls holds the channel the viewstate last switched to, for the poll loop to poll once (see
+	// requestViewPoll). Size 1.
+	viewPolls chan string
+	// resyncs paces the portal resyncs of the running session; nil between sessions.
+	resyncs atomic.Pointer[resyncPacer]
 
 	wsMu  sync.Mutex
 	ws    *traq.WSConn    // the open WebSocket connection, nil while disconnected
@@ -165,16 +179,21 @@ func (c *TraQClient) run(ctx context.Context) {
 // runLoops loads, syncs and runs the event worker and the subscription sync, viewstate, poll and WebSocket
 // loops until ctx ends. A loop that sees the token rejected cancels ctx through stop with errTokenRejected.
 func (c *TraQClient) runLoops(ctx context.Context, stop context.CancelCauseFunc) {
+	pacer := newResyncPacer(ctx, c.runResync)
+	c.resyncs.Store(pacer)
+	defer c.resyncs.CompareAndSwap(pacer, nil)
 	var wg sync.WaitGroup
 	defer wg.Wait()
 	defer stop(nil)
 
-	me, targets, unread, ok := c.load(ctx, stop)
+	l, ok := c.load(ctx, stop)
 	if !ok {
 		return
 	}
-	c.loadLastActivity(ctx, targets)
-	c.initialSync(ctx, me, targets, unread)
+	c.loadLastActivity(ctx, l.targets)
+	c.initialSync(ctx, l)
+	// After initialSync, which reads targets (c.targets) without the lock, and which a failed resync changes.
+	wg.Go(pacer.loop)
 	// One queue and one worker per session, so events are handled in the order traQ sent them, across
 	// reconnects too.
 	queue := make(chan traq.Event, eventQueueSize)
@@ -187,49 +206,57 @@ func (c *TraQClient) runLoops(ctx context.Context, stop context.CancelCauseFunc)
 	c.websocketLoop(ctx, stop, queue)
 }
 
+// loaded is what a session reads from traQ before it starts.
+type loaded struct {
+	me            *traq.Me
+	targets       map[string]channelInfo // also stored in c.targets
+	unread        []traq.UnreadChannel
+	subscriptions int // the number of subscriptions, of any level
+}
+
 // load reads what the bridge needs from traQ, retrying with backoff. The bool is false when ctx ended or the
 // token was rejected.
-func (c *TraQClient) load(ctx context.Context, stop context.CancelCauseFunc) (*traq.Me, map[string]channelInfo, []traq.UnreadChannel, bool) {
+func (c *TraQClient) load(ctx context.Context, stop context.CancelCauseFunc) (loaded, bool) {
 	var retry backoff
 	for {
-		me, targets, unread, err := c.loadOnce(ctx)
+		l, err := c.loadOnce(ctx)
 		if err == nil {
-			return me, targets, unread, true
+			return l, true
 		}
-		if !c.handleConnectError(ctx, stop, err, errCodeConnectFail, "Failed to load data from traQ") || !retry.wait(ctx, c.Login.Log) {
-			return nil, nil, nil, false
+		if !c.handleConnectError(ctx, stop, err, errCodeConnectFail, "Failed to load data from traQ") || !retry.wait(ctx, c.Login.Log, "Retrying the connection to traQ") {
+			return loaded{}, false
 		}
 	}
 }
 
-func (c *TraQClient) loadOnce(ctx context.Context) (*traq.Me, map[string]channelInfo, []traq.UnreadChannel, error) {
+func (c *TraQClient) loadOnce(ctx context.Context) (loaded, error) {
 	me, err := c.API.Me(ctx)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("get me: %w", err)
+		return loaded{}, fmt.Errorf("get me: %w", err)
 	}
 	users, err := c.API.Users(ctx)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("get users: %w", err)
+		return loaded{}, fmt.Errorf("get users: %w", err)
 	}
 	list, err := c.API.Channels(ctx)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("get channels: %w", err)
+		return loaded{}, fmt.Errorf("get channels: %w", err)
 	}
 	subs, err := c.API.Subscriptions(ctx)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("get subscriptions: %w", err)
+		return loaded{}, fmt.Errorf("get subscriptions: %w", err)
 	}
 	unread, err := c.API.Unread(ctx)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("get unread channels: %w", err)
+		return loaded{}, fmt.Errorf("get unread channels: %w", err)
 	}
 	tree := buildChannelTree(list)
 	targets := subscriptionSnapshot(tree, subs)
 	c.users.setAll(users)
 	c.stateMu.Lock()
-	c.me, c.channels, c.targets = me, tree, targets
+	c.me, c.channels, c.targets, c.heldRemovals = me, tree, targets, nil
 	c.stateMu.Unlock()
-	return me, targets, unread, nil
+	return loaded{me: me, targets: targets, unread: unread, subscriptions: len(subs)}, nil
 }
 
 // handleConnectError reports a failed attempt to reach traQ and tells whether to retry: not when ctx ended
@@ -255,11 +282,16 @@ func (c *TraQClient) handleConnectError(ctx context.Context, stop context.Cancel
 // backoff doubles the delay between attempts from min (minBackoff if zero) up to maxBackoff.
 type backoff struct{ next, min time.Duration }
 
-// wait sleeps for the next delay. It returns false if ctx ended first.
-func (b *backoff) wait(ctx context.Context, log zerolog.Logger) bool {
+// wait logs msg, which says what is retried, and sleeps for the next delay. It returns false if ctx ended first.
+func (b *backoff) wait(ctx context.Context, log zerolog.Logger, msg string) bool {
 	d := max(b.next, cmp.Or(b.min, minBackoff))
 	b.next = min(2*d, maxBackoff)
-	log.Info().Stringer("delay", d).Msg("Retrying the connection to traQ")
+	log.Info().Stringer("delay", d).Msg(msg)
+	return sleepCtx(ctx, d)
+}
+
+// sleepCtx waits for d. It returns false if ctx ended first.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {
@@ -298,7 +330,7 @@ func (c *TraQClient) websocketLoop(ctx context.Context, stop context.CancelCause
 				retry.reset()
 			}
 		}
-		if !c.handleConnectError(ctx, stop, err, errCodeWSDisconnected, "Lost the connection to traQ, reconnecting") || !retry.wait(ctx, c.Login.Log) {
+		if !c.handleConnectError(ctx, stop, err, errCodeWSDisconnected, "Lost the connection to traQ, reconnecting") || !retry.wait(ctx, c.Login.Log, "Retrying the connection to traQ") {
 			return
 		}
 	}
@@ -418,16 +450,38 @@ func (c *TraQClient) viewStateLoop(ctx context.Context) {
 // subscriptionSyncLoop re-syncs the subscriptions every subscription_sync_interval and when the event worker
 // asks for it through requests (a channel was changed or deleted). A rejected token stops the session with
 // errTokenRejected.
+//
+// traQ sends the channel events of every public channel, and each sync reads the whole channel list, so a sync
+// for requests starts no sooner than eventSyncSpacing after the previous sync started; the requests made
+// meanwhile add up to that one sync. A periodic sync due meanwhile runs at once and covers them.
 func (c *TraQClient) subscriptionSyncLoop(ctx context.Context, stop context.CancelCauseFunc, requests <-chan struct{}) {
 	t := time.NewTicker(c.Main.Config.SubscriptionSyncInterval)
 	defer t.Stop()
+	var last time.Time // when the last sync started
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 		case <-requests:
+			if wait := time.Until(last.Add(eventSyncSpacing)); !last.IsZero() && wait > 0 {
+				spacing := time.NewTimer(wait)
+				select {
+				case <-ctx.Done():
+					spacing.Stop()
+					return
+				case <-t.C:
+				case <-spacing.C:
+				}
+				spacing.Stop()
+			}
 		}
+		// The sync reads traQ after every change requested so far, so it covers a request still pending.
+		select {
+		case <-requests:
+		default:
+		}
+		last = time.Now()
 		err := c.syncSubscriptions(ctx)
 		switch {
 		case err == nil || ctx.Err() != nil:

@@ -49,9 +49,17 @@ func (c *fakeClock) advance(d time.Duration) { c.now = c.now.Add(d) }
 const testIdle = 10 * time.Minute
 
 func newTestViewState() (*viewState, *fakeViewSender, *fakeClock) {
+	v, sender, clock, _ := newTestViewStateWithSwitches()
+	return v, sender, clock
+}
+
+// newTestViewStateWithSwitches also returns the channels the viewstate switched to, in order.
+func newTestViewStateWithSwitches() (*viewState, *fakeViewSender, *fakeClock, *[]string) {
 	sender := &fakeViewSender{}
 	clock := &fakeClock{now: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}
-	return newViewState(testIdle, sender.send, clock.Now), sender, clock
+	var switches []string
+	v := newViewState(testIdle, sender.send, clock.Now, func(channelID string) { switches = append(switches, channelID) })
+	return v, sender, clock, &switches
 }
 
 func expectSent(t *testing.T, sender *fakeViewSender, want ...string) {
@@ -82,6 +90,40 @@ func TestViewStateTouch(t *testing.T) {
 	if v.Current() != "b" {
 		t.Errorf("Current() = %q, want b", v.Current())
 	}
+}
+
+// traQ sends the stamp events of the viewed channel only, so a switch to a channel is reported (and the
+// channel polled once, for the stamps changed before), whenever a send makes it the viewed channel: not when
+// it already was, not for a failed send, not for a clear, and again on a new connection.
+func TestViewStateSwitches(t *testing.T) {
+	ctx := context.Background()
+	v, sender, clock, switches := newTestViewStateWithSwitches()
+	expect := func(want ...string) {
+		t.Helper()
+		if !slices.Equal(*switches, want) {
+			t.Errorf("switches = %q, want %q", *switches, want)
+		}
+		*switches = nil
+	}
+	v.Touch(ctx, "a")
+	v.Touch(ctx, "a")
+	expect("a")
+	v.Touch(ctx, "b")
+	expect("b")
+
+	sender.setErr(errors.New("down"))
+	v.Touch(ctx, "c")
+	expect()
+	sender.setErr(nil)
+
+	v.Resend(ctx) // a new connection: c, wanted since the failed send, is sent
+	expect("c")
+
+	clock.advance(testIdle)
+	v.Tick(ctx) // cleared
+	expect()
+	v.Touch(ctx, "c")
+	expect("c")
 }
 
 func TestViewStateTickIdle(t *testing.T) {

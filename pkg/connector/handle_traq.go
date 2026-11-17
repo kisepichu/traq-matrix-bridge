@@ -2,7 +2,10 @@ package connector
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
 	"time"
 	"unicode/utf8"
 
@@ -19,6 +22,13 @@ const eventQueueSize = 256
 
 // maxLoggedEventBody is the number of bytes of an event body that the failure log shows.
 const maxLoggedEventBody = 1024
+
+// The worker reads the message of a MESSAGE_CREATED or MESSAGE_UPDATED up to messageFetchAttempts times when
+// the read fails in a way that may pass (see isTransient), messageFetchRetryDelay apart, doubling.
+const (
+	messageFetchAttempts   = 3
+	messageFetchRetryDelay = 500 * time.Millisecond
+)
 
 // enqueueEvent hands evt to the session's event worker. It runs on the WebSocket reader goroutine, which
 // must keep reading for keepAlive's pongs to be processed, so the handling itself happens on the worker.
@@ -146,9 +156,9 @@ func (c *TraQClient) handleMessageCreated(ctx context.Context, w *workerState, e
 	if err != nil {
 		return err
 	}
-	msg, err := c.API.Message(ctx, body.ID)
+	msg, err := c.fetchMessage(ctx, body.ID)
 	if err != nil {
-		return fmt.Errorf("get message %s: %w", body.ID, err)
+		return err
 	}
 	ch, ok := c.target(msg.ChannelID)
 	if !ok {
@@ -160,6 +170,45 @@ func (c *TraQClient) handleMessageCreated(ctx context.Context, w *workerState, e
 	c.queueMessage(key, ch.isDM(), msg)
 	w.recent.add(msg.ID, messageTarget{portal: key, userID: msg.UserID})
 	return nil
+}
+
+// fetchMessage reads the message of a MESSAGE_CREATED or MESSAGE_UPDATED, whose body has only its ID. A failure
+// that may pass (see isTransient) is retried, up to messageFetchAttempts in all: a dropped event is otherwise
+// brought only by the poller, for a recently active channel, or by the catch-up after the next reconnect.
+// The worker waits meanwhile, so the retries are few and short. 502 and 504 are not retried here: the traQ
+// client has already retried them, for several seconds.
+func (c *TraQClient) fetchMessage(ctx context.Context, id string) (*traq.Message, error) {
+	delay := messageFetchRetryDelay
+	for attempt := 1; ; attempt++ {
+		msg, err := c.API.Message(ctx, id)
+		if err == nil {
+			return msg, nil
+		}
+		retriedByClient := traq.IsStatus(err, http.StatusBadGateway) || traq.IsStatus(err, http.StatusGatewayTimeout)
+		if attempt >= messageFetchAttempts || !isTransient(err) || retriedByClient || ctx.Err() != nil {
+			if attempt > 1 {
+				return nil, fmt.Errorf("get message %s (%d attempts): %w", id, attempt, err)
+			}
+			return nil, fmt.Errorf("get message %s: %w", id, err)
+		}
+		zerolog.Ctx(ctx).Debug().Err(err).Str("traq_message_id", id).Stringer("delay", delay).
+			Msg("Failed to read a traQ message, retrying")
+		if !sleepCtx(ctx, delay) {
+			return nil, ctx.Err()
+		}
+		delay *= 2
+	}
+}
+
+// isTransient reports whether a failed traQ request may succeed when sent again soon: a 5xx response, or no
+// response because of a connection error. A timeout is not: the request already took the whole client timeout,
+// and a hung traQ would stall the worker for several of them.
+func isTransient(err error) bool {
+	if he := (*traq.HTTPError)(nil); errors.As(err, &he) {
+		return he.Status >= http.StatusInternalServerError
+	}
+	var ue *url.Error
+	return errors.As(err, &ue) && !ue.Timeout()
 }
 
 // queueMessage queues a new traQ message. bridgev2 drops one already bridged (by its ID) in the portal's
@@ -186,9 +235,9 @@ func (c *TraQClient) handleMessageUpdated(ctx context.Context, evt traq.Event) e
 	if err != nil {
 		return err
 	}
-	msg, err := c.API.Message(ctx, body.ID)
+	msg, err := c.fetchMessage(ctx, body.ID)
 	if err != nil {
-		return fmt.Errorf("get message %s: %w", body.ID, err)
+		return err
 	}
 	key, ok := c.portalKeyFor(msg.ChannelID)
 	if !ok {

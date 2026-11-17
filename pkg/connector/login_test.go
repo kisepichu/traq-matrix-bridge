@@ -134,3 +134,39 @@ func TestSubmitUserInputExchangeFailure(t *testing.T) {
 		}
 	}
 }
+
+// A token traQ issued for a login that then fails is revoked: it is stored nowhere, but stays valid for a year.
+func TestSubmitUserInputRevokesTheTokenOfAFailedLogin(t *testing.T) {
+	var revoked atomic.Value
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v3/oauth2/token", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"access_token":"fresh-token","token_type":"Bearer","expires_in":31536000}`))
+	})
+	mux.HandleFunc("GET /api/v3/users/me", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, `{"message":"boom"}`, http.StatusInternalServerError)
+	})
+	mux.HandleFunc("POST /api/v3/oauth2/revoke", func(w http.ResponseWriter, r *http.Request) {
+		revoked.Store(r.FormValue("token"))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := &TraQConnector{Config: NetworkConfig{
+		ServerURL: srv.URL,
+		OAuth:     OAuthConfig{ClientID: "client-id", RedirectURI: "http://localhost:29399/callback"},
+	}}
+	proc, err := c.CreateLogin(context.Background(), nil, "oauth")
+	if err != nil {
+		t.Fatal(err)
+	}
+	login := proc.(*oauthLogin)
+	if _, err := login.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	redirect := "http://localhost:29399/callback?code=c&state=" + url.QueryEscape(login.pkce.State)
+	if _, err := login.SubmitUserInput(context.Background(), map[string]string{"redirect_url": redirect}); err == nil {
+		t.Fatal("expected an error")
+	}
+	if got, _ := revoked.Load().(string); got != "fresh-token" {
+		t.Errorf("revoked %q, want the new token", got)
+	}
+}

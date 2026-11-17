@@ -96,16 +96,38 @@ func (l *oauthLogin) SubmitUserInput(ctx context.Context, input map[string]strin
 		log.Err(err).Msg("Failed to exchange the authorization code")
 		return nil, loginError("traQ did not accept the authorization code. Start over with the `login` command.")
 	}
+	// From here on, a failure revokes the new token: it is stored nowhere, but would stay valid for a year. A
+	// re-login that fails once the new token is in use is the exception (see NewLogin below).
 	api, err := traq.NewClient(l.main.Config.ServerURL, httpClient, token.AccessToken, userAgent)
 	if err != nil {
+		l.revoke(ctx, token.AccessToken, "new")
 		return nil, fmt.Errorf("failed to create the traQ client: %w", err)
 	}
 	me, err := api.Me(ctx)
 	if err != nil {
 		log.Err(err).Msg("Failed to fetch the logged-in traQ user")
+		l.revoke(ctx, token.AccessToken, "new")
 		return nil, loginError("Failed to fetch your traQ profile with the new token. Start over with the `login` command.")
 	}
 
+	existing, err := l.user.Bridge.GetExistingUserLoginByID(ctx, LoginID(me.ID))
+	if err != nil {
+		log.Err(err).Msg("Failed to look up an existing login")
+		l.revoke(ctx, token.AccessToken, "new")
+		return nil, loginError("Failed to save the login. Start over with the `login` command.")
+	}
+	if existing != nil && existing.UserMXID != l.user.MXID {
+		// The message must not name the other Matrix user.
+		log.Warn().Str("traq_user_id", me.ID).Msg("The traQ account is already logged in by another Matrix user")
+		l.revoke(ctx, token.AccessToken, "new")
+		return nil, loginError("This traQ account is already logged in on this bridge by another Matrix user.")
+	}
+	var oldToken string
+	if existing != nil {
+		if meta, _ := existing.Metadata.(*UserLoginMetadata); meta != nil {
+			oldToken = meta.AccessToken
+		}
+	}
 	ul, err := l.user.NewLogin(ctx, &database.UserLogin{
 		ID:         LoginID(me.ID),
 		RemoteName: me.Name,
@@ -116,7 +138,22 @@ func (l *oauthLogin) SubmitUserInput(ctx context.Context, input map[string]strin
 		Metadata: &UserLoginMetadata{AccessToken: token.AccessToken, ExpiresAt: token.ExpiresAt},
 	}, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to save the login: %w", err)
+		// NewLogin's error may name another Matrix user (a login made meanwhile), so it only goes to the log.
+		log.Err(err).Msg("Failed to save the login")
+		// On a re-login, bridgev2 reuses the cached login: NewLogin may fail before it put the new token in that
+		// login's metadata (the new token is then unused, so it is revoked) or after (when loading the client or
+		// saving to the database fails; the new token is then the cached login's, so neither token is revoked).
+		// Known limit of the latter: the old client has been disconnected and the new one is not connected until
+		// the bridge restarts, which loads the old token again from the database; the new token then stays valid
+		// until traQ expires it.
+		if existing == nil || !holdsToken(existing, token.AccessToken) {
+			l.revoke(ctx, token.AccessToken, "new")
+		}
+		return nil, loginError("Failed to save the login. Start over with the `login` command.")
+	}
+	// A re-login replaced the stored token; the old one is no longer used anywhere.
+	if oldToken != "" && oldToken != token.AccessToken {
+		l.revoke(ctx, oldToken, "replaced")
 	}
 	// bridgev2 calls Connect only at startup and on reconnects, so start the new login here. The request
 	// context ends with this call.
@@ -133,15 +170,33 @@ func (l *oauthLogin) SubmitUserInput(ctx context.Context, input map[string]strin
 	}, nil
 }
 
+// holdsToken tells whether ul's metadata holds the access token.
+func holdsToken(ul *bridgev2.UserLogin, token string) bool {
+	meta, _ := ul.Metadata.(*UserLoginMetadata)
+	return meta != nil && meta.AccessToken == token
+}
+
 func (l *oauthLogin) Cancel() {}
+
+// revoke revokes an access token that this login does not keep (which: "new" or "replaced"). A failure is
+// logged; traQ expires the token on its own. It runs even if the login request ends meanwhile, bounded by
+// httpTimeout.
+func (l *oauthLogin) revoke(ctx context.Context, token, which string) {
+	log := zerolog.Ctx(ctx)
+	if err := l.main.oauthConfig().Revoke(context.WithoutCancel(ctx), token); err != nil {
+		log.Warn().Err(err).Str("token", which).Msg("Failed to revoke a traQ access token")
+		return
+	}
+	log.Info().Str("token", which).Msg("Revoked a traQ access token that is no longer used")
+}
 
 func loginError(msg string) error {
 	return bridgev2.RespError(mautrix.MInvalidParam.WithMessage(msg))
 }
 
 func (c *TraQConnector) LoadUserLogin(_ context.Context, login *bridgev2.UserLogin) error {
-	client := &TraQClient{Main: c, Login: login, users: newUserCache()}
-	client.view = newViewState(c.Config.ViewIdleTimeout, client.sendViewState, time.Now)
+	client := &TraQClient{Main: c, Login: login, users: newUserCache(), viewPolls: make(chan string, 1)}
+	client.view = newViewState(c.Config.ViewIdleTimeout, client.sendViewState, time.Now, client.requestViewPoll)
 	if meta, _ := login.Metadata.(*UserLoginMetadata); meta != nil && meta.AccessToken != "" {
 		api, err := traq.NewClient(c.Config.ServerURL, httpClient, meta.AccessToken, userAgent)
 		if err != nil {

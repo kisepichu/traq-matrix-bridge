@@ -139,3 +139,38 @@ func TestToMatrixReplyQuoteAloneWithoutLink(t *testing.T) {
 		t.Errorf("ToMatrix(%q)\n got  %#v\n want %#v", quote, got, want)
 	}
 }
+
+// On a traQ whose host has no dotted TLD (the dev environment's http://localhost:3080), bare file and message
+// URLs of that origin are found like on any other host. Other dotless URLs are left as text, as before.
+func TestToMatrixDotlessOrigin(t *testing.T) {
+	const origin = "http://localhost:3080"
+	in := func(content string) ToMatrixInput {
+		i := input(content)
+		i.ServerURL = &url.URL{Scheme: "http", Host: "localhost:3080"}
+		return i
+	}
+	cases := []struct {
+		name string
+		in   string
+		want ToMatrixResult
+	}{
+		{"file url", "a\n" + origin + "/files/" + f1, ToMatrixResult{Body: "a", HTML: "a", FileIDs: []string{f1}}},
+		{"reply quote", origin + "/messages/" + m1 + "\nyes", ToMatrixResult{Body: "yes", HTML: "yes", ReplyTo: m1}},
+		{"other quote", "see " + origin + "/messages/" + m2, ToMatrixResult{Body: "see " + origin + "/messages/" + m2,
+			HTML: `see <a href="https://matrix.to/#/!gen:example.org/$ev2">` + origin + `/messages/` + m2 + `</a>`}},
+		// As with a dotted host, whose upper-case TLD the linkify pattern does not take either.
+		{"upper-case host", "http://LOCALHOST:3080/files/" + f1 + " x", ToMatrixResult{Body: "http://LOCALHOST:3080/files/" + f1 + " x", HTML: "http://LOCALHOST:3080/files/" + f1 + " x"}},
+		{"longer path stays a link", origin + "/files/" + f1 + "/x", ToMatrixResult{Body: origin + "/files/" + f1 + "/x",
+			HTML: `<a href="` + origin + `/files/` + f1 + `/x">` + origin + `/files/` + f1 + `/x</a>`}},
+		{"longer port is another origin", "http://localhost:30801/files/" + f1, ToMatrixResult{Body: "http://localhost:30801/files/" + f1, HTML: "http://localhost:30801/files/" + f1}},
+		{"other dotless host", "http://other:3080/files/" + f1, ToMatrixResult{Body: "http://other:3080/files/" + f1, HTML: "http://other:3080/files/" + f1}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := ToMatrix(in(c.in), resolver)
+			if !reflect.DeepEqual(got, c.want) {
+				t.Errorf("ToMatrix(%q)\n got  %#v\n want %#v", c.in, got, c.want)
+			}
+		})
+	}
+}

@@ -4,6 +4,8 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"iter"
+	"maps"
 	"net/http"
 	"slices"
 	"time"
@@ -60,42 +62,74 @@ func (c *TraQClient) noteActivity(channelID string, t time.Time) {
 
 // loadLastActivity starts the session's last activity map from the newest bridged message of each target.
 func (c *TraQClient) loadLastActivity(ctx context.Context, targets map[string]channelInfo) {
-	activity := make(map[string]time.Time, len(targets))
-	for id, ch := range targets {
-		rows, err := c.Login.Bridge.DB.Message.GetLastNInPortal(ctx, c.portalKey(ch), 1)
-		if err != nil {
-			if ctx.Err() == nil {
-				c.Login.Log.Err(err).Str("traq_channel_id", id).Msg("Failed to get the newest bridged message")
-			}
-			continue
-		}
-		if len(rows) > 0 {
-			activity[id] = rows[0].Timestamp
-		}
-	}
+	activity := c.newestBridged(ctx, maps.Values(targets))
 	c.stateMu.Lock()
 	c.lastActivity = activity
 	c.stateMu.Unlock()
 }
 
+// newestBridged returns the time of the newest bridged message of each channel that has one, by channel ID.
+func (c *TraQClient) newestBridged(ctx context.Context, channels iter.Seq[channelInfo]) map[string]time.Time {
+	activity := make(map[string]time.Time)
+	for ch := range channels {
+		rows, err := c.Login.Bridge.DB.Message.GetLastNInPortal(ctx, c.portalKey(ch), 1)
+		if err != nil {
+			if ctx.Err() == nil {
+				c.Login.Log.Err(err).Str("traq_channel_id", ch.ID).Msg("Failed to get the newest bridged message")
+			}
+			continue
+		}
+		if len(rows) > 0 {
+			activity[ch.ID] = rows[0].Timestamp
+		}
+	}
+	return activity
+}
+
 // pollLoop re-reads the recently active channels every poll.interval until ctx ends, to bridge the edits,
 // deletions and stamp changes that the WebSocket does not deliver (it sends stamps only for the viewed
 // channel, and nothing but new messages for DMs), and the new messages it missed while its connection was
-// dead but not noticed yet. A rejected token stops the session with errTokenRejected.
+// dead but not noticed yet. It also polls, once, each channel the viewstate switches to (see
+// requestViewPoll). A rejected token stops the session with errTokenRejected.
 func (c *TraQClient) pollLoop(ctx context.Context, stop context.CancelCauseFunc) {
 	t := time.NewTicker(c.Main.Config.Poll.Interval)
 	ctx = c.Login.Log.With().Str("action", "poll").Logger().WithContext(ctx)
 	defer t.Stop()
 	for {
+		var rejected bool
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			rejected = c.pollOnce(ctx)
+		case id := <-c.viewPolls:
+			// Paced like the channels of a poll: the switch follows Matrix activity, which may have just sent
+			// requests to traQ.
+			if !sleepCtx(ctx, pollChannelGap) {
+				return
+			}
+			zerolog.Ctx(ctx).Debug().Str("traq_channel_id", id).Msg("Polling the channel the viewstate switched to")
+			rejected = c.pollLogged(ctx, id)
 		}
-		if c.pollOnce(ctx) {
+		if rejected {
 			stop(errTokenRejected)
 			return
 		}
+	}
+}
+
+// requestViewPoll asks the poll loop to poll a channel once, without waiting: the viewstate switched to it,
+// and traQ never sent the stamp events of the time before (see viewState). A request still waiting is
+// replaced, as only the viewed channel matters. It is viewState's switched function, called under its lock, so
+// there is one caller at a time.
+func (c *TraQClient) requestViewPoll(channelID string) {
+	select {
+	case <-c.viewPolls:
+	default:
+	}
+	select {
+	case c.viewPolls <- channelID:
+	default:
 	}
 }
 
@@ -120,13 +154,8 @@ func (c *TraQClient) pollOnce(ctx context.Context) (rejected bool) {
 		if i > 0 && !sleepCtx(ctx, pollChannelGap) {
 			return false
 		}
-		err := c.pollChannel(ctx, id)
-		switch {
-		case err == nil || ctx.Err() != nil:
-		case traq.IsStatus(err, http.StatusUnauthorized):
+		if c.pollLogged(ctx, id) {
 			return true
-		default:
-			zerolog.Ctx(ctx).Warn().Err(err).Str("traq_channel_id", id).Msg("Failed to poll channel")
 		}
 		if ctx.Err() != nil {
 			return false
@@ -135,16 +164,17 @@ func (c *TraQClient) pollOnce(ctx context.Context) (rejected bool) {
 	return false
 }
 
-// sleepCtx waits for d. It returns false if ctx ended first.
-func sleepCtx(ctx context.Context, d time.Duration) bool {
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-t.C:
+// pollLogged polls a channel and logs a failure. It reports whether traQ rejected the token.
+func (c *TraQClient) pollLogged(ctx context.Context, channelID string) (rejected bool) {
+	err := c.pollChannel(ctx, channelID)
+	switch {
+	case err == nil || ctx.Err() != nil:
+	case traq.IsStatus(err, http.StatusUnauthorized):
 		return true
+	default:
+		zerolog.Ctx(ctx).Warn().Err(err).Str("traq_channel_id", channelID).Msg("Failed to poll channel")
 	}
+	return false
 }
 
 // pollChannel reads the newest poll.depth messages of a channel, compares them with what is bridged and

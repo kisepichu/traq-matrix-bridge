@@ -249,7 +249,7 @@ func TestHTTPErrorFallsBackToTruncatedBody(t *testing.T) {
 	}))
 	defer srv.Close()
 	c, _ := NewClient(srv.URL, srv.Client(), "t", "test")
-	_, err := c.Channel(context.Background(), "c1")
+	_, err := c.User(context.Background(), "u1")
 	var he *HTTPError
 	if !errors.As(err, &he) || he.Status != http.StatusNotFound || len(he.Message) != 200 {
 		t.Errorf("err = %v", err)

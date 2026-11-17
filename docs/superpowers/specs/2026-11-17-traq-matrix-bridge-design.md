@@ -150,6 +150,9 @@ traQ の WebSocket は event ごとに届く相手が違う。
 - **今読んでいるチャンネル**: Matrix で read receipt (または message の送信、reaction の追加・取り消し) があった room のチャンネルに
   `viewstate:<channel>:monitoring` を送る。そのチャンネルの編集・削除・スタンプは WebSocket で届く。
   `view_idle_timeout` の間 Matrix で操作が無ければ `viewstate:null` を送る (traQ の閲覧者の表示に残り続けない)。
+  viewstate を別のチャンネルに向けた (再接続で送り直したときも) すぐ後に、そのチャンネルを 1 回だけ下の poller と
+  同じ方法で読む (200ms 空けてから。poll が走っている最中なら、その後になる)。向ける前のスタンプの変更は
+  WebSocket で届かず、閲覧中は poller も読まないため。
 - **それ以外のチャンネル** (poller): 新着は全部 bridge に届くので、bridge は portal ごとの最終書き込み時刻を
   知っている (起動時は database の最新 message から、その後は受け取った event から)。`poll.interval` ごとに、
   最終書き込みが `poll.window` 内で、今 viewstate を向けていない portal を新しい順に最大 `poll.max_channels` 件選び、
@@ -166,14 +169,19 @@ traQ の WebSocket は event ごとに届く相手が違う。
     (順番は前後しうるが失われない。bridge 済みの ID は bridgev2 が捨てる)。ただし、取れた中で bridge 済みの
     最古の message より古いものは除く (room より前の過去ログか、読んだ範囲の外)。取れた中に bridge 済みのものが
     無ければ何もしない (取れる件数より多く来ているので、再接続の取り込みに任せる)
-  - stamp の (user, stamp) の組が増えた・減った → reaction の追加・削除
+  - stamp の (user, stamp) の組が増えた・減った → reaction の追加・削除。message ごとに全 user 分の組を
+    `ReactionSync` で送り、足し引きは bridgev2 が計算する。既知の制限: viewstate を向けたときの 1 回の poll と
+    WebSocket のスタンプの event が競ると、poll が読んだ古い組で event の分が戻ることがあり、閲覧が外れて
+    poller がまた読むまでそのままになる
   
   `/activity/timeline` は候補選びに使わない。`limit` が最大 50 で、public チャンネルしか返さない (DM が漏れる) ため。
 - **再接続**: WebSocket が切れたら指数 backoff で繋ぎ直す。繋がったら、切れていた間の新着を拾うため、
   `/users/me/unread` に出ているチャンネル、`/activity/timeline?per_channel=true` (購読チャンネル) で最後の
   投稿が切断時刻 (気付くまでの遅れと時計のずれの分を引く) 以後のチャンネル、全 DM のうち、room のある portal に
-  ついて、traQ の最新が database の最新 message より新しければ、その後を取り込む。bridge を起動したときは
-  unread・activity timeline (時刻で絞らない)・全 DM について同じことをする (activity timeline が読めなければ全 portal)。
+  ついて、traQ の最新が database の最新 message より新しければ、その後を取り込む。room の無い DM で未読のあるものは、
+  ここで room を作って過去ログを取り込む。bridge を起動したときは unread・activity timeline (時刻で絞らない)・全 DM
+  について同じことをする (activity timeline が読めなければ全 portal)。どちらも 1 秒に 4 件までに抑えて queue する
+  (「チャンネルと room」)。
   `PING` を定期的に送り、応答が無ければ切って繋ぎ直す。
 - **user / stamp の変更**: `USER_UPDATED` / `USER_ICON_UPDATED` で ghost の表示名とアイコンを、
   `STAMP_CREATED` / `UPDATED` / `DELETED` で stamp の cache を更新する。
@@ -181,9 +189,25 @@ traQ の WebSocket は event ごとに届く相手が違う。
 ## チャンネルと room
 
 - portal にするのは、購読レベル 1 (未読管理) 以上のチャンネルと DM (`/channels?include-dm=true`)。
-  購読状態は接続時と `subscription_sync_interval` ごとに `/users/me/subscriptions` から読む。
+  購読状態は接続時と `subscription_sync_interval` ごとに `/users/me/subscriptions` から読む。チャンネルの変更
+  (`CHANNEL_UPDATED` / `DELETED`) でも読み直すが、全 public チャンネルの変更が届くので、前回の読み直しの開始から
+  30 秒は空ける (その間の変更はまとめて 1 回にする)。
+- DM の room は遅延して作る。traQ は誰かが DM のページを開いただけで DM チャンネルを作るので、中身の無い DM が多い。
+  接続時に room を作るのは、room の無い DM のうち未読のあるもの (traQ は DM の未読を必ず管理する) だけにする。
+  それ以外は最初の新着 (WebSocket、poller、再接続の catch-up) で room を作り、過去ログを取り込む。
+- portal の作成・更新 (`ChatResync`) は、接続時、購読の読み直し、再接続の catch-up のどれでも 1 秒に 4 件までに
+  抑えて queue する (数百のチャンネルを購読する account で、room の作成と過去ログの取り込み、traQ への request が
+  一度に走らないように)。まだ queue していない portal に新着などが届いたら、その portal の分だけ先に queue する
+  (catch-up より先に新着が入ると、取り込みの起点がずれて間の message が抜けるため)。切断 (`Disconnect`) で止める。
 - 購読レベル 2 (未読管理 + 通知) は通常の room、1 は通知を切った room (double puppet の room 設定)。
-- 購読を 0 にしたチャンネルは portal を消す。購読し直したら作り直し、過去ログを取り込む。
+- 購読を 0 にしたチャンネルは portal を消す。購読し直したら作り直し、過去ログを取り込む。ただし 1 回の読み直しで
+  public チャンネルの portal の半分より多く (かつ 5 件以上) が消える、または購読が 1 件も無いのに public チャンネルの
+  portal があるときは、traQ の一時的な異常とみなしてその回は消さず、警告を log に出す。次の読み直しでも同じ portal が
+  消えるなら消す。接続時も同じ規則で判断する (比べる相手は、この login の room のある portal)。消さなかった portal は
+  対象のまま残す (poller も見る) ので、次の読み直しで同じ portal が消えれば消し、そうでなければ残して、保留の間に
+  投稿された message を取り込む (traQ の最新が database の最新 message より新しければその後を取り込む。接続時に
+  保留にした portal では停止中の分も)。既知の制限: DM の portal はこの規則で数えない。DM だけが消える答え (DM の無い
+  チャンネル一覧など) では DM の portal はそのまま消える (public チャンネルの portal とともに保留になるときだけ残る)。
 - room 名はフルパス (`#` 無しの `gps/times/kise`)、topic はチャンネルの topic。DM は相手の表示名。
 - ghost の表示名は traQ の `displayName`、アイコンは `/public/icon/{name}` (認証不要)。bot user は表示名に `(bot)` を付ける。
 
@@ -279,7 +303,8 @@ traQ の WebSocket は event ごとに届く相手が違う。
 - **Matrix → traQ**: read receipt で `DELETE /users/me/unread/{channelId}` (`readChannel`) を送る。traQ の既読は
   チャンネル単位なので、Matrix で途中まで読んだ場合もチャンネル全体が既読になる。
 - **traQ → Matrix**: `MESSAGE_READ` で、その room の最新の bridge 済み message に自分の read receipt を付ける (double puppet)。
-- **接続時**: `/users/me/unread` に無い portal は最新 message まで既読にする。
+- **接続時**: `/users/me/unread` に無い portal は最新 message まで既読にする (その portal の作成・更新の直後に)。
+  bridge 済みの message が 1 つも無い portal は飛ばす (既読にするものが無く、新しい room は過去ログの取り込みが既読を付ける)。
 
 ## 検索
 

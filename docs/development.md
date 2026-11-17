@@ -8,6 +8,8 @@ bridge を手元で動かして確認するための環境と、その操作 scr
 - Synapse: docker、server name `localhost`、client API は `http://localhost:8008` (host の `127.0.0.1` だけに公開。federation 無し、rate limit 無し、SQLite)
 - bridge: host で `go build` して前景で実行 (Synapse から `host.docker.internal:29338` で到達する)
 
+traQ の origin `http://localhost:3080` の host には `.` で区切った TLD が無いが、本文中の bare な `http://localhost:3080/files/<id>` と `http://localhost:3080/messages/<id>` も production の traQ と同じく file と引用として扱う (msgconv は goldmark の linkify が拾わない URL を、設定の origin で始まるものに限って拾う)。`127.0.0.1.nip.io` のような `.` 入りの別名を `network.server_url` に設定する必要は無い。
+
 必要なもの: bash、curl、jq、docker (compose v2)、go。libolm のヘッダが無い環境でも動くように、`dev.sh bridge` は `-tags goolm` でビルドする。
 
 ## 開発の流れ
@@ -86,7 +88,7 @@ testenv/dev.sh setup
 
 `TRAQ_INIT_EMOJIS=1` は `testenv/compose.emojis.yaml` を重ねて traQ を `--skip-init-emojis` 無しで起動し、traQ が応答するまで最大 30 分待つ。絵文字の取得に失敗しても traQ はそのまま起動するので、stamp が少ない時は `docker compose -p tmb logs traq` で `failed to install unicode emojis` を確かめる。結合テストと CI は `compose.yaml` だけを使うので影響しない。
 
-bridge は最初に CONNECTED になった login の API で stamp の一覧を DB (`traq_stamp`) に取り込み、Unicode stamp の file 名 (`1f44d.svg` など) から絵文字を 100ms に 1 件ずつ解決する (約 1700 個で 3 分ほど)。進み具合は 500 件ごとに、終わると `The stamp table is complete` が log に出る。解決した表は DB に残るので、再起動後は解決し直さない。その途中でも、bridge する message や reaction に付いた Unicode stamp はその場で解決する。file が無いものや file 名が絵文字でないものは、解決できないものとして DB に記録する。meta の読み込みがそれ以外の理由 (traQ が落ちているなど) で 5 回失敗したものは、いったん飛ばして (`Giving up on the emoji of a Unicode stamp for now, it is retried after the others`) 残りを先に解決し、表を完成させてから背景で backoff を空けて読み直し続ける (`retrying` がその数、全部解決すると `Resolved the emoji of the Unicode stamps that were retried`)。DB では未解決のままなので、途中で止めても次の起動で読み直す。読み直しが終わるまでは、Matrix からの絵文字の reaction で表に無いものは「unknown stamp」でなく「the emoji to stamp table is still being built」で拒否され、traQ → Matrix の変換はその stamp を 1 分に 1 回だけその場で読み直す (それまでは `:name:`)。
+bridge は最初に CONNECTED になった login の API で stamp の一覧を DB (`traq_stamp`) に取り込み、Unicode stamp の file 名 (`1f44d.svg` など) から絵文字を 100ms に 1 件ずつ解決する (約 1700 個で 3 分ほど)。進み具合は 500 件ごとに、終わると `The stamp table is complete` が log に出る。解決した表は DB に残るので、再起動後は解決し直さない。その途中でも、bridge する message や reaction に付いた Unicode stamp はその場で解決する。file が無いものや file 名が絵文字でないものは、解決できないものとして DB に記録する。meta の読み込みがそれ以外の理由 (traQ が落ちているなど) で 5 回失敗したものは、いったん飛ばして (`Giving up on the emoji of a Unicode stamp for now, it is retried after the others`) 残りを先に解決し、表を完成させてから背景で backoff を空けて読み直し続ける (`retrying` がその数、待つたびに `Retrying the emoji of the Unicode stamps given up on`、全部解決すると `Resolved the emoji of the Unicode stamps that were retried`)。1 回の読み直しは最初に失敗したところで止め (traQ が落ちている間は 1 回に 1 件しか読まない)、次の回は失敗した stamp の次から読む。DB では未解決のままなので、途中で止めても次の起動で読み直す。読み直しが終わるまでは、Matrix からの絵文字の reaction で表に無いものは「unknown stamp」でなく「the emoji to stamp table is still being built」で拒否され、traQ → Matrix の変換はその stamp を 1 分に 1 回だけその場で読み直す (それまでは `:name:`)。`STAMP_CREATED` / `STAMP_UPDATED` で読み直した Unicode stamp の meta が読めなかったときも同じ扱いになる。
 
 ### 片付け
 

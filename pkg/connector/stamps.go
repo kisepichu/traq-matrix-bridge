@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"runtime/debug"
 	"slices"
 	"sync"
 	"time"
@@ -143,10 +144,12 @@ func (c *TraQConnector) runStampSync(ctx context.Context) {
 // stampResolveAttempts times, for any reason, so that one stamp cannot keep the table incomplete: the table is
 // marked complete after the walk. The stamps that the walk leaves pending (given up on, or given another file
 // meanwhile whose meta failed) are then retried in rounds, with the backoff, until each is resolved or gets a
-// definite answer (see emojiFromFile); only then has the job finished. Meanwhile Stamps has them with a retry
-// time (SetRetryAfter), so Resolve does not call an emoji unknown and the conversions do not ask traQ for them
-// at every turn. They stay pending in the store, so a stopped job or the next start retries them too. The
-// backoff is not reset by giving up, so a traQ that fails every request slows the job down.
+// definite answer (see emojiFromFile); only then has the job finished. A round stops at its first failure, so
+// that a traQ that is down is asked once per round, and the next round starts after the stamp that failed.
+// Meanwhile Stamps has them with a retry time (SetRetryAfter), so Resolve does not call an emoji unknown and
+// the conversions do not ask traQ for them at every turn. They stay pending in the store, so a stopped job or
+// the next start retries them too. The backoff is not reset by giving up, so a traQ that fails every request
+// slows the job down.
 func (c *TraQConnector) syncStamps(ctx context.Context) (bool, error) {
 	log := zerolog.Ctx(ctx)
 	retry := backoff{min: c.stampSync.retryMin}
@@ -173,7 +176,7 @@ func (c *TraQConnector) syncStamps(ctx context.Context) (bool, error) {
 				}
 			}
 			log.Warn().Err(err).Msg("Stamp sync failed")
-			if !retry.wait(ctx, *log) {
+			if !retry.wait(ctx, *log, "Retrying the stamp sync") {
 				return ctx.Err()
 			}
 		}
@@ -218,6 +221,8 @@ func (c *TraQConnector) syncStamps(ctx context.Context) (bool, error) {
 			resolved++
 		case s.Unresolvable:
 			unresolvable++
+		case !s.Unicode:
+			// Changed to a custom stamp meanwhile: it has no emoji to resolve.
 		default:
 			c.Stamps.SetRetryAfter(p.ID, time.Now().Add(stampOnDemandRetryDelay))
 			retrying = append(retrying, p.ID)
@@ -234,7 +239,7 @@ func (c *TraQConnector) syncStamps(ctx context.Context) (bool, error) {
 	}
 
 	for len(retrying) > 0 {
-		if !retry.wait(ctx, *log) {
+		if !retry.wait(ctx, *log, "Retrying the emoji of the Unicode stamps given up on") {
 			return false, ctx.Err()
 		}
 		api := c.stampAPI()
@@ -242,8 +247,8 @@ func (c *TraQConnector) syncStamps(ctx context.Context) (bool, error) {
 			return false, errNoStampLogin
 		}
 		var failed error
-		left := retrying[:0]
-		for _, id := range retrying {
+		var left []string
+		for i, id := range retrying {
 			if s, ok := c.Stamps.ByID(id); !ok || !s.EmojiPending() {
 				continue
 			}
@@ -253,13 +258,20 @@ func (c *TraQConnector) syncStamps(ctx context.Context) (bool, error) {
 			case <-tick.C:
 			}
 			if _, err := c.resolveEmoji(ctx, api, id); err != nil {
+				// traQ is likely still failing, so the others are not tried this round. The next round starts
+				// after this stamp, so that one stamp that keeps failing does not keep the others waiting.
 				failed = err
+				left = append(append(slices.Clone(retrying[i+1:]), left...), id)
+				break
 			}
 			if s, ok := c.Stamps.ByID(id); ok && s.EmojiPending() {
 				left = append(left, id)
 			}
 		}
-		retrying = left
+		retrying = slices.DeleteFunc(left, func(id string) bool {
+			s, ok := c.Stamps.ByID(id)
+			return !ok || !s.EmojiPending()
+		})
 		if failed != nil {
 			log.Warn().Err(failed).Int("left", len(retrying)).Msg("Failed to resolve the emoji of Unicode stamps again")
 		} else {
@@ -351,9 +363,16 @@ func (c *TraQConnector) reconcileStamps(ctx context.Context, api *traq.Client) e
 // concurrent calls for one stamp share one resolution (run with the first caller's ctx), and a stamp
 // resolved, changed or deleted meanwhile is returned as Stamps has it (the zero Stamp if deleted), without
 // storing the resolution. FileMeta runs without writeMu, so that a slow traQ delays only the callers of this
-// stamp. A failure leaves the stamp pending.
+// stamp. A failure leaves the stamp pending. The resolution runs on its own goroutine (DoChan), where nothing
+// else would recover a panic, so a panic is returned as an error.
 func (c *TraQConnector) resolveEmoji(ctx context.Context, api *traq.Client, id string) (stampconv.Stamp, error) {
-	ch := c.stampSync.resolving.DoChan(id, func() (any, error) {
+	ch := c.stampSync.resolving.DoChan(id, func() (val any, err error) {
+		defer func() {
+			if p := recover(); p != nil {
+				val, _ = c.Stamps.ByID(id)
+				err = fmt.Errorf("panic while resolving the emoji of stamp %s: %v\n%s", id, p, debug.Stack())
+			}
+		}()
 		s, ok := c.Stamps.ByID(id)
 		if !ok || !s.EmojiPending() {
 			return s, nil
@@ -424,7 +443,8 @@ func (c *TraQConnector) storedFileID(ctx context.Context, id string) (string, er
 
 // refreshStamp reads one stamp from traQ, with the emoji of a Unicode stamp, into the store and Stamps
 // (STAMP_CREATED, STAMP_UPDATED). A stamp that traQ no longer has is deleted. If the emoji cannot be read now,
-// the stamp is stored pending, and resolved on demand or by the next job.
+// the stamp is stored pending with a retry time, like a stamp the job has given up on (see SetRetryAfter), and
+// resolved on demand after that time, or by the next job.
 func (c *TraQConnector) refreshStamp(ctx context.Context, api *traq.Client, id string) error {
 	c.stampSync.writeMu.Lock()
 	defer c.stampSync.writeMu.Unlock()
@@ -436,16 +456,24 @@ func (c *TraQConnector) refreshStamp(ctx context.Context, api *traq.Client, id s
 		return fmt.Errorf("get stamp %s: %w", id, err)
 	}
 	s := stampFromTraQ(st)
+	retryLater := false
 	if st.IsUnicode {
 		if resolved, err := emojiFromFile(ctx, api, s, st.FileID); err != nil {
 			zerolog.Ctx(ctx).Warn().Err(err).Str("stamp_id", id).
 				Msg("Failed to resolve the emoji of a Unicode stamp, it is resolved later")
+			retryLater = true
 		} else {
 			s = resolved
 		}
 	}
 	c.touchedLocked(id)
-	return c.putStampLocked(ctx, s, st.FileID)
+	if err := c.putStampLocked(ctx, s, st.FileID); err != nil {
+		return err
+	}
+	if retryLater {
+		c.Stamps.SetRetryAfter(id, time.Now().Add(stampOnDemandRetryDelay))
+	}
+	return nil
 }
 
 // deleteStamp removes a stamp from the store and Stamps (STAMP_DELETED).

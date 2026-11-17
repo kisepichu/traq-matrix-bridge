@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -78,74 +80,146 @@ func TestFailedEventLogBody(t *testing.T) {
 	}
 }
 
-// A burst of channel events must not block the worker on a sync, and adds up to at most one pending sync.
-func TestChannelEventsCoalesceSyncs(t *testing.T) {
-	var calls atomic.Int32
-	release := make(chan struct{})
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/v3/channels", func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
-		select {
-		case <-release:
-		case <-r.Context().Done():
-			return
+// A burst of channel events must not block the worker on a sync, and adds up to at most one pending sync. A
+// sync that channel events trigger starts at least eventSyncSpacing after the previous one, so a server whose
+// channels change all the time does not make the bridge read the whole channel list again and again.
+func TestChannelEventSyncs(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var mu sync.Mutex
+		var syncs []time.Time
+		release := make(chan struct{})
+		mux := http.NewServeMux()
+		mux.HandleFunc("GET /api/v3/channels", func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			syncs = append(syncs, time.Now())
+			mu.Unlock()
+			<-release
+			_, _ = w.Write([]byte(`{"public":[],"dm":[]}`))
+		})
+		mux.HandleFunc("GET /api/v3/users/me/subscriptions", func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`[]`))
+		})
+		c := &TraQClient{
+			Main: &TraQConnector{
+				Config:  NetworkConfig{SubscriptionSyncInterval: time.Hour},
+				Stamps:  stampconv.NewTable([]stampconv.Stamp{{ID: "s1", Name: "good"}}, false),
+				stampDB: newTestStampDB(t),
+			},
+			Login: &bridgev2.UserLogin{UserLogin: &database.UserLogin{}, Log: zerolog.Nop()},
+			API:   newMemAPI(t, mux),
 		}
-		_, _ = w.Write([]byte(`{"public":[],"dm":[]}`))
-	})
-	mux.HandleFunc("GET /api/v3/users/me/subscriptions", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`[]`))
-	})
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-	api, err := traq.NewClient(srv.URL, srv.Client(), "token", userAgent)
-	if err != nil {
-		t.Fatal(err)
-	}
-	c := &TraQClient{
-		Main: &TraQConnector{
-			Config:  NetworkConfig{SubscriptionSyncInterval: time.Hour},
-			Stamps:  stampconv.NewTable([]stampconv.Stamp{{ID: "s1", Name: "good"}}, false),
-			stampDB: newTestStampDB(t),
-		},
-		Login: &bridgev2.UserLogin{UserLogin: &database.UserLogin{}, Log: zerolog.Nop()},
-		API:   api,
-	}
-	ctx, stop := context.WithCancelCause(context.Background())
-	queue := make(chan traq.Event, eventQueueSize)
-	requests := make(chan struct{}, 1)
-	var wg sync.WaitGroup
-	wg.Go(func() { c.eventWorker(ctx, queue, requests) })
-	wg.Go(func() { c.subscriptionSyncLoop(ctx, stop, requests) })
-	t.Cleanup(func() {
-		stop(nil)
-		wg.Wait()
-	})
-	wait := func(what string, cond func() bool) {
-		t.Helper()
-		for deadline := time.Now().Add(2 * time.Second); !cond(); time.Sleep(5 * time.Millisecond) {
-			if time.Now().After(deadline) {
-				t.Fatalf("timed out waiting for %s", what)
+		ctx, stop := context.WithCancelCause(t.Context())
+		queue := make(chan traq.Event, eventQueueSize)
+		requests := make(chan struct{}, 1)
+		var wg sync.WaitGroup
+		wg.Go(func() { c.eventWorker(ctx, queue, requests) })
+		wg.Go(func() { c.subscriptionSyncLoop(ctx, stop, requests) })
+		defer func() {
+			stop(nil)
+			wg.Wait()
+		}()
+		syncTimes := func() []time.Duration {
+			mu.Lock()
+			defer mu.Unlock()
+			var d []time.Duration
+			for _, s := range syncs {
+				d = append(d, s.Sub(syncs[0]))
 			}
+			return d
 		}
-	}
-	channelEvent := func(typ string) traq.Event {
-		return traq.Event{Type: typ, Body: json.RawMessage(`{"id":"0193a1b2-0000-7000-8000-0000000000c1"}`)}
-	}
+		channelEvent := func(typ string) traq.Event {
+			return traq.Event{Type: typ, Body: json.RawMessage(`{"id":"0193a1b2-0000-7000-8000-0000000000c1"}`)}
+		}
 
-	queue <- channelEvent("CHANNEL_UPDATED")
-	wait("the first sync", func() bool { return calls.Load() == 1 })
-	for i := range 10 {
-		queue <- channelEvent([]string{"CHANNEL_UPDATED", "CHANNEL_DELETED"}[i%2])
-	}
-	queue <- traq.Event{Type: "STAMP_DELETED", Body: json.RawMessage(`{"id":"s1"}`)}
-	wait("the worker to handle the events after the burst", func() bool {
-		_, ok := c.Main.Stamps.ByID("s1")
-		return !ok
+		queue <- channelEvent("CHANNEL_UPDATED")
+		synctest.Wait()
+		for i := range 10 {
+			queue <- channelEvent([]string{"CHANNEL_UPDATED", "CHANNEL_DELETED"}[i%2])
+		}
+		queue <- traq.Event{Type: "STAMP_DELETED", Body: json.RawMessage(`{"id":"s1"}`)}
+		synctest.Wait()
+		if _, ok := c.Main.Stamps.ByID("s1"); ok {
+			t.Fatal("the worker did not handle the event after the burst while a sync was running")
+		}
+		close(release)
+		time.Sleep(10 * time.Minute)
+		synctest.Wait()
+		if got, want := syncTimes(), []time.Duration{0, eventSyncSpacing}; !slices.Equal(got, want) {
+			t.Errorf("syncs at %v, want %v (the running sync, and the burst's one sync after the spacing)", got, want)
+		}
+
+		// Long enough after the last sync, an event is synced at once.
+		queue <- channelEvent("CHANNEL_DELETED")
+		synctest.Wait()
+		if got, want := syncTimes(), []time.Duration{0, eventSyncSpacing, 10 * time.Minute}; !slices.Equal(got, want) {
+			t.Errorf("syncs at %v, want %v", got, want)
+		}
 	})
-	close(release)
-	wait("the pending sync", func() bool { return calls.Load() == 2 })
-	time.Sleep(100 * time.Millisecond)
-	if got := calls.Load(); got != 2 {
-		t.Errorf("Channels() was called %d times, want 2 (the running sync and one pending)", got)
+}
+
+// The worker reads the message of MESSAGE_CREATED and MESSAGE_UPDATED again a few times, a moment apart, when
+// the read fails in a way that may pass (a 5xx or a connection error), before it drops the event. A 4xx is
+// final, a 502 or 504 has already been retried by the traQ client (1 + 3 requests), and a client timeout is not
+// retried, so a hung traQ does not stall the worker for several timeouts.
+func TestMessageEventRetriesTransientFailures(t *testing.T) {
+	ok := func(w http.ResponseWriter) {
+		_, _ = w.Write([]byte(`{"id":"0193a1b2-0000-7000-8000-000000000001","channelId":"ch-none","content":"hi"}`))
+	}
+	status := func(code int) func(http.ResponseWriter) {
+		return func(w http.ResponseWriter) { http.Error(w, `{"message":"boom"}`, code) }
+	}
+	errNet := errors.New("connection reset by peer")
+	cases := []struct {
+		name      string
+		responses []func(http.ResponseWriter) // nil: an error, err
+		err       error
+		calls     int
+		dropped   bool
+	}{
+		{"500 then ok", []func(http.ResponseWriter){status(500), status(500), ok}, nil, 3, false},
+		{"network error then ok", []func(http.ResponseWriter){nil, ok}, errNet, 2, false},
+		{"timeout", []func(http.ResponseWriter){nil, ok}, timeoutError{}, 1, true},
+		{"503 every time", []func(http.ResponseWriter){status(503), status(503), status(503), status(503)}, nil, messageFetchAttempts, true},
+		{"404", []func(http.ResponseWriter){status(404), ok}, nil, 1, true},
+		{"502 every time", []func(http.ResponseWriter){status(502)}, nil, 4, true},
+	}
+	for _, tc := range cases {
+		for _, typ := range []string{"MESSAGE_CREATED", "MESSAGE_UPDATED"} {
+			t.Run(tc.name+"/"+typ, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					var calls int
+					client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+						respond := tc.responses[min(calls, len(tc.responses)-1)]
+						calls++
+						if respond == nil {
+							return nil, tc.err
+						}
+						rec := httptest.NewRecorder()
+						respond(rec)
+						return rec.Result(), nil
+					})}
+					api, err := traq.NewClient("http://traq.test", client, "token", userAgent)
+					if err != nil {
+						t.Fatal(err)
+					}
+					var logs bytes.Buffer
+					c := &TraQClient{Login: &bridgev2.UserLogin{UserLogin: &database.UserLogin{}, Log: zerolog.New(&logs)}, API: api}
+					w := &workerState{recent: newRecentMessages(1)}
+					c.handleEvent(t.Context(), w, traq.Event{Type: typ, Body: json.RawMessage(`{"id":"0193a1b2-0000-7000-8000-000000000001"}`)})
+					if calls != tc.calls {
+						t.Errorf("GET /messages/{id} was called %d times, want %d", calls, tc.calls)
+					}
+					if dropped := strings.Contains(logs.String(), "Failed to handle traQ event"); dropped != tc.dropped {
+						t.Errorf("dropped = %v, want %v (log %s)", dropped, tc.dropped, logs.String())
+					}
+				})
+			})
+		}
 	}
 }
+
+// timeoutError is the error of a request that timed out, as net/http reports it (url.Error.Timeout).
+type timeoutError struct{}
+
+func (timeoutError) Error() string { return "i/o timeout" }
+func (timeoutError) Timeout() bool { return true }

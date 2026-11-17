@@ -331,18 +331,24 @@ func (r *resolver) MessageLink(messageID string) (string, bool) {
 	if msg == nil {
 		return "", false
 	}
-	roomID := r.portal.MXID
-	if msg.Room != r.portal.PortalKey {
-		portal, err := r.c.Login.Bridge.GetExistingPortalByKey(r.ctx, msg.Room)
-		if err != nil || portal == nil {
+	return r.c.eventLink(r.ctx, msg, r.portal)
+}
+
+// eventLink returns the matrix.to URL of the Matrix event of a bridged message part, if its portal has a room.
+// known, if not nil, is a portal already at hand, used instead of a lookup when it is the part's.
+func (c *TraQClient) eventLink(ctx context.Context, part *database.Message, known *bridgev2.Portal) (string, bool) {
+	br := c.Login.Bridge
+	portal := known
+	if portal == nil || part.Room != portal.PortalKey {
+		var err error
+		if portal, err = br.GetExistingPortalByKey(ctx, part.Room); err != nil || portal == nil {
 			return "", false
 		}
-		roomID = portal.MXID
 	}
-	if roomID == "" {
+	if portal.MXID == "" {
 		return "", false
 	}
-	return roomID.EventURI(msg.MXID, r.c.Login.Bridge.Matrix.ServerName()).MatrixToURL(), true
+	return portal.MXID.EventURI(part.MXID, br.Matrix.ServerName()).MatrixToURL(), true
 }
 
 func (r *resolver) CanReplyTo(messageID string) bool {

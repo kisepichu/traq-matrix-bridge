@@ -1,6 +1,9 @@
 package msgconv
 
 import (
+	"regexp"
+	"sync/atomic"
+
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/ast"
 	"github.com/yuin/goldmark/extension"
@@ -88,13 +91,29 @@ type span struct{ start, end int }
 
 var bareLinkKey = parser.NewContextKey()
 
+// originLinkKey holds, in a parse's context, the linkify parser of the traQ origin (see originLinkify).
+var originLinkKey = parser.NewContextKey()
+
 // bareLinkParser wraps goldmark's linkify parser to record where each bare URL
 // sits in the source, which ast.AutoLink does not expose. Angle-bracket
 // autolinks (<https://...>) never pass through linkify and so are not recorded.
+//
+// Where goldmark finds no URL, the traQ origin's own parser (originLinkKey) is
+// tried. goldmark's pattern needs a dotted host with a lower-case TLD, and links
+// every URL of such an origin itself, so for one (any production traQ with a
+// usual host name) the fallback never applies and nothing changes. Other
+// origins, such as http://localhost:3080 (the dev traQ), an IP host or a host
+// with an upper-case TLD, get their bare URLs linked by the fallback, so their
+// /files and /messages URLs are recognized too.
 type bareLinkParser struct{ parser.InlineParser }
 
 func (p bareLinkParser) Parse(parent ast.Node, block text.Reader, pc parser.Context) ast.Node {
 	n := p.InlineParser.Parse(parent, block, pc)
+	if n == nil {
+		if origin, ok := pc.Get(originLinkKey).(parser.InlineParser); ok {
+			n = origin.Parse(parent, block, pc)
+		}
+	}
 	link, ok := n.(*ast.AutoLink)
 	if !ok {
 		return n
@@ -108,6 +127,27 @@ func (p bareLinkParser) Parse(parent ast.Node, block text.Reader, pc parser.Cont
 	_, pos := block.Position()
 	spans[link] = span{pos.Start - len(link.Label(block.Source())), pos.Start}
 	return n
+}
+
+// originLinkify is the linkify parser of one traQ origin: it takes a URL that starts with the origin followed
+// by a path, query or fragment, with the characters goldmark's own URL pattern allows there.
+type originLinkify struct {
+	origin string
+	parser parser.InlineParser
+}
+
+// lastOriginLinkify caches the parser of the last origin: a bridge has one traQ origin.
+var lastOriginLinkify atomic.Pointer[originLinkify]
+
+// originLinkifyParser returns the linkify parser of origin ("scheme://host").
+func originLinkifyParser(origin string) parser.InlineParser {
+	if o := lastOriginLinkify.Load(); o != nil && o.origin == origin {
+		return o.parser
+	}
+	re := regexp.MustCompile(`^` + regexp.QuoteMeta(origin) + `[/#?][-a-zA-Z0-9@:%_+.~#$!?&/=\(\);,'">\^{}\[\]` + "`" + `]*`)
+	o := &originLinkify{origin: origin, parser: extension.NewLinkifyParser(extension.WithLinkifyURLRegexp(re))}
+	lastOriginLinkify.Store(o)
+	return o.parser
 }
 
 // --- rendering ---

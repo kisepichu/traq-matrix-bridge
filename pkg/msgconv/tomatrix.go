@@ -63,6 +63,9 @@ func ToMatrix(in ToMatrixInput, r Resolver) ToMatrixResult {
 	// CRLF is normalised so that Body and the parsed text agree on line ends.
 	c := &converter{in: in, r: r, src: []byte(strings.ReplaceAll(in.Content, "\r\n", "\n"))}
 	pc := parser.NewContext()
+	if origin := c.origin(); origin != "" {
+		pc.Set(originLinkKey, originLinkifyParser(origin))
+	}
 	doc := markdown.Parser().Parse(text.NewReader(c.src), parser.WithContext(pc))
 	c.spans, _ = pc.Get(bareLinkKey).(map[*ast.AutoLink]span)
 

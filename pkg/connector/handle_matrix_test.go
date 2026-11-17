@@ -23,6 +23,15 @@ import (
 // newTestBridgeDB opens bridgev2's database, upgraded, on an in-memory SQLite database.
 func newTestBridgeDB(t *testing.T) *database.Database {
 	t.Helper()
+	db := database.New("test", (&TraQConnector{}).GetDBMetaTypes(), newTestRawDB(t))
+	if err := db.Upgrade(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
+func newTestRawDB(t *testing.T) *dbutil.Database {
+	t.Helper()
 	raw, err := dbutil.NewFromConfig("", dbutil.Config{PoolConfig: dbutil.PoolConfig{
 		Type: "sqlite3-fk-wal", URI: ":memory:?_txlock=immediate", MaxOpenConns: 1, MaxIdleConns: 1,
 	}}, nil)
@@ -30,11 +39,7 @@ func newTestBridgeDB(t *testing.T) *database.Database {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = raw.Close() })
-	db := database.New("test", (&TraQConnector{}).GetDBMetaTypes(), raw)
-	if err := db.Upgrade(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	return db
+	return raw
 }
 
 // Reacting and removing a reaction are Matrix activity in the channel, like sending a message, so the channel
