@@ -51,6 +51,28 @@ func portalDiff(old, new map[string]channelInfo) []portalChange {
 	return changes
 }
 
+// revertFailedUpserts undoes, in the stored snapshot, the upserts that could not be queued, so that the next
+// portalDiff emits them again: a channel that was in old gets its old entry back, a new one is dropped.
+func revertFailedUpserts(stored, old map[string]channelInfo, failed []channelInfo) {
+	for _, ch := range failed {
+		if prev, ok := old[ch.ID]; ok {
+			stored[ch.ID] = prev
+		} else {
+			delete(stored, ch.ID)
+		}
+	}
+}
+
+// revertTargets applies revertFailedUpserts to c.targets.
+func (c *TraQClient) revertTargets(old map[string]channelInfo, failed []channelInfo) {
+	if len(failed) == 0 {
+		return
+	}
+	c.stateMu.Lock()
+	revertFailedUpserts(c.targets, old, failed)
+	c.stateMu.Unlock()
+}
+
 // subscriptionSnapshot returns the channels that get a portal, by ID: every DM, and every public channel
 // subscribed at level >= 1 with that level. Subscriptions of channels missing from the tree are skipped.
 func subscriptionSnapshot(tree *channelTree, subs []traq.Subscription) map[string]channelInfo {
@@ -88,21 +110,25 @@ func channelLogContext(ch channelInfo) func(zerolog.Context) zerolog.Context {
 	return func(c zerolog.Context) zerolog.Context { return c.Str("traq_channel_id", ch.ID) }
 }
 
-func (c *TraQClient) queue(evt bridgev2.RemoteEvent) {
-	if res := c.Login.QueueRemoteEvent(evt); res.Error != nil {
+// queue queues evt and reports whether bridgev2 accepted it.
+func (c *TraQClient) queue(evt bridgev2.RemoteEvent) bool {
+	res := c.Login.QueueRemoteEvent(evt)
+	if res.Error != nil {
 		c.Login.Log.Err(res.Error).Stringer("event_type", evt.GetType()).Msg("Failed to queue remote event")
+		return false
 	}
+	return true
 }
 
-// queueResync queues the ChatResync that creates the portal of ch or updates its info. Every portal
-// resync is built here.
-func (c *TraQClient) queueResync(ctx context.Context, ch channelInfo) {
+// queueResync queues the ChatResync that creates the portal of ch or updates its info, and reports whether
+// it was queued. Every portal resync is built here.
+func (c *TraQClient) queueResync(ctx context.Context, ch channelInfo) bool {
 	info, err := c.chatInfo(ctx, ch)
 	if err != nil {
 		c.Login.Log.Err(err).Str("traq_channel_id", ch.ID).Msg("Failed to build chat info")
-		return
+		return false
 	}
-	c.queue(&simplevent.ChatResync{
+	return c.queue(&simplevent.ChatResync{
 		EventMeta: simplevent.EventMeta{
 			Type:         bridgev2.RemoteEventChatResync,
 			LogContext:   channelLogContext(ch),
@@ -128,7 +154,8 @@ func (c *TraQClient) queueLeave(key networkid.PortalKey) {
 // initialSync brings the portals in line with the snapshot loaded by Connect: it creates or updates every
 // target portal, leaves the portals of this login that are no longer targets, and marks the targets that
 // have no unread messages as read. Each portal's event loop is serial, so the receipt is handled after the
-// resync.
+// resync. Targets whose resync could not be queued are dropped from c.targets, so the next subscription sync
+// retries them.
 func (c *TraQClient) initialSync(ctx context.Context, me *traq.Me, targets map[string]channelInfo, unread []traq.UnreadChannel) {
 	log := c.Login.Log
 	ids := make([]string, 0, len(targets))
@@ -137,10 +164,13 @@ func (c *TraQClient) initialSync(ctx context.Context, me *traq.Me, targets map[s
 	}
 	slices.Sort(ids)
 	keys := make(map[networkid.PortalKey]struct{}, len(ids))
+	var failed []channelInfo
 	for _, id := range ids {
 		ch := targets[id]
 		keys[c.portalKey(ch)] = struct{}{}
-		c.queueResync(ctx, ch)
+		if !c.queueResync(ctx, ch) {
+			failed = append(failed, ch)
+		}
 	}
 
 	userPortals, err := c.Login.Bridge.DB.UserPortal.GetAllForLogin(ctx, c.Login.UserLogin)
@@ -183,9 +213,12 @@ func (c *TraQClient) initialSync(ctx context.Context, me *traq.Me, targets map[s
 			ReadUpTo: now,
 		})
 	}
+	// Last, because targets is c.targets and the loops above read it.
+	c.revertTargets(nil, failed)
 }
 
-// syncSubscriptions re-reads the channels and subscriptions and queues only what changed.
+// syncSubscriptions re-reads the channels and subscriptions and queues only what changed. Upserts that could
+// not be queued are reverted in c.targets, so the next sync emits them again.
 func (c *TraQClient) syncSubscriptions(ctx context.Context) error {
 	list, err := c.API.Channels(ctx)
 	if err != nil {
@@ -202,13 +235,17 @@ func (c *TraQClient) syncSubscriptions(ctx context.Context) error {
 	c.channels, c.targets = tree, snap
 	c.stateMu.Unlock()
 
+	var failed []channelInfo
 	for _, change := range portalDiff(old, snap) {
 		switch change.Kind {
 		case changeUpsert:
-			c.queueResync(ctx, change.Channel)
+			if !c.queueResync(ctx, change.Channel) {
+				failed = append(failed, change.Channel)
+			}
 		case changeRemove:
 			c.queueLeave(c.portalKey(change.Channel))
 		}
 	}
+	c.revertTargets(old, failed)
 	return nil
 }

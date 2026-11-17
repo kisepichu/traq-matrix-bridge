@@ -39,14 +39,17 @@ func (c *TraQClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (
 	return c.chatInfo(ctx, ch)
 }
 
-// chatInfo builds the full chat info of a channel, including this login as a member.
+// chatInfo builds the full chat info of a channel. This login is listed as a joined member of every DM and
+// of the public channels it subscribes to (level >= 1). A public channel at level 0 (known only from the
+// tree, e.g. through bridgev2's bridge/sync commands) leaves this login out of the non-full member list and
+// sets no mute, so bridgev2 neither invites nor joins this login's user. The list stays non-nil: a nil list
+// makes bridgev2 invite the source login at room creation.
 func (c *TraQClient) chatInfo(ctx context.Context, ch channelInfo) (*bridgev2.ChatInfo, error) {
 	me := c.self()
 	if me == nil {
 		return nil, errNotConnected
 	}
 	members := bridgev2.ChatMemberMap{}
-	members.Set(bridgev2.ChatMember{EventSender: c.selfSender(me), Membership: event.MembershipJoin})
 	info := &bridgev2.ChatInfo{
 		CanBackfill:  true,
 		ExtraUpdates: setPortalMetadata(ch.DMUserID),
@@ -55,6 +58,9 @@ func (c *TraQClient) chatInfo(ctx context.Context, ch channelInfo) (*bridgev2.Ch
 		info.Name = &ch.Path
 		info.Topic = &ch.Topic
 		info.Members = &bridgev2.ChatMemberList{MemberMap: members}
+		if ch.Level >= 1 {
+			members.Set(bridgev2.ChatMember{EventSender: c.selfSender(me), Membership: event.MembershipJoin})
+		}
 		switch ch.Level {
 		case 1:
 			info.UserLocal = &bridgev2.UserLocalPortalInfo{MutedUntil: new(event.MutedForever)}
@@ -63,6 +69,8 @@ func (c *TraQClient) chatInfo(ctx context.Context, ch channelInfo) (*bridgev2.Ch
 		}
 		return info, nil
 	}
+
+	members.Set(bridgev2.ChatMember{EventSender: c.selfSender(me), Membership: event.MembershipJoin})
 
 	other, err := c.users.Get(ctx, c.API, ch.DMUserID)
 	if err != nil {

@@ -1,6 +1,7 @@
 package connector
 
 import (
+	"maps"
 	"reflect"
 	"testing"
 )
@@ -47,6 +48,53 @@ func TestPortalDiff(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			if got := portalDiff(tc.old, tc.new); !reflect.DeepEqual(got, tc.want) {
 				t.Errorf("portalDiff =\n%+v\nwant\n%+v", got, tc.want)
+			}
+		})
+	}
+}
+
+// An upsert that could not be queued must be emitted again by the next sync of the same traQ state.
+func TestRevertFailedUpserts(t *testing.T) {
+	pub := func(id string, level int) channelInfo { return channelInfo{ID: id, Path: "p/" + id, Level: level} }
+	snap := func(chs ...channelInfo) map[string]channelInfo {
+		m := make(map[string]channelInfo, len(chs))
+		for _, ch := range chs {
+			m[ch.ID] = ch
+		}
+		return m
+	}
+	upsert := func(ch channelInfo) portalChange { return portalChange{Channel: ch, Kind: changeUpsert} }
+
+	for name, tc := range map[string]struct {
+		old, new map[string]channelInfo
+		failed   []channelInfo
+		want     []portalChange
+	}{
+		"periodic sync": {
+			old:    snap(pub("changed", 1), pub("same", 2), pub("ok", 1)),
+			new:    snap(pub("changed", 2), pub("same", 2), pub("ok", 2), pub("added", 1)),
+			failed: []channelInfo{pub("changed", 2), pub("added", 1)},
+			want:   []portalChange{upsert(pub("added", 1)), upsert(pub("changed", 2))},
+		},
+		// initialSync upserts every target whatever the previous snapshot held, so a failure there has no old
+		// entry to restore.
+		"initial sync": {
+			old:    nil,
+			new:    snap(pub("a", 1), pub("b", 2)),
+			failed: []channelInfo{pub("b", 2)},
+			want:   []portalChange{upsert(pub("b", 2))},
+		},
+		"nothing failed": {
+			old:  snap(pub("a", 1)),
+			new:  snap(pub("a", 2)),
+			want: nil,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			stored := maps.Clone(tc.new)
+			revertFailedUpserts(stored, tc.old, tc.failed)
+			if got := portalDiff(stored, tc.new); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("next sync =\n%+v\nwant\n%+v", got, tc.want)
 			}
 		})
 	}

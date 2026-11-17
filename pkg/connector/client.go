@@ -43,6 +43,9 @@ const (
 
 var errNotImplemented = errors.New("traq: not implemented yet")
 
+// errTokenRejected is the cancel cause of a session whose token traQ rejected (HTTP 401).
+var errTokenRejected = errors.New("traq: access token rejected")
+
 // TraQClient is the per-login client stored in bridgev2.UserLogin.Client.
 type TraQClient struct {
 	Main  *TraQConnector
@@ -129,32 +132,43 @@ func (c *TraQClient) Connect(ctx context.Context) {
 }
 
 // run is the body of a session. It returns when ctx ends or the token is rejected, after every goroutine it
-// started has returned.
+// started has returned. BAD_CREDENTIALS for a rejected token is sent only here, after all loops have stopped,
+// so no TRANSIENT_DISCONNECT of the same session can follow it.
 func (c *TraQClient) run(ctx context.Context) {
+	ctx, stop := context.WithCancelCause(ctx)
+	c.runLoops(ctx, stop)
+	stop(nil)
+	if errors.Is(context.Cause(ctx), errTokenRejected) {
+		c.sendBadCredentials(errCodeTokenInvalid, "traQ rejected the access token, please log in again")
+	}
+}
+
+// runLoops loads, syncs and runs the subscription sync and WebSocket loops until ctx ends. A loop that sees
+// the token rejected cancels ctx through stop with errTokenRejected.
+func (c *TraQClient) runLoops(ctx context.Context, stop context.CancelCauseFunc) {
 	var wg sync.WaitGroup
 	defer wg.Wait()
-	ctx, stop := context.WithCancel(ctx)
-	defer stop()
+	defer stop(nil)
 
-	me, targets, unread, ok := c.load(ctx)
+	me, targets, unread, ok := c.load(ctx, stop)
 	if !ok {
 		return
 	}
 	c.initialSync(ctx, me, targets, unread)
 	wg.Go(func() { c.subscriptionSyncLoop(ctx, stop) })
-	c.websocketLoop(ctx)
+	c.websocketLoop(ctx, stop)
 }
 
 // load reads what the bridge needs from traQ, retrying with backoff. The bool is false when ctx ended or the
 // token was rejected.
-func (c *TraQClient) load(ctx context.Context) (*traq.Me, map[string]channelInfo, []traq.UnreadChannel, bool) {
+func (c *TraQClient) load(ctx context.Context, stop context.CancelCauseFunc) (*traq.Me, map[string]channelInfo, []traq.UnreadChannel, bool) {
 	var retry backoff
 	for {
 		me, targets, unread, err := c.loadOnce(ctx)
 		if err == nil {
 			return me, targets, unread, true
 		}
-		if !c.handleConnectError(ctx, err, errCodeConnectFail, "Failed to load data from traQ") || !retry.wait(ctx, c.Login.Log) {
+		if !c.handleConnectError(ctx, stop, err, errCodeConnectFail, "Failed to load data from traQ") || !retry.wait(ctx, c.Login.Log) {
 			return nil, nil, nil, false
 		}
 	}
@@ -191,13 +205,14 @@ func (c *TraQClient) loadOnce(ctx context.Context) (*traq.Me, map[string]channel
 }
 
 // handleConnectError reports a failed attempt to reach traQ and tells whether to retry: not when ctx ended
-// (Disconnect) and not when traQ rejected the token (BAD_CREDENTIALS); otherwise it sends TRANSIENT_DISCONNECT.
-func (c *TraQClient) handleConnectError(ctx context.Context, err error, code status.BridgeStateErrorCode, message string) bool {
+// (Disconnect), and not when traQ rejected the token, which stops the session with errTokenRejected (run then
+// sends BAD_CREDENTIALS); otherwise it sends TRANSIENT_DISCONNECT.
+func (c *TraQClient) handleConnectError(ctx context.Context, stop context.CancelCauseFunc, err error, code status.BridgeStateErrorCode, message string) bool {
 	if ctx.Err() != nil {
 		return false
 	}
 	if traq.IsStatus(err, http.StatusUnauthorized) {
-		c.sendBadCredentials(errCodeTokenInvalid, "traQ rejected the access token, please log in again")
+		stop(errTokenRejected)
 		return false
 	}
 	c.Login.Log.Warn().Err(err).Str("error_code", string(code)).Msg(message)
@@ -230,7 +245,7 @@ func (b *backoff) wait(ctx context.Context, log zerolog.Logger) bool {
 func (b *backoff) reset() { b.next = 0 }
 
 // websocketLoop keeps the WebSocket open, reconnecting with backoff, until ctx ends or the token is rejected.
-func (c *TraQClient) websocketLoop(ctx context.Context) {
+func (c *TraQClient) websocketLoop(ctx context.Context, stop context.CancelCauseFunc) {
 	var retry backoff
 	for {
 		ws, err := c.dialWebSocket(ctx)
@@ -248,7 +263,7 @@ func (c *TraQClient) websocketLoop(ctx context.Context) {
 				retry.reset()
 			}
 		}
-		if !c.handleConnectError(ctx, err, errCodeWSDisconnected, "Lost the connection to traQ, reconnecting") || !retry.wait(ctx, c.Login.Log) {
+		if !c.handleConnectError(ctx, stop, err, errCodeWSDisconnected, "Lost the connection to traQ, reconnecting") || !retry.wait(ctx, c.Login.Log) {
 			return
 		}
 	}
@@ -309,15 +324,20 @@ func keepAlive(ctx context.Context, ws *traq.WSConn, fail context.CancelCauseFun
 	}
 }
 
-// handleEvent dispatches one WebSocket event. It runs on the reader goroutine. Events without a handler are
-// ignored.
+// handleEvent dispatches one WebSocket event. Events without a handler are ignored.
+//
+// It runs on the WebSocket reader goroutine, and keepAlive's pongs are only processed while that goroutine
+// is inside ReadEvent: a handler that blocks for longer than pingTimeout makes the ping fail and recycles the
+// connection, and every event behind it waits. Handlers must therefore not block. Slow work, such as REST
+// fetches, belongs in a worker goroutine or in bridgev2's portal event loop (queue a remote event whose
+// convert func does the fetch). ctx is the per-connection context and ends when the connection closes.
 func (c *TraQClient) handleEvent(_ context.Context, evt traq.Event) {
 	c.Login.Log.Debug().Str("event_type", evt.Type).Msg("Ignoring traQ event")
 }
 
-// subscriptionSyncLoop re-syncs the subscriptions every subscription_sync_interval. A rejected token sends
-// BAD_CREDENTIALS and stops the session.
-func (c *TraQClient) subscriptionSyncLoop(ctx context.Context, stopSession context.CancelFunc) {
+// subscriptionSyncLoop re-syncs the subscriptions every subscription_sync_interval. A rejected token stops the
+// session with errTokenRejected.
+func (c *TraQClient) subscriptionSyncLoop(ctx context.Context, stop context.CancelCauseFunc) {
 	t := time.NewTicker(c.Main.Config.SubscriptionSyncInterval)
 	defer t.Stop()
 	for {
@@ -330,8 +350,7 @@ func (c *TraQClient) subscriptionSyncLoop(ctx context.Context, stopSession conte
 		switch {
 		case err == nil || ctx.Err() != nil:
 		case traq.IsStatus(err, http.StatusUnauthorized):
-			c.sendBadCredentials(errCodeTokenInvalid, "traQ rejected the access token, please log in again")
-			stopSession()
+			stop(errTokenRejected)
 			return
 		default:
 			c.Login.Log.Warn().Err(err).Msg("Failed to sync subscriptions")
