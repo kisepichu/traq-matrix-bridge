@@ -2,6 +2,7 @@ package stampdb_test
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"strings"
 	"testing"
@@ -74,11 +75,49 @@ func TestPutReplacesTheStamp(t *testing.T) {
 	s := newStore(t)
 	put(t, s, stampconv.Stamp{ID: "s1", Name: "good"}, "f1")
 	put(t, s, stampconv.Stamp{ID: "s2", Name: "thumbsup", Unicode: true, Emoji: "👍"}, "f2")
+	put(t, s, stampconv.Stamp{ID: "s3", Name: "odd", Unicode: true, Unresolvable: true}, "f3")
 	put(t, s, stampconv.Stamp{ID: "s1", Name: "great"}, "f1")
 
-	want := []stampconv.Stamp{{ID: "s1", Name: "great"}, {ID: "s2", Name: "thumbsup", Unicode: true, Emoji: "👍"}}
+	want := []stampconv.Stamp{
+		{ID: "s1", Name: "great"},
+		{ID: "s2", Name: "thumbsup", Unicode: true, Emoji: "👍"},
+		{ID: "s3", Name: "odd", Unicode: true, Unresolvable: true},
+	}
 	if got := all(t, s); !slices.Equal(got, want) {
 		t.Errorf("All = %+v, want %+v", got, want)
+	}
+}
+
+func TestFileID(t *testing.T) {
+	s := newStore(t)
+	put(t, s, stampconv.Stamp{ID: "s1", Name: "heart", Unicode: true}, "f1")
+	if fileID, ok, err := s.FileID(context.Background(), "s1"); fileID != "f1" || !ok || err != nil {
+		t.Errorf("FileID(s1) = %q, %v, %v; want f1, true, nil", fileID, ok, err)
+	}
+	if fileID, ok, err := s.FileID(context.Background(), "missing"); fileID != "" || ok || err != nil {
+		t.Errorf("FileID(missing) = %q, %v, %v; want \"\", false, nil", fileID, ok, err)
+	}
+}
+
+// The writes of a failed transaction are rolled back together.
+func TestDoTxnRollsBack(t *testing.T) {
+	s := newStore(t)
+	put(t, s, stampconv.Stamp{ID: "s1", Name: "good"}, "f1")
+	boom := errors.New("boom")
+	err := s.DoTxn(context.Background(), func(ctx context.Context) error {
+		if err := s.Put(ctx, stampconv.Stamp{ID: "s2", Name: "new"}, "f2"); err != nil {
+			return err
+		}
+		if err := s.Delete(ctx, "s1"); err != nil {
+			return err
+		}
+		return boom
+	})
+	if !errors.Is(err, boom) {
+		t.Fatalf("DoTxn = %v, want boom", err)
+	}
+	if got, want := all(t, s), []stampconv.Stamp{{ID: "s1", Name: "good"}}; !slices.Equal(got, want) {
+		t.Errorf("All after the rollback = %+v, want %+v", got, want)
 	}
 }
 
@@ -101,6 +140,7 @@ func TestPendingUnicodeListsOnlyUnresolvedUnicodeStamps(t *testing.T) {
 	s := newStore(t)
 	put(t, s, stampconv.Stamp{ID: "custom", Name: "good"}, "f1")
 	put(t, s, stampconv.Stamp{ID: "resolved", Name: "thumbsup", Unicode: true, Emoji: "👍"}, "f2")
+	put(t, s, stampconv.Stamp{ID: "unresolvable", Name: "odd", Unicode: true, Unresolvable: true}, "f5")
 	put(t, s, stampconv.Stamp{ID: "u1", Name: "heart", Unicode: true}, "f3")
 	put(t, s, stampconv.Stamp{ID: "u2", Name: "smile", Unicode: true}, "f4")
 
@@ -132,5 +172,9 @@ func TestComplete(t *testing.T) {
 	put(t, s, stampconv.Stamp{ID: "u1", Name: "heart", Unicode: true, Emoji: "❤️"}, "f2")
 	if !complete(t, s) {
 		t.Error("Complete after resolving every Unicode stamp = false, want true")
+	}
+	put(t, s, stampconv.Stamp{ID: "u2", Name: "odd", Unicode: true, Unresolvable: true}, "f3")
+	if !complete(t, s) {
+		t.Error("Complete with an unresolvable Unicode stamp = false, want true")
 	}
 }

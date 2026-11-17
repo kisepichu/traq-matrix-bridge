@@ -188,11 +188,12 @@ func (c *TraQClient) hitUserName(ctx context.Context, hit traq.Message) string {
 	return user.Name
 }
 
-// hitLink is the link of the Matrix event the hit is bridged to, else the traQ link of the message.
+// hitLink is the link of the Matrix event the hit is bridged to, else the traQ link of the message. The hit is
+// looked up with the receiver of its channel's portal; a channel the tree does not know is taken for a DM.
 func (c *TraQClient) hitLink(ctx context.Context, tree *channelTree, hit traq.Message, bridged bridgedLinkFunc) string {
 	receiver := c.Login.ID
-	if ch, ok := tree.Get(hit.ChannelID); ok && !ch.isDM() {
-		receiver = ""
+	if ch, ok := tree.Get(hit.ChannelID); ok {
+		receiver = c.portalKey(ch).Receiver
 	}
 	if link, ok := bridged(ctx, receiver, hit.ID); ok {
 		return link

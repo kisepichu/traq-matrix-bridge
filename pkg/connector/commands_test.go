@@ -11,8 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"maunium.net/go/mautrix/bridgev2"
-	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 
 	"github.com/kisepichu/traq-matrix-bridge/pkg/traq"
@@ -125,7 +123,7 @@ func routedTestClient(t *testing.T, routes map[string]string) (*TraQClient, *rou
 	users.put(&traq.User{ID: "u-bob", Name: "bob"})
 	return &TraQClient{
 		API:   api,
-		Login: &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: "login-1"}},
+		Login: testLogin("login-1", false),
 		users: users,
 		channels: buildChannelTree(&traq.ChannelList{
 			Public: []traq.Channel{{ID: "ch-a", Name: "a"}},
@@ -182,31 +180,39 @@ func TestSearchMessagesHits(t *testing.T) {
 			{"id":"m-plain","userId":"u-bob","channelId":"ch-a","createdAt":"` + at + `","content":"not bridged"},
 			{"id":"m-dm","userId":"u-bob","channelId":"ch-dm","createdAt":"` + at + `","content":"dm hit"}]}`,
 	}
-	c, rt := routedTestClient(t, routes)
-	var receivers []string
-	bridged := func(_ context.Context, receiver networkid.UserLoginID, id string) (string, bool) {
-		receivers = append(receivers, id+"@"+string(receiver))
-		if id == "m-bridged" || id == "m-dm" {
-			return "https://matrix.to/#/!room:example.org/$ev_" + id, true
+	for _, split := range []bool{false, true} {
+		c, rt := routedTestClient(t, routes)
+		c.Login.Bridge.Config.SplitPortals = split
+		var receivers []string
+		bridged := func(_ context.Context, receiver networkid.UserLoginID, id string) (string, bool) {
+			receivers = append(receivers, id+"@"+string(receiver))
+			if id == "m-bridged" || id == "m-dm" {
+				return "https://matrix.to/#/!room:example.org/$ev_" + id, true
+			}
+			return "", false
 		}
-		return "", false
-	}
-	got := c.searchMessages(context.Background(), parseSearchQuery("hi"), time.FixedZone("JST", 9*3600), bridged)
-	origin := c.origin()
-	want := strings.Join([]string{
-		`#a  @bob  2026-01-02 15:04  hi @alice second\_line  https://matrix.to/#/!room:example.org/$ev\_m-bridged`,
-		`#a  @bob  2026-01-02 15:04  not bridged  ` + origin + `/messages/m-plain`,
-		`DM  @bob  2026-01-02 15:04  dm hit  https://matrix.to/#/!room:example.org/$ev\_m-dm`,
-	}, "\n")
-	if got != want {
-		t.Errorf("reply =\n%s\nwant\n%s", got, want)
-	}
-	// A public channel's messages belong to no login; a DM's belong to the login.
-	if wantReceivers := []string{"m-bridged@", "m-plain@", "m-dm@login-1"}; !reflect.DeepEqual(receivers, wantReceivers) {
-		t.Errorf("lookups = %v, want %v", receivers, wantReceivers)
-	}
-	if rt.count("/channels") != 0 {
-		t.Errorf("GET /channels = %d, want 0: the tree knows every channel", rt.count("/channels"))
+		got := c.searchMessages(context.Background(), parseSearchQuery("hi"), time.FixedZone("JST", 9*3600), bridged)
+		origin := c.origin()
+		want := strings.Join([]string{
+			`#a  @bob  2026-01-02 15:04  hi @alice second\_line  https://matrix.to/#/!room:example.org/$ev\_m-bridged`,
+			`#a  @bob  2026-01-02 15:04  not bridged  ` + origin + `/messages/m-plain`,
+			`DM  @bob  2026-01-02 15:04  dm hit  https://matrix.to/#/!room:example.org/$ev\_m-dm`,
+		}, "\n")
+		if got != want {
+			t.Errorf("split_portals=%v: reply =\n%s\nwant\n%s", split, got, want)
+		}
+		// A message is looked up with the receiver of its portal: none for a shared public channel, the login
+		// for a DM and, with split portals, for a public channel too.
+		wantReceivers := []string{"m-bridged@", "m-plain@", "m-dm@login-1"}
+		if split {
+			wantReceivers = []string{"m-bridged@login-1", "m-plain@login-1", "m-dm@login-1"}
+		}
+		if !reflect.DeepEqual(receivers, wantReceivers) {
+			t.Errorf("split_portals=%v: lookups = %v, want %v", split, receivers, wantReceivers)
+		}
+		if rt.count("/channels") != 0 {
+			t.Errorf("GET /channels = %d, want 0: the tree knows every channel", rt.count("/channels"))
+		}
 	}
 }
 

@@ -48,7 +48,7 @@ func input(content string) ToMatrixInput {
 var resolver = fakeResolver{
 	users:    map[string]id.UserID{uAlice: "@traq_alice:example.org", uSelf: "@me:example.org", uBob: "@traq_bob:example.org"},
 	channels: map[string]string{cGen: "https://matrix.to/#/!gen:example.org"},
-	links:    map[string]string{m2: "https://matrix.to/#/!gen:example.org/$ev2"},
+	links:    map[string]string{m1: "https://matrix.to/#/!gen:example.org/$ev1", m2: "https://matrix.to/#/!gen:example.org/$ev2"},
 	replies:  map[string]bool{m1: true},
 }
 
@@ -82,6 +82,12 @@ func TestToMatrix(t *testing.T) {
 			ToMatrixResult{FileIDs: []string{f1}}},
 		{"first reply candidate becomes reply", "https://q.example.jp/messages/" + m1 + "\nyes",
 			ToMatrixResult{Body: "yes", HTML: "yes", ReplyTo: m1}},
+		{"a reply quote alone stays visible as a link", "https://q.example.jp/messages/" + m1,
+			ToMatrixResult{Body: "https://q.example.jp/messages/" + m1, HTML: `<a href="https://matrix.to/#/!gen:example.org/$ev1">https://q.example.jp/messages/` + m1 + `</a>`, ReplyTo: m1}},
+		{"a reply quote alone in a quote block stays visible", "> https://q.example.jp/messages/" + m1,
+			ToMatrixResult{Body: "https://q.example.jp/messages/" + m1, HTML: `<a href="https://matrix.to/#/!gen:example.org/$ev1">https://q.example.jp/messages/` + m1 + `</a>`, ReplyTo: m1}},
+		{"a reply quote with only a file is shown by the file", "https://q.example.jp/messages/" + m1 + "\n" + fileURL,
+			ToMatrixResult{ReplyTo: m1, FileIDs: []string{f1}}},
 		{"bridged message elsewhere becomes link", "see https://q.example.jp/messages/" + m2,
 			ToMatrixResult{Body: "see https://q.example.jp/messages/" + m2, HTML: `see <a href="https://matrix.to/#/!gen:example.org/$ev2">https://q.example.jp/messages/` + m2 + `</a>`}},
 		{"explicit link untouched", "[x](https://q.example.jp/files/" + f1 + ")",
@@ -121,5 +127,15 @@ func TestToMatrix(t *testing.T) {
 				t.Errorf("ToMatrix(%q)\n got  %#v\n want %#v", c.in, got, c.want)
 			}
 		})
+	}
+}
+
+// Without a Matrix event to link to, a reply quote left alone stays visible as its traQ URL.
+func TestToMatrixReplyQuoteAloneWithoutLink(t *testing.T) {
+	quote := "https://q.example.jp/messages/" + m1
+	got := ToMatrix(input(quote), fakeResolver{replies: map[string]bool{m1: true}})
+	want := ToMatrixResult{Body: quote, HTML: `<a href="` + quote + `">` + quote + `</a>`, ReplyTo: m1}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("ToMatrix(%q)\n got  %#v\n want %#v", quote, got, want)
 	}
 }

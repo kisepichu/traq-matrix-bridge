@@ -1,6 +1,7 @@
 package connector
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -251,12 +252,12 @@ func (c *TraQClient) handleConnectError(ctx context.Context, stop context.Cancel
 	return true
 }
 
-// backoff doubles the delay between attempts from minBackoff up to maxBackoff.
-type backoff struct{ next time.Duration }
+// backoff doubles the delay between attempts from min (minBackoff if zero) up to maxBackoff.
+type backoff struct{ next, min time.Duration }
 
 // wait sleeps for the next delay. It returns false if ctx ended first.
 func (b *backoff) wait(ctx context.Context, log zerolog.Logger) bool {
-	d := max(b.next, minBackoff)
+	d := max(b.next, cmp.Or(b.min, minBackoff))
 	b.next = min(2*d, maxBackoff)
 	log.Info().Stringer("delay", d).Msg("Retrying the connection to traQ")
 	t := time.NewTimer(d)

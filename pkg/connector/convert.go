@@ -63,7 +63,7 @@ func (c *TraQClient) convertMessage(ctx context.Context, portal *bridgev2.Portal
 // batch that are sent before this one, so a quote of one of them becomes a reply although the database
 // does not have it yet.
 func (c *TraQClient) convertMessageAfter(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *traq.Message, earlier map[string]struct{}) (*bridgev2.ConvertedMessage, error) {
-	res := msgconv.ToMatrix(c.toMatrixInput(msg.Content), &resolver{ctx: ctx, c: c, portal: portal, earlier: earlier})
+	res := msgconv.ToMatrix(c.toMatrixInput(msg.Content), c.newResolver(ctx, portal, earlier))
 	up := &portalUploader{api: c.API, files: c.Files, limit: c.Main.maxFileSize(), roomID: portal.MXID, intent: intent}
 	return buildMessage(ctx, res, messageMetadata(msg), c.origin(), up, messageFilesTimeout)
 }
@@ -72,7 +72,8 @@ func (c *TraQClient) convertMessageAfter(ctx context.Context, portal *bridgev2.P
 // to the message is linked in the text. The reply target cannot change, so only a quote of the original
 // reply target is turned into the reply; other quotes stay links.
 func (c *TraQClient) convertEdit(ctx context.Context, portal *bridgev2.Portal, _ bridgev2.MatrixAPI, existing []*database.Message, msg *traq.Message) (*bridgev2.ConvertedEdit, error) {
-	r := &resolver{ctx: ctx, c: c, portal: portal, edit: true}
+	r := c.newResolver(ctx, portal, nil)
+	r.edit = true
 	for _, part := range existing {
 		if part.ReplyTo.MessageID != "" {
 			r.editReplyTo = part.ReplyTo.MessageID
@@ -83,6 +84,8 @@ func (c *TraQClient) convertEdit(ctx context.Context, portal *bridgev2.Portal, _
 	return buildEdit(existing, res, messageMetadata(msg), c.origin())
 }
 
+// toMatrixInput is the input of a conversion. Group mentions notify only this login's user: whether another
+// login's user is in a group would need that login's groups, which the conversion does not have.
 func (c *TraQClient) toMatrixInput(content string) msgconv.ToMatrixInput {
 	in := msgconv.ToMatrixInput{Content: content, ServerURL: c.API.ServerURL(), SelfMXID: c.Login.UserMXID}
 	if me := c.self(); me != nil {
@@ -280,15 +283,35 @@ type resolver struct {
 	editReplyTo networkid.MessageID
 	// earlier is the IDs of the backfill batch's messages that are sent before the one being converted.
 	earlier map[string]struct{}
+	// loginMXID returns the Matrix user of a login of this bridge, if it exists.
+	loginMXID func(networkid.UserLoginID) (id.UserID, bool)
+	ghostMXID func(networkid.UserID) id.UserID
 }
 
 var _ msgconv.Resolver = (*resolver)(nil)
 
-func (r *resolver) UserMXID(traqUserID string) (id.UserID, bool) {
-	if me := r.c.self(); me != nil && me.ID == traqUserID {
-		return r.c.Login.UserMXID, true
+func (c *TraQClient) newResolver(ctx context.Context, portal *bridgev2.Portal, earlier map[string]struct{}) *resolver {
+	br := c.Login.Bridge
+	return &resolver{
+		ctx: ctx, c: c, portal: portal, earlier: earlier,
+		loginMXID: func(loginID networkid.UserLoginID) (id.UserID, bool) {
+			// bridgev2 loads every login at startup and caches it until it is deleted.
+			if login := br.GetCachedUserLoginByID(loginID); login != nil {
+				return login.UserMXID, true
+			}
+			return "", false
+		},
+		ghostMXID: br.Matrix.FormatGhostMXID,
 	}
-	return r.c.Login.Bridge.Matrix.FormatGhostMXID(UserID(traqUserID)), true
+}
+
+// UserMXID is the Matrix user of the traQ user's login on this bridge (the login's ID is the traQ user ID),
+// so that a mention notifies a logged-in user whichever login converts the message; else the ghost.
+func (r *resolver) UserMXID(traqUserID string) (id.UserID, bool) {
+	if mxid, ok := r.loginMXID(LoginID(traqUserID)); ok {
+		return mxid, true
+	}
+	return r.ghostMXID(UserID(traqUserID)), true
 }
 
 func (r *resolver) ChannelLink(channelID string) (string, bool) {
@@ -355,12 +378,18 @@ func (c *TraQClient) sender(userID string) bridgev2.EventSender {
 	}
 }
 
-// portalKeyFor returns the portal key of a channel that has a portal for this login (a DM, or a public
-// channel subscribed at level >= 1), and false for any other channel.
-func (c *TraQClient) portalKeyFor(channelID string) (networkid.PortalKey, bool) {
+// target returns a channel that has a portal for this login (a DM, or a public channel subscribed at level
+// >= 1), and false for any other channel.
+func (c *TraQClient) target(channelID string) (channelInfo, bool) {
 	c.stateMu.RLock()
+	defer c.stateMu.RUnlock()
 	ch, ok := c.targets[channelID]
-	c.stateMu.RUnlock()
+	return ch, ok
+}
+
+// portalKeyFor returns the portal key of a target channel (see target), and false for any other channel.
+func (c *TraQClient) portalKeyFor(channelID string) (networkid.PortalKey, bool) {
+	ch, ok := c.target(channelID)
 	if !ok {
 		return networkid.PortalKey{}, false
 	}
@@ -394,21 +423,46 @@ func (c *TraQClient) stampReactions(ctx context.Context, msg *traq.Message) []*b
 	return reactions
 }
 
-// reactionKey returns the Matrix reaction key of a stamp. A stamp missing from the table is fetched with
-// Stamp() and added to it. A failure is returned, not logged.
+// reactionKey returns the Matrix reaction key of a stamp. A stamp missing from the table is read with Stamp()
+// and stored; a failure to read it is returned, not logged. The emoji of a pending Unicode stamp is resolved
+// on demand (resolveEmoji), so its reactions get the emoji rather than ":name:" also while the stamp sync job
+// has not got to it; if that fails, the failure is logged and the key is ":name:". A stamp the job has given
+// up on for now is not tried before its retry time, and a failure sets the next one.
 func (c *TraQClient) reactionKey(ctx context.Context, stampID string) (string, error) {
-	if s, ok := c.Main.Stamps.ByID(stampID); ok {
+	s, ok := c.Main.Stamps.ByID(stampID)
+	if !ok {
+		st, err := c.API.Stamp(ctx, stampID)
+		if err != nil {
+			return "", fmt.Errorf("get stamp %s: %w", stampID, err)
+		}
+		if s, err = c.Main.addStamp(ctx, stampFromTraQ(st), st.FileID); err != nil {
+			zerolog.Ctx(ctx).Warn().Err(err).Str("traq_stamp_id", stampID).Msg("Failed to store a stamp")
+			return stampconv.ReactionKey(s), nil
+		}
+	}
+	if !s.EmojiPending() {
 		return stampconv.ReactionKey(s), nil
 	}
-	st, err := c.API.Stamp(ctx, stampID)
-	if err != nil {
-		return "", fmt.Errorf("get stamp %s: %w", stampID, err)
+	retryAt, retried := c.Main.Stamps.RetryAfter(stampID)
+	if retried && time.Now().Before(retryAt) {
+		return stampconv.ReactionKey(s), nil
 	}
-	return stampconv.ReactionKey(c.Main.tableStamp(stampFromTraQ(st))), nil
+	resolved, err := c.Main.resolveEmoji(ctx, c.API, stampID)
+	if err != nil {
+		zerolog.Ctx(ctx).Warn().Err(err).Str("traq_stamp_id", stampID).
+			Msg("Failed to resolve the emoji of a Unicode stamp, using its name")
+		if retried {
+			c.Main.Stamps.SetRetryAfter(stampID, time.Now().Add(stampOnDemandRetryDelay))
+		}
+	}
+	if resolved.ID != "" { // else deleted meanwhile: keep the stamp the reaction was made with
+		s = resolved
+	}
+	return stampconv.ReactionKey(s), nil
 }
 
-// stampFromTraQ converts a traQ stamp for the table. Emoji stays empty: the stamp sync job (stamps.go) resolves
-// the emoji of Unicode stamps, and until then their reaction key is ":name:".
+// stampFromTraQ converts a traQ stamp for the table. Emoji stays empty: the emoji of a Unicode stamp is
+// resolved from its file (resolveEmoji, refreshStamp), and until then its reaction key is ":name:".
 func stampFromTraQ(s *traq.Stamp) stampconv.Stamp {
 	return stampconv.Stamp{ID: s.ID, Name: s.Name, Unicode: s.IsUnicode}
 }

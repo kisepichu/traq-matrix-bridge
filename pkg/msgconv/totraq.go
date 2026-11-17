@@ -7,6 +7,7 @@ import (
 	"html"
 	"net/url"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"maunium.net/go/mautrix/event"
@@ -21,9 +22,12 @@ const MaxTraQLength = 10000
 // message exceeds MaxTraQLength.
 var ErrTooLong = errors.New("message is too long for traQ")
 
-// TraQUserResolver maps a Matrix user (a ghost, or a Matrix user logged into the bridge) to a traQ user name.
-type TraQUserResolver interface {
+// TraQResolver maps the Matrix side of the bridge to traQ: a user (a ghost, or a Matrix user logged into the
+// bridge) to a traQ user name, a portal room to its channel and a bridged event to its message.
+type TraQResolver interface {
 	TraQUserName(mxid id.UserID) (name string, ok bool)
+	ChannelPath(roomID id.RoomID) (path string, ok bool) // "gps/times" for the portal of a public channel
+	MessageID(eventID id.EventID) (messageID string, ok bool)
 }
 
 // ToTraQInput is a Matrix message to convert.
@@ -37,9 +41,10 @@ type ToTraQInput struct {
 
 // ToTraQ converts a Matrix message into the traQ Markdown to post with embed
 // enabled. traQ turns plain @name and #channel into embeds itself, so a user
-// pill becomes "@name". It must not be an embed already: traQ also converts the
-// "@name" inside an embed's raw text, which nests one embed in another.
-func ToTraQ(ctx context.Context, in ToTraQInput, r TraQUserResolver) (string, error) {
+// pill becomes "@name" and a portal room pill "#path". It must not be an embed
+// already: traQ also converts the "@name" inside an embed's raw text, which
+// nests one embed in another.
+func ToTraQ(ctx context.Context, in ToTraQInput, r TraQResolver) (string, error) {
 	var text string
 	if in.Format == string(event.FormatHTML) {
 		// A pill's "@name" is preceded by start and followed by end, runes not in the input; separatePills
@@ -49,7 +54,7 @@ func ToTraQ(ctx context.Context, in ToTraQInput, r TraQUserResolver) (string, er
 		start := unusedRune(raw, end)
 		parser := *format.MarkdownHTMLParser
 		parser.PillConverter = func(displayname, mxid, eventID string, _ format.Context) string {
-			s, isName := traqPill(r, displayname, mxid, eventID)
+			s, isName := traqPill(r, in.ServerURL, displayname, mxid, eventID)
 			if isName {
 				s = string(start) + s + string(end)
 			}
@@ -69,7 +74,11 @@ func ToTraQ(ctx context.Context, in ToTraQInput, r TraQUserResolver) (string, er
 		if in.ServerURL == nil {
 			return "", errors.New("reply target without a traQ server URL")
 		}
-		text = in.ServerURL.JoinPath("messages", in.ReplyTo).String() + "\n" + text
+		// A quote-only message keeps its quote visible in Matrix as a link to the reply target, which
+		// converts back to this URL: a text that starts with it, as a word, has the quote already.
+		if quote := in.ServerURL.JoinPath("messages", in.ReplyTo).String(); !startsWithWord(text, quote) {
+			text = quote + "\n" + text
+		}
 	}
 	if n := utf8.RuneCountInString(text); n > MaxTraQLength {
 		return "", fmt.Errorf("%w: %d characters", ErrTooLong, n)
@@ -77,15 +86,25 @@ func ToTraQ(ctx context.Context, in ToTraQInput, r TraQUserResolver) (string, er
 	return text, nil
 }
 
-// traqPill renders a matrix.to link: a resolvable user becomes "@name" (which
-// traQ embeds; isName is true), an unknown user its display name, and a room
-// or event link its URL.
-func traqPill(r TraQUserResolver, displayname, mxid, eventID string) (s string, isName bool) {
+// traqPill renders a matrix.to link: a resolvable user becomes "@name" and a
+// portal room "#path" (which traQ embeds; isName is true), an unknown user its
+// display name, a bridged event the URL of its traQ message (which traQ shows
+// as a quote), and any other room or event link its URL.
+func traqPill(r TraQResolver, server *url.URL, displayname, mxid, eventID string) (s string, isName bool) {
 	if mxid == "" || mxid[0] == '@' {
 		if name, ok := r.TraQUserName(id.UserID(mxid)); ok {
 			return "@" + name, true
 		}
 		return displayname, false
+	}
+	if eventID != "" {
+		if messageID, ok := r.MessageID(id.EventID(eventID)); ok && server != nil {
+			return server.JoinPath("messages", messageID).String(), false
+		}
+	} else if mxid[0] == '!' { // not a room alias
+		if path, ok := r.ChannelPath(id.RoomID(mxid)); ok {
+			return "#" + path, true
+		}
 	}
 	link := "https://matrix.to/#/" + mxid
 	if eventID != "" {
@@ -105,11 +124,11 @@ func unusedRune(s string, after rune) rune {
 	return r
 }
 
-// separatePills removes the start and end marks around each "@name" pill.
-// traQ embeds no mention that follows ":", so a space is put before a pill
-// that does. A space is also put after the pill if a traQ name character
+// separatePills removes the start and end marks around each "@name" or
+// "#path" pill. traQ embeds neither after ":", so a space is put before a pill
+// that follows one. A space is also put after the pill if a traQ name character
 // follows: traQ would otherwise read the characters after the pill as part
-// of the name and mention another user.
+// of the name and mention another user or channel.
 func separatePills(text string, start, end rune) string {
 	var b strings.Builder
 	b.Grow(len(text))
@@ -137,6 +156,16 @@ func separatePills(text string, start, end rune) string {
 // isTraQNameRune reports whether c may appear in a traQ user name.
 func isTraQNameRune(c rune) bool {
 	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-'
+}
+
+// startsWithWord reports whether text starts with word followed by the end of text or whitespace.
+func startsWithWord(text, word string) bool {
+	rest, ok := strings.CutPrefix(text, word)
+	if !ok {
+		return false
+	}
+	r, _ := utf8.DecodeRuneInString(rest)
+	return rest == "" || unicode.IsSpace(r)
 }
 
 // trimReplyFallbackBody drops the "> <@user> ..." quote and the blank line

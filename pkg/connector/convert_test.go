@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"slices"
 	"testing"
 	"time"
@@ -102,6 +103,51 @@ func TestBuildMessageEmpty(t *testing.T) {
 	_, err := buildMessage(context.Background(), msgconv.ToMatrixResult{}, metaOf(""), testOrigin, &fakeUploader{}, time.Minute)
 	if !errors.Is(err, bridgev2.ErrIgnoringRemoteEvent) {
 		t.Fatalf("err = %v, want ErrIgnoringRemoteEvent", err)
+	}
+}
+
+// quoteResolver is a msgconv.Resolver for which every message can be replied to and none is linked.
+type quoteResolver struct{}
+
+func (quoteResolver) UserMXID(string) (id.UserID, bool) { return "", false }
+func (quoteResolver) ChannelLink(string) (string, bool) { return "", false }
+func (quoteResolver) MessageLink(string) (string, bool) { return "", false }
+func (quoteResolver) CanReplyTo(string) bool            { return true }
+
+// A traQ message that only quotes a message of the same channel is bridged as a reply that shows the quote,
+// not dropped for being empty.
+func TestBuildMessageReplyQuoteAlone(t *testing.T) {
+	quote := testOrigin + "/messages/" + testUUID
+	srv, _ := url.Parse(testOrigin)
+	res := msgconv.ToMatrix(msgconv.ToMatrixInput{Content: quote, ServerURL: srv}, quoteResolver{})
+	cm, err := buildMessage(context.Background(), res, metaOf(quote), testOrigin, &fakeUploader{}, time.Minute)
+	if err != nil {
+		t.Fatalf("buildMessage: %v", err)
+	}
+	if len(cm.Parts) != 1 || cm.Parts[0].ID != textPartID || cm.Parts[0].Content.Body != quote {
+		t.Errorf("parts = %+v, want one text part showing %s", cm.Parts, quote)
+	}
+	if cm.ReplyTo == nil || cm.ReplyTo.MessageID != MessageID(testUUID) {
+		t.Errorf("ReplyTo = %+v, want %s", cm.ReplyTo, testUUID)
+	}
+}
+
+// A mention of a traQ user who is logged into this bridge points to that login's Matrix user, whichever login
+// converts the message; any other traQ user is their ghost.
+func TestResolverUserMXID(t *testing.T) {
+	logins := map[networkid.UserLoginID]id.UserID{"u-me": "@me:example.org", "u-carol": "@carol:example.org"}
+	r := &resolver{
+		loginMXID: func(loginID networkid.UserLoginID) (id.UserID, bool) { mxid, ok := logins[loginID]; return mxid, ok },
+		ghostMXID: func(userID networkid.UserID) id.UserID { return id.UserID("@traq_" + string(userID) + ":example.org") },
+	}
+	for traqUserID, want := range map[string]id.UserID{
+		"u-me":    "@me:example.org",
+		"u-carol": "@carol:example.org",
+		"u-bob":   "@traq_u-bob:example.org",
+	} {
+		if got, ok := r.UserMXID(traqUserID); got != want || !ok {
+			t.Errorf("UserMXID(%q) = %q, %v; want %q", traqUserID, got, ok, want)
+		}
 	}
 }
 

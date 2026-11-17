@@ -3,6 +3,7 @@ package stampconv
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestEmojiFromFileName(t *testing.T) {
@@ -89,6 +90,36 @@ func TestResolveEmojiWhileTableIncomplete(t *testing.T) {
 	tbl.SetComplete(true)
 	if _, err := tbl.Resolve("🦄"); !errors.Is(err, ErrUnknownStamp) {
 		t.Errorf("after SetComplete err = %v, want ErrUnknownStamp", err)
+	}
+}
+
+// A stamp being retried keeps the table incomplete for emoji until it is resolved or deleted.
+func TestResolveEmojiWhileAStampIsRetried(t *testing.T) {
+	tbl := NewTable([]Stamp{{ID: "u1", Name: "a", Unicode: true}, {ID: "u2", Name: "b", Unicode: true}, {ID: "c", Name: "c"}}, true)
+	at := time.Now().Add(time.Minute)
+	tbl.SetRetryAfter("u1", at)
+	tbl.SetRetryAfter("u2", at)
+	tbl.SetRetryAfter("c", at) // not pending: ignored
+	if got, ok := tbl.RetryAfter("u1"); !ok || !got.Equal(at) {
+		t.Errorf("RetryAfter(u1) = %v, %v; want %v", got, ok, at)
+	}
+	if _, ok := tbl.RetryAfter("c"); ok {
+		t.Error("a stamp that is not pending is being retried")
+	}
+	tbl.Put(Stamp{ID: "u1", Name: "a", Unicode: true}) // still pending
+	if _, err := tbl.Resolve("🦄"); !errors.Is(err, ErrEmojiTableIncomplete) {
+		t.Errorf("Resolve(🦄) err = %v, want ErrEmojiTableIncomplete", err)
+	}
+	tbl.Put(Stamp{ID: "u1", Name: "a", Unicode: true, Emoji: "👍"})
+	if _, ok := tbl.RetryAfter("u1"); ok {
+		t.Error("a resolved stamp is still being retried")
+	}
+	if _, err := tbl.Resolve("🦄"); !errors.Is(err, ErrEmojiTableIncomplete) {
+		t.Errorf("Resolve(🦄) with u2 left: err = %v, want ErrEmojiTableIncomplete", err)
+	}
+	tbl.Delete("u2")
+	if _, err := tbl.Resolve("🦄"); !errors.Is(err, ErrUnknownStamp) {
+		t.Errorf("Resolve(🦄) with none left: err = %v, want ErrUnknownStamp", err)
 	}
 }
 

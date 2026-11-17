@@ -8,6 +8,7 @@ import (
 	"go.mau.fi/util/configupgrade"
 	"go.mau.fi/util/dbutil"
 	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/bridgeconfig"
 	"maunium.net/go/mautrix/bridgev2/database"
 
 	"github.com/kisepichu/traq-matrix-bridge/pkg/connector/stampdb"
@@ -41,7 +42,11 @@ func (c *TraQConnector) Init(br *bridgev2.Bridge) {
 }
 
 // Start upgrades the connector's tables (bridgev2 has upgraded its own just before) and loads the stamp table.
+// It warns about bridgev2 settings the connector does not work with.
 func (c *TraQConnector) Start(ctx context.Context) error {
+	for _, w := range bridgeConfigWarnings(c.Bridge.Config) {
+		c.Bridge.Log.Warn().Msg(w)
+	}
 	db := c.Bridge.DB.Database.Child(stampdb.VersionTableName, stampdb.UpgradeTable,
 		dbutil.ZeroLogger(c.Bridge.Log.With().Str("db_section", "traq").Logger()))
 	if err := db.Upgrade(ctx); err != nil {
@@ -59,6 +64,20 @@ func (c *TraQConnector) Start(ctx context.Context) error {
 	c.Stamps = stampconv.NewTable(stamps, complete)
 	c.Bridge.Log.Info().Int("stamps", len(stamps)).Bool("complete", complete).Msg("Loaded the stamp table")
 	return nil
+}
+
+// bridgeConfigWarnings returns one warning per bridgev2 setting that breaks an assumption of the connector.
+func bridgeConfigWarnings(cfg *bridgeconfig.BridgeConfig) []string {
+	var warnings []string
+	if !cfg.Backfill.Enabled {
+		warnings = append(warnings, "backfill.enabled is false: new rooms get no history, and messages "+
+			"missed while the bridge was stopped or disconnected are not caught up on")
+	}
+	if cfg.AsyncEvents {
+		warnings = append(warnings, "bridge.async_events is true: the connector relies on each portal "+
+			"handling its events one at a time, in order (echo detection, catch-up before live messages)")
+	}
+	return warnings
 }
 
 // defaultMaxFileSize is the upload limit bridgev2's Matrix connector assumes until it has read the

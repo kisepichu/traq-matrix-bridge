@@ -93,12 +93,15 @@ func subscriptionSnapshot(tree *channelTree, subs []traq.Subscription) map[strin
 	return snap
 }
 
-// portalKey returns the portal key of a channel: public channels are shared by all logins, DMs are per login.
+// portalKey returns the portal key of a channel. Every portal key is built here. A DM's portal belongs to
+// this login. A public channel's portal is shared by all logins (no receiver), unless bridgev2 splits
+// portals (bridge.split_portals, which bbctl's bridgev2 config sets): bridgev2 then rejects every key
+// without a receiver, and each login has its own portal of the channel.
 func (c *TraQClient) portalKey(ch channelInfo) networkid.PortalKey {
-	if ch.isDM() {
-		return DMPortalKey(ch.ID, c.Login.ID)
+	if ch.isDM() || c.Login.Bridge.Config.SplitPortals {
+		return PortalKey(ch.ID, c.Login.ID)
 	}
-	return PortalKey(ch.ID)
+	return PortalKey(ch.ID, "")
 }
 
 // selfSender is the EventSender for events of the logged-in user.

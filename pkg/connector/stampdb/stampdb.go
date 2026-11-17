@@ -3,7 +3,9 @@ package stampdb
 
 import (
 	"context"
+	"database/sql"
 	"embed"
+	"errors"
 
 	"go.mau.fi/util/dbutil"
 
@@ -22,7 +24,7 @@ var UpgradeTable = dbutil.BuildUpgradeTable().WithFSPath(upgrades, "upgrades").F
 // Store reads and writes the traq_stamp table.
 type Store struct{ db *dbutil.Database }
 
-// Pending is a Unicode stamp whose emoji has not been resolved from its file name yet.
+// Pending is a Unicode stamp whose emoji has not been resolved yet and is not known to be unresolvable.
 type Pending struct{ ID, FileID string }
 
 // New returns a store on db, the child database (br.DB.Database.Child(VersionTableName, UpgradeTable, ...)).
@@ -32,7 +34,7 @@ func New(db *dbutil.Database) *Store {
 
 // All returns every stamp.
 func (s *Store) All(ctx context.Context) ([]stampconv.Stamp, error) {
-	rows, err := s.db.Query(ctx, `SELECT id, name, is_unicode, emoji FROM traq_stamp`)
+	rows, err := s.db.Query(ctx, `SELECT id, name, is_unicode, emoji, unresolvable FROM traq_stamp`)
 	if err != nil {
 		return nil, err
 	}
@@ -40,7 +42,7 @@ func (s *Store) All(ctx context.Context) ([]stampconv.Stamp, error) {
 	var out []stampconv.Stamp
 	for rows.Next() {
 		var st stampconv.Stamp
-		if err := rows.Scan(&st.ID, &st.Name, &st.Unicode, &st.Emoji); err != nil {
+		if err := rows.Scan(&st.ID, &st.Name, &st.Unicode, &st.Emoji, &st.Unresolvable); err != nil {
 			return nil, err
 		}
 		out = append(out, st)
@@ -51,11 +53,27 @@ func (s *Store) All(ctx context.Context) ([]stampconv.Stamp, error) {
 // Put adds or replaces a stamp. fileID is the ID of the stamp's image.
 func (s *Store) Put(ctx context.Context, st stampconv.Stamp, fileID string) error {
 	_, err := s.db.Exec(ctx, `
-		INSERT INTO traq_stamp (id, name, is_unicode, emoji, file_id) VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO traq_stamp (id, name, is_unicode, emoji, unresolvable, file_id) VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (id) DO UPDATE SET
-			name=excluded.name, is_unicode=excluded.is_unicode, emoji=excluded.emoji, file_id=excluded.file_id
-	`, st.ID, st.Name, st.Unicode, st.Emoji, fileID)
+			name=excluded.name, is_unicode=excluded.is_unicode, emoji=excluded.emoji,
+			unresolvable=excluded.unresolvable, file_id=excluded.file_id
+	`, st.ID, st.Name, st.Unicode, st.Emoji, st.Unresolvable, fileID)
 	return err
+}
+
+// FileID returns the ID of a stamp's image; false if the stamp is not stored.
+func (s *Store) FileID(ctx context.Context, id string) (string, bool, error) {
+	var fileID string
+	err := s.db.QueryRow(ctx, `SELECT file_id FROM traq_stamp WHERE id=$1`, id).Scan(&fileID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	return fileID, err == nil, err
+}
+
+// DoTxn runs fn in a transaction; the store's methods called with the ctx fn gets are part of it.
+func (s *Store) DoTxn(ctx context.Context, fn func(ctx context.Context) error) error {
+	return s.db.DoTxn(ctx, nil, fn)
 }
 
 // Delete removes a stamp. A missing stamp is not an error.
@@ -64,9 +82,11 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 	return err
 }
 
-// PendingUnicode returns the Unicode stamps whose emoji is not resolved yet.
+// PendingUnicode returns the Unicode stamps whose emoji is still to be resolved.
 func (s *Store) PendingUnicode(ctx context.Context) ([]Pending, error) {
-	rows, err := s.db.Query(ctx, `SELECT id, file_id FROM traq_stamp WHERE is_unicode AND emoji='' ORDER BY id`)
+	rows, err := s.db.Query(ctx, `
+		SELECT id, file_id FROM traq_stamp WHERE is_unicode AND emoji='' AND NOT unresolvable ORDER BY id
+	`)
 	if err != nil {
 		return nil, err
 	}
@@ -86,7 +106,7 @@ func (s *Store) PendingUnicode(ctx context.Context) ([]Pending, error) {
 func (s *Store) Complete(ctx context.Context) (bool, error) {
 	var total, pending int
 	err := s.db.QueryRow(ctx, `
-		SELECT COUNT(*), COUNT(CASE WHEN is_unicode AND emoji='' THEN 1 END) FROM traq_stamp
+		SELECT COUNT(*), COUNT(CASE WHEN is_unicode AND emoji='' AND NOT unresolvable THEN 1 END) FROM traq_stamp
 	`).Scan(&total, &pending)
 	return total > 0 && pending == 0, err
 }

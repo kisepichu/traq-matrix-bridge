@@ -77,7 +77,7 @@ flake.nix       package (buildGoModule)、開発環境
 | bridgev2 | traQ |
 |---|---|
 | `UserLoginID` | login した traQ user の UUID |
-| `PortalID` | channel の UUID (DM は DM channel の UUID)。DM の PortalKey は receiver に login を入れる |
+| `PortalID` | channel の UUID (DM は DM channel の UUID)。DM の PortalKey は receiver に login を入れる。公開チャンネルの PortalKey は receiver 無しで全 login が共有する。ただし bridgev2 の `bridge.split_portals` が true (Beeper の `bbctl` の bridgev2 設定の既定) なら、receiver の無い key を bridgev2 が拒むので、公開チャンネルも receiver に login を入れ、login ごとに別の room にする |
 | `UserID` (ghost) | traQ user の UUID。MXID は bridge 設定の `appservice.username_template` で決まる (例: `traq_{{.}}` なら `@traq_<uuid>:<homeserver の domain>`) |
 | `MessageID` | message の UUID |
 | reaction の `EmojiID` | stamp の UUID (1 user × 1 stamp で 1 reaction) |
@@ -103,6 +103,13 @@ network:
 ```
 
 過去ログの件数は bridgev2 の `backfill` 設定 (`max_initial_messages` など) を使い、`network:` には重複させない。
+
+bridgev2 の設定のうち connector が前提にするもの。外れていれば起動時に warning を log に出す。
+
+- `backfill.enabled: true`: false だと新しい room に過去ログが入らず、停止中・切断中に投稿された message の追いつき
+  (catch-up) も動かない。
+- `bridge.async_events: false`: portal ごとに event を 1 つずつ順に処理することを前提にしている (echo の判定、
+  live の message より先に catch-up を処理すること)。
 
 ## login (OAuth 2.0 authorization code + PKCE)
 
@@ -140,7 +147,7 @@ traQ の WebSocket は event ごとに届く相手が違う。
 - **WebSocket を 1 本**張り、接続直後に `timeline_streaming:on` を送る。新着は全部、public チャンネルの編集・削除も
   これで届く。
   event は ID しか持たないので、本文などは REST で取る。
-- **今読んでいるチャンネル**: Matrix で read receipt (または message の送信) があった room のチャンネルに
+- **今読んでいるチャンネル**: Matrix で read receipt (または message の送信、reaction の追加・取り消し) があった room のチャンネルに
   `viewstate:<channel>:monitoring` を送る。そのチャンネルの編集・削除・スタンプは WebSocket で届く。
   `view_idle_timeout` の間 Matrix で操作が無ければ `viewstate:null` を送る (traQ の閲覧者の表示に残り続けない)。
 - **それ以外のチャンネル** (poller): 新着は全部 bridge に届くので、bridge は portal ごとの最終書き込み時刻を
@@ -186,9 +193,11 @@ traQ の WebSocket は event ごとに届く相手が違う。
 
 - **traQ → Matrix**: traQ の Markdown を goldmark (GFM、raw HTML 無効) で HTML にし `formatted_body` に、
   plain text を `body` にする。traQ 固有の記法は次のとおり。
-  - 埋め込み `!{"type":"user","raw":"@name","id":"<uuid>"}` → ghost への mention (pill)。
+  - 埋め込み `!{"type":"user","raw":"@name","id":"<uuid>"}` → ghost への mention (pill)。その traQ user がこの bridge に
+    login していれば、どの login が変換しても、その login の Matrix user への mention にする。
   - `!{"type":"channel",...}` → portal があればその room への link、無ければ traQ の channel URL。
   - `!{"type":"group",...}` → `@group` の文字列。自分が member なら自分への mention として扱う (group の member は cache)。
+    変換する login の group しか分からないので、他の login の user が member でも mention にはしない。
   - `!!spoiler!!` → Matrix の spoiler。インラインのスタンプ `:name:` と数式は文字のまま。
   - 自分 (user か所属 group) への mention を含むときは `m.mentions` に自分を入れる。
 - **Matrix → traQ**: `formatted_body` があれば mautrix-go の HTML parser で Markdown に戻し、ghost (と bridge に login
@@ -196,7 +205,15 @@ traQ の WebSocket は event ごとに届く相手が違う。
   投稿と編集は `embed: true` で送り、pill から作った `@name` も、pill を使わずに打った `@name` / `#channel` も、traQ に
   埋め込み `!{"type":"user","raw":"@name","id":"<uuid>"}` へ直させる (traQ の web client で打ったときと同じになる)。
   pill を自分で埋め込みにはしない: traQ (3.32.1) は既存の埋め込みの `raw` の中の `@name` も埋め込みに直すので、二重になる。
-  pill の直後が traQ の名前に使える文字 (`[A-Za-z0-9_-]`) なら `@name` の後に空白を入れる (別の user と読まれないように)。
+  room と event の pill (matrix.to の link) は traQ → Matrix の逆にする。
+  - 公開チャンネルの portal の room → `#<channel の path>` (traQ がチャンネルの埋め込みに直す)。
+  - bridge 済みの event → その traQ message の `<server_url>/messages/<id>` (traQ では引用になる)。
+  - DM の room、portal でない room、bridge していない event → matrix.to の URL のまま。
+
+  こうしないと、チャンネルへの言及や引用を含む自分の message を Matrix で編集したとき、traQ 側で matrix.to の URL に
+  置き換わってしまう。
+  `@name` と `#path` の pill の直後が traQ の名前に使える文字 (`[A-Za-z0-9_-]`) なら後に空白を入れ (別の user や
+  チャンネルと読まれないように)、直前が `:` なら前に空白を入れる (traQ は `:` の後を埋め込みにしない)。
   traQ の上限 (10000 文字) を超える場合は送らずに error を返す。
 
 ### 編集・削除
@@ -210,6 +227,7 @@ traQ の WebSocket は event ごとに届く相手が違う。
 
 - **traQ → Matrix**: 本文中の `<server_url>/messages/<uuid>` と `!{"type":"message",...,"id":"<uuid>"}` について、
   - 同じチャンネルで portal に bridge 済みの message への最初の引用 → Matrix の reply relation にし、本文からその URL を消す。
+    その引用を消すと本文も file も残らない (引用だけの message) ときは、引用を消さずに link として見せる。
   - それ以外 → bridge 済みならその Matrix event への link (matrix.to)、未 bridge なら traQ の URL のまま。
 - **Matrix → traQ**: reply の相手が bridge 済みの traQ message なら、その URL を本文の先頭行に付ける。
 
@@ -229,10 +247,24 @@ traQ の WebSocket は event ごとに届く相手が違う。
   (`traQ/utils/twemoji/installer.go`)、名前は JoyPixels の shortname、file 名は codepoint (`1f44d.svg`、
   複数なら `-` 区切り) になる。そこで `isUnicode` なスタンプの `/files/{fileId}/meta` の `name` を
   codepoint として読み、絵文字の文字列に直す。
-  - 対応表は connector 自身の database table (stamp ID、名前、`isUnicode`、絵文字) に持つ。
+  - 対応表は connector 自身の database table (stamp ID、名前、`isUnicode`、絵文字、解決できないことの印) に持つ。
   - 初回の接続時に背景で作る (数千件の meta を間隔を空けて読む)。`STAMP_CREATED` で増えた分を足す。
+    meta が読めなかった stamp は絵文字を空 (未解決) のまま入れておき、後で解決する。
+  - 変換中に未解決の Unicode スタンプに出会ったら、その場でその stamp の meta を 1 回読んで解決し、表に入れる
+    (同じ stamp を同時に要る変換は 1 回の読み込みを共有する)。meta はロックの外で読み、表に入れる前に、その stamp が
+    まだ未解決で file も変わっていないことを確かめる。背景の処理は解決済みの stamp を飛ばす。
+    これで、表ができる前に bridge した過去ログや reaction も絵文字になる。失敗したら `:name:` で代える。
+  - file が無い (404) か file 名が絵文字でない stamp は、「解決できない」と印を付けて DB に入れる
+    (そのスタンプが変わるまで読み直さない)。
+  - それ以外の失敗 (5xx、proxy の 502/503/504、timeout、接続の切断など) が 5 回続いた stamp は、いったん飛ばして
+    残りを先に解決する。これで traQ が落ちても表はその回で完成する (DB では未解決のままで、次の起動でも読み直す)。
+    飛ばした stamp は表を完成させた後、背景の処理が backoff を空けて、解決するか確かな答え (404 など) が出るまで
+    読み直し続ける (bridge と一緒に止まり、同時に 2 つは動かない)。その間、変換は飛ばした stamp をその場で
+    1 分に 1 回だけ読み直し (それまでは `:name:`)、Matrix → traQ は表に無い絵文字に「まだ表を作っている」の
+    error を返す (その絵文字は飛ばした stamp のものかもしれないので、「無い」とは言わない)。
   - 比べるときは双方の異体字セレクタ (U+FE0F) を取り除く。
-  - 対応表ができるまでは、traQ → Matrix は `:name:` で代え、Matrix → traQ の絵文字は error を返す。
+  - 対応表ができるまでは、traQ → Matrix はその場で解決できなかったものだけ `:name:` で代え、Matrix → traQ は
+    まだ解決していない絵文字に error を返す。
   - JoyPixels の emoji.json は OSS の license ではない (JoyPixels Free License) ので、repository に同梱しない。
 
 ### ファイル

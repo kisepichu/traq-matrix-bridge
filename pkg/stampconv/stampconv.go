@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 )
 
@@ -17,6 +18,13 @@ type Stamp struct {
 	Unicode bool
 	// Emoji is the emoji text of a Unicode stamp, or "" until its file name has been resolved.
 	Emoji string
+	// Unresolvable marks a Unicode stamp whose emoji cannot be derived from its file; its key stays ":name:".
+	Unresolvable bool
+}
+
+// EmojiPending reports whether s is a Unicode stamp whose emoji is still to be resolved.
+func (s Stamp) EmojiPending() bool {
+	return s.Unicode && s.Emoji == "" && !s.Unresolvable
 }
 
 var (
@@ -63,15 +71,19 @@ type Table struct {
 	byName   map[string]string // name -> ID
 	byEmoji  map[string]string // normalized emoji -> ID
 	complete bool
+	// retryAfter holds the pending Unicode stamps whose emoji failed to resolve and is being retried, with the
+	// time before which a conversion should not try it again. A stamp leaves it once it is no longer pending.
+	retryAfter map[string]time.Time
 }
 
 // NewTable builds a table. complete reports whether every Unicode stamp already has its Emoji resolved.
 func NewTable(stamps []Stamp, complete bool) *Table {
 	t := &Table{
-		byID:     make(map[string]Stamp, len(stamps)),
-		byName:   make(map[string]string, len(stamps)),
-		byEmoji:  make(map[string]string, len(stamps)),
-		complete: complete,
+		byID:       make(map[string]Stamp, len(stamps)),
+		byName:     make(map[string]string, len(stamps)),
+		byEmoji:    make(map[string]string, len(stamps)),
+		complete:   complete,
+		retryAfter: make(map[string]time.Time),
 	}
 	for _, s := range stamps {
 		t.putLocked(s)
@@ -85,6 +97,9 @@ func (t *Table) putLocked(s Stamp) {
 	t.byName[s.Name] = s.ID
 	if s.Unicode && s.Emoji != "" {
 		t.byEmoji[Normalize(s.Emoji)] = s.ID
+	}
+	if !s.EmojiPending() {
+		delete(t.retryAfter, s.ID)
 	}
 }
 
@@ -114,13 +129,35 @@ func (t *Table) Delete(id string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.deleteLocked(id)
+	delete(t.retryAfter, id)
 }
 
-// SetComplete marks whether every Unicode stamp has its Emoji resolved.
+// SetComplete marks whether every Unicode stamp has its Emoji resolved, but for those being retried (see
+// SetRetryAfter).
 func (t *Table) SetComplete(complete bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.complete = complete
+}
+
+// SetRetryAfter records that the emoji of the pending Unicode stamp id failed to resolve for now and is being
+// retried, and that a conversion should not try it again before at. Until the stamp is no longer pending (or
+// deleted), an emoji the table does not have may be its emoji, so Resolve reports ErrEmojiTableIncomplete for
+// it. A stamp that is not pending is left alone.
+func (t *Table) SetRetryAfter(id string, at time.Time) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if s, ok := t.byID[id]; ok && s.EmojiPending() {
+		t.retryAfter[id] = at
+	}
+}
+
+// RetryAfter returns the time set by SetRetryAfter for a stamp that is still being retried.
+func (t *Table) RetryAfter(id string) (time.Time, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	at, ok := t.retryAfter[id]
+	return at, ok
 }
 
 // ByID looks up a stamp by its traQ ID.
@@ -148,7 +185,7 @@ func (t *Table) Resolve(key string) (Stamp, error) {
 	if id, ok := t.byEmoji[Normalize(key)]; ok {
 		return t.byID[id], nil
 	}
-	if !t.complete {
+	if !t.complete || len(t.retryAfter) > 0 {
 		return Stamp{}, ErrEmojiTableIncomplete
 	}
 	return Stamp{}, ErrUnknownStamp

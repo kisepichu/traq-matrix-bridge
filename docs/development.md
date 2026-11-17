@@ -70,7 +70,7 @@ testenv/dev.sh read '<room ID>' "$ev"                      # 既読 (m.read rece
 testenv/dev.sh send-raw '<room ID>' '{"msgtype":"m.text","body":"hi bob","format":"org.matrix.custom.html","formatted_body":"hi <a href=\"https://matrix.to/#/@traq_<bob の ID>:localhost\">bob</a>"}'
 ```
 
-(*) key は traQ の stamp の `:stamp名:` か、Unicode stamp の絵文字 (`👍` など)。絵文字の key は、bridge が Unicode stamp の絵文字を解決し終えるまで (下の「Unicode stamp」) 「the emoji to stamp table is still being built」の notice で拒否される。標準の開発環境には Unicode stamp が無いので、絵文字の key は「unknown stamp」になる。
+(*) key は traQ の stamp の `:stamp名:` か、Unicode stamp の絵文字 (`👍` など)。絵文字の key は、bridge がその絵文字の Unicode stamp をまだ解決していなければ (下の「Unicode stamp」) 「the emoji to stamp table is still being built」の notice で拒否される。traQ 側でその stamp が押された message を bridge すると、その場で解決される。標準の開発環境には Unicode stamp が無いので、絵文字の key は「unknown stamp」になる。
 
 `traq <user> <METHOD> <path> [json]` は毎回 traQ に login し直した session で `/api/v3<path>` を叩き、response body を表示する。user のパスワードは `admin` (user 名 `traq`) が `traq`、それ以外は `<user>-password` (`alice` なら `alice-password`)。
 
@@ -86,7 +86,7 @@ testenv/dev.sh setup
 
 `TRAQ_INIT_EMOJIS=1` は `testenv/compose.emojis.yaml` を重ねて traQ を `--skip-init-emojis` 無しで起動し、traQ が応答するまで最大 30 分待つ。絵文字の取得に失敗しても traQ はそのまま起動するので、stamp が少ない時は `docker compose -p tmb logs traq` で `failed to install unicode emojis` を確かめる。結合テストと CI は `compose.yaml` だけを使うので影響しない。
 
-bridge は最初に CONNECTED になった login の API で stamp の一覧を DB (`traq_stamp`) に取り込み、Unicode stamp の file 名 (`1f44d.svg` など) から絵文字を 100ms に 1 件ずつ解決する (約 1700 個で 3 分ほど)。進み具合は 500 件ごとに、終わると `The stamp table is complete` が log に出る。解決した表は DB に残るので、再起動後は解決し直さない。
+bridge は最初に CONNECTED になった login の API で stamp の一覧を DB (`traq_stamp`) に取り込み、Unicode stamp の file 名 (`1f44d.svg` など) から絵文字を 100ms に 1 件ずつ解決する (約 1700 個で 3 分ほど)。進み具合は 500 件ごとに、終わると `The stamp table is complete` が log に出る。解決した表は DB に残るので、再起動後は解決し直さない。その途中でも、bridge する message や reaction に付いた Unicode stamp はその場で解決する。file が無いものや file 名が絵文字でないものは、解決できないものとして DB に記録する。meta の読み込みがそれ以外の理由 (traQ が落ちているなど) で 5 回失敗したものは、いったん飛ばして (`Giving up on the emoji of a Unicode stamp for now, it is retried after the others`) 残りを先に解決し、表を完成させてから背景で backoff を空けて読み直し続ける (`retrying` がその数、全部解決すると `Resolved the emoji of the Unicode stamps that were retried`)。DB では未解決のままなので、途中で止めても次の起動で読み直す。読み直しが終わるまでは、Matrix からの絵文字の reaction で表に無いものは「unknown stamp」でなく「the emoji to stamp table is still being built」で拒否され、traQ → Matrix の変換はその stamp を 1 分に 1 回だけその場で読み直す (それまでは `:name:`)。
 
 ### 片付け
 
