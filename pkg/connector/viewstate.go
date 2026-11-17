@@ -53,27 +53,41 @@ func (v *viewState) Current() string {
 }
 
 // Tick clears the viewstate once there has been no Touch for the idle timeout. It is called every
-// viewStateTickInterval.
+// viewStateTickInterval. The clear is also sent when current is empty but a channel is still wanted: a send
+// that failed (for example timed out) may have reached traQ. wanted is reset only once the clear succeeded,
+// so a failed clear is tried again on the next Tick.
 func (v *viewState) Tick(ctx context.Context) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	if v.now().Sub(v.lastActivity) < v.idle {
+	if v.activeLocked() {
 		return
 	}
-	v.wanted = ""
-	if v.current != "" {
-		v.sendLocked(ctx, "")
+	if (v.current != "" || v.wanted != "") && v.sendLocked(ctx, "") {
+		v.wanted = ""
 	}
 }
 
+// activeLocked reports whether the last Touch is more recent than the idle timeout.
+func (v *viewState) activeLocked() bool {
+	return v.now().Sub(v.lastActivity) < v.idle
+}
+
 // Resend is called on a new WebSocket connection, which starts without a viewstate. It sends the channel of
-// the last Touch, also when its send failed while the connection was down. If the viewstate was cleared for
-// idle meanwhile, nothing is sent. If the send fails, nothing is current, so the next Touch sends again.
+// the last Touch, also when its send failed while the connection was down. If the idle timeout has passed
+// since the last Touch, nothing is sent and the channel is no longer wanted. If the send fails, nothing is
+// current, so the next Touch sends again.
 func (v *viewState) Resend(ctx context.Context) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.current = ""
-	if v.wanted != "" && v.sendLocked(ctx, v.wanted) {
+	if v.wanted == "" {
+		return
+	}
+	if !v.activeLocked() {
+		v.wanted = ""
+		return
+	}
+	if v.sendLocked(ctx, v.wanted) {
 		zerolog.Ctx(ctx).Info().Str("traq_channel_id", v.wanted).Msg("Sent the traQ viewstate again on the new connection")
 	}
 }

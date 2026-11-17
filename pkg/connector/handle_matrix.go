@@ -1,9 +1,11 @@
 package connector
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"unicode/utf8"
 
 	"github.com/rs/zerolog"
@@ -105,9 +107,13 @@ func tooLongStatus(err error) error {
 	return err
 }
 
-// withFileURLs appends the URL of every file part to content, one per line in part order. A traQ message
+// withFileURLs appends the URL of every file part to content, one per line in part order. bridgev2 inserts
+// the parts one after another in converted order, so the order of RowID is the part order. A traQ message
 // keeps its files only while their URLs are in its content, so an edit of a message with files repeats them.
+// parts is sorted in place.
 func withFileURLs(content string, parts []*database.Message, origin string) (string, error) {
+	slices.SortFunc(parts, func(a, b *database.Message) int { return cmp.Compare(a.RowID, b.RowID) })
+	textLen := utf8.RuneCountInString(content)
 	for _, part := range parts {
 		fileID, ok := fileIDOfPart(part.PartID)
 		if !ok {
@@ -118,7 +124,12 @@ func withFileURLs(content string, parts []*database.Message, origin string) (str
 		}
 		content += fileURL(origin, fileID)
 	}
-	if n := utf8.RuneCountInString(content); n > msgconv.MaxTraQLength {
+	n := utf8.RuneCountInString(content)
+	if n > msgconv.MaxTraQLength {
+		if textLen <= msgconv.MaxTraQLength {
+			return "", fmt.Errorf("%w: %d characters, including %d characters of file links kept from the original message",
+				msgconv.ErrTooLong, n, n-textLen)
+		}
 		return "", fmt.Errorf("%w: %d characters", msgconv.ErrTooLong, n)
 	}
 	return content, nil

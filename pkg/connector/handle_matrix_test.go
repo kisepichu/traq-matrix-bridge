@@ -15,17 +15,18 @@ import (
 )
 
 func TestWithFileURLs(t *testing.T) {
+	// Out of RowID order, as GetAllPartsByID may return them.
 	parts := []*database.Message{
-		{ID: "m", PartID: textPartID},
-		{ID: "m", PartID: filePartID(fileB)},
-		{ID: "m", PartID: filePartID(fileA)},
+		{RowID: 3, ID: "m", PartID: filePartID(fileA)},
+		{RowID: 1, ID: "m", PartID: textPartID},
+		{RowID: 2, ID: "m", PartID: filePartID(fileB)},
 	}
 	got, err := withFileURLs("new text", parts, testOrigin)
 	if want := "new text\n" + testOrigin + "/files/" + fileB + "\n" + testOrigin + "/files/" + fileA; err != nil || got != want {
 		t.Errorf("withFileURLs = %q, %v; want %q", got, err, want)
 	}
 
-	got, err = withFileURLs("new text", parts[:1], testOrigin)
+	got, err = withFileURLs("new text", []*database.Message{{RowID: 1, ID: "m", PartID: textPartID}}, testOrigin)
 	if err != nil || got != "new text" {
 		t.Errorf("withFileURLs without file parts = %q, %v; want the text unchanged", got, err)
 	}
@@ -38,8 +39,13 @@ func TestWithFileURLsLength(t *testing.T) {
 	if _, err := withFileURLs(fits, parts, testOrigin); err != nil {
 		t.Errorf("content of exactly %d code points with the file URL rejected: %v", msgconv.MaxTraQLength, err)
 	}
-	if _, err := withFileURLs(fits+"あ", parts, testOrigin); !errors.Is(err, msgconv.ErrTooLong) {
-		t.Errorf("one code point over: err = %v, want ErrTooLong", err)
+	_, err := withFileURLs(fits+"あ", parts, testOrigin)
+	if !errors.Is(err, msgconv.ErrTooLong) || !strings.Contains(err.Error(), "file links kept from the original message") {
+		t.Errorf("one code point over only because of the file URL: err = %v, want ErrTooLong naming the file links", err)
+	}
+	_, err = withFileURLs(strings.Repeat("あ", msgconv.MaxTraQLength+1), parts, testOrigin)
+	if !errors.Is(err, msgconv.ErrTooLong) || strings.Contains(err.Error(), "file links") {
+		t.Errorf("text alone over the limit: err = %v, want ErrTooLong without the file links note", err)
 	}
 }
 

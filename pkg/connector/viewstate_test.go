@@ -198,6 +198,34 @@ func TestViewStateResendAfterFailedClear(t *testing.T) {
 	expectSent(t, sender) // nothing left to clear
 }
 
+// A Resend whose send failed (for example timed out) may still have reached traQ, so the idle Tick sends
+// the clear although nothing is current, and again after a failed clear.
+func TestViewStateTickAfterFailedResend(t *testing.T) {
+	ctx := context.Background()
+	v, sender, clock := newTestViewState()
+	v.Touch(ctx, "a")
+	sender.takeSent()
+
+	sender.setErr(errors.New("timed out"))
+	v.Resend(ctx)
+	if v.Current() != "" {
+		t.Fatalf("Current() = %q after a failed Resend, want empty", v.Current())
+	}
+	sender.setErr(nil)
+	clock.advance(testIdle - time.Second)
+	v.Tick(ctx)
+	expectSent(t, sender) // still active
+
+	clock.advance(2 * time.Second)
+	sender.setErr(errors.New("not connected"))
+	v.Tick(ctx)
+	sender.setErr(nil)
+	v.Tick(ctx)
+	expectSent(t, sender, "") // the failed clear is retried
+	v.Tick(ctx)
+	expectSent(t, sender) // cleared; nothing more to send
+}
+
 // A Resend that fails leaves the new connection without a viewstate, so the next Touch of the same channel
 // sends it.
 func TestViewStateResendFails(t *testing.T) {

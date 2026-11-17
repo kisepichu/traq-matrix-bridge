@@ -42,21 +42,23 @@ type ToTraQInput struct {
 func ToTraQ(ctx context.Context, in ToTraQInput, r TraQUserResolver) (string, error) {
 	var text string
 	if in.Format == string(event.FormatHTML) {
-		// A pill's "@name" is followed by mark, a rune not in the input; separatePills replaces it once the
-		// text after the pill is known.
-		mark := unusedRune(html.UnescapeString(in.FormattedBody))
+		// A pill's "@name" is preceded by start and followed by end, runes not in the input; separatePills
+		// replaces them once the text around the pill is known.
+		raw := html.UnescapeString(in.FormattedBody)
+		end := unusedRune(raw, 0)
+		start := unusedRune(raw, end)
 		parser := *format.MarkdownHTMLParser
 		parser.PillConverter = func(displayname, mxid, eventID string, _ format.Context) string {
 			s, isName := traqPill(r, displayname, mxid, eventID)
 			if isName {
-				s += string(mark)
+				s = string(start) + s + string(end)
 			}
 			return s
 		}
 		parser.SpoilerConverter = func(text, _ string, _ format.Context) string {
 			return "!!" + text + "!!"
 		}
-		text = separatePills(parser.Parse(event.TrimReplyFallbackHTML(in.FormattedBody), format.NewContext(ctx)), mark)
+		text = separatePills(parser.Parse(event.TrimReplyFallbackHTML(in.FormattedBody), format.NewContext(ctx)), start, end)
 	} else {
 		text = in.Body
 		if in.ReplyTo != "" {
@@ -93,28 +95,40 @@ func traqPill(r TraQUserResolver, displayname, mxid, eventID string) (s string, 
 }
 
 // unusedRune returns a rune that s does not contain, from the private use
-// area unless s holds all of it.
-func unusedRune(s string) rune {
+// area unless s holds all of it. after is skipped, so that two calls with
+// the first result as after give distinct runes; 0 means no exclusion.
+func unusedRune(s string, after rune) rune {
 	r := rune(0xE000)
-	for strings.ContainsRune(s, r) {
+	for r == after || strings.ContainsRune(s, r) {
 		r++
 	}
 	return r
 }
 
-// separatePills removes each mark that ends an "@name" pill, putting a space
-// there if a traQ name character follows: traQ would otherwise read the
-// characters after the pill as part of the name and mention another user.
-func separatePills(text string, mark rune) string {
+// separatePills removes the start and end marks around each "@name" pill.
+// traQ embeds no mention that follows ":", so a space is put before a pill
+// that does. A space is also put after the pill if a traQ name character
+// follows: traQ would otherwise read the characters after the pill as part
+// of the name and mention another user.
+func separatePills(text string, start, end rune) string {
 	var b strings.Builder
 	b.Grow(len(text))
+	var prev rune
 	for i, c := range text {
-		if c != mark {
+		switch c {
+		case start:
+			if prev == ':' {
+				b.WriteByte(' ')
+				prev = ' '
+			}
+		case end:
+			if next, _ := utf8.DecodeRuneInString(text[i+utf8.RuneLen(end):]); isTraQNameRune(next) {
+				b.WriteByte(' ')
+				prev = ' '
+			}
+		default:
 			b.WriteRune(c)
-			continue
-		}
-		if next, _ := utf8.DecodeRuneInString(text[i+utf8.RuneLen(mark):]); isTraQNameRune(next) {
-			b.WriteByte(' ')
+			prev = c
 		}
 	}
 	return b.String()
