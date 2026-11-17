@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -147,5 +149,63 @@ func TestChannelEventsCoalesceSyncs(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if got := calls.Load(); got != 2 {
 		t.Errorf("Channels() was called %d times, want 2 (the running sync and one pending)", got)
+	}
+}
+
+// The worker reads the message of MESSAGE_CREATED and MESSAGE_UPDATED again a few times, a moment apart, when
+// the read fails in a way that may pass (a 5xx or a network error), before it drops the event. A 4xx is final,
+// and a 502 or 504 has already been retried by the traQ client (1 + 3 requests).
+func TestMessageEventRetriesTransientFailures(t *testing.T) {
+	ok := func(w http.ResponseWriter) {
+		_, _ = w.Write([]byte(`{"id":"0193a1b2-0000-7000-8000-000000000001","channelId":"ch-none","content":"hi"}`))
+	}
+	status := func(code int) func(http.ResponseWriter) {
+		return func(w http.ResponseWriter) { http.Error(w, `{"message":"boom"}`, code) }
+	}
+	errNet := errors.New("connection reset by peer")
+	cases := []struct {
+		name      string
+		responses []func(http.ResponseWriter) // nil: a network error
+		calls     int
+		dropped   bool
+	}{
+		{"500 then ok", []func(http.ResponseWriter){status(500), status(500), ok}, 3, false},
+		{"network error then ok", []func(http.ResponseWriter){nil, ok}, 2, false},
+		{"503 every time", []func(http.ResponseWriter){status(503), status(503), status(503), status(503)}, messageFetchAttempts, true},
+		{"404", []func(http.ResponseWriter){status(404), ok}, 1, true},
+		{"502 every time", []func(http.ResponseWriter){status(502)}, 4, true},
+	}
+	for _, tc := range cases {
+		for _, typ := range []string{"MESSAGE_CREATED", "MESSAGE_UPDATED"} {
+			t.Run(tc.name+"/"+typ, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					var calls int
+					client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+						respond := tc.responses[min(calls, len(tc.responses)-1)]
+						calls++
+						if respond == nil {
+							return nil, errNet
+						}
+						rec := httptest.NewRecorder()
+						respond(rec)
+						return rec.Result(), nil
+					})}
+					api, err := traq.NewClient("http://traq.test", client, "token", userAgent)
+					if err != nil {
+						t.Fatal(err)
+					}
+					var logs bytes.Buffer
+					c := &TraQClient{Login: &bridgev2.UserLogin{UserLogin: &database.UserLogin{}, Log: zerolog.New(&logs)}, API: api}
+					w := &workerState{recent: newRecentMessages(1)}
+					c.handleEvent(t.Context(), w, traq.Event{Type: typ, Body: json.RawMessage(`{"id":"0193a1b2-0000-7000-8000-000000000001"}`)})
+					if calls != tc.calls {
+						t.Errorf("GET /messages/{id} was called %d times, want %d", calls, tc.calls)
+					}
+					if dropped := strings.Contains(logs.String(), "Failed to handle traQ event"); dropped != tc.dropped {
+						t.Errorf("dropped = %v, want %v (log %s)", dropped, tc.dropped, logs.String())
+					}
+				})
+			})
+		}
 	}
 }
