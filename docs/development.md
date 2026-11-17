@@ -35,6 +35,14 @@ testenv/dev.sh bot '<redirect URL>'                       # bot に貼る
 
 `traq-login` が表示する redirect URL には認可 code が入っている。`dev.sh` が表示する秘密値はこれだけで、bot に貼るために表示する。
 
+### 検索
+
+bot の `search <query>` が traQ の message を検索し、新しい順に最大 20 件を `#channel  @user  日時  抜粋  link` で返す。bridge 済みの message の link は Matrix の event、そうでなければ traQ の URL。`in:#path` で channel、`from:@name` で user を絞る (`"…"` で空白を含む語を 1 語にできる)。日時は bridge の process の local time zone。traQ の検索は Elasticsearch が index してから効くので、開発用の traQ では message を投稿してから約 70 秒待つ。
+
+```sh
+testenv/dev.sh bot 'search in:#gps/times from:@bob hello'
+```
+
 ### 相手側の操作を再現する
 
 traQ や Matrix の相手側 (別の user) の操作は次で再現する。
