@@ -33,7 +33,7 @@ Matrix client から次ができる。
 
 ## 前提と制約
 
-- **ライセンスは MIT**。依存 (mautrix-go: MPL-2.0、go-traq: MIT、coder/websocket: ISC、goldmark: MIT) は
+- **ライセンスは MIT**。依存 (mautrix-go: MPL-2.0、coder/websocket: ISC、goldmark: MIT) は
   すべて MIT の project から使える。mautrix-go のファイルは改変しない (MPL-2.0 の義務は改変したファイルに掛かる)。
 - **AGPL の bridge (mautrix-slack、mautrix-discord など) のコードは写さない**。bridgev2 の使い方は
   mautrix-go の interface と godoc から書く。他の bridge は挙動を理解するために読むだけにする。
@@ -45,8 +45,10 @@ Matrix client から次ができる。
 
 - **言語・framework**: Go + mautrix-go bridgev2。bridge 本体 (Matrix との接続、portal、ghost、backfill の
   queue、bot command、provisioning API) は bridgev2 が持ち、この repository は traQ 側の network connector を書く。
-- **traQ の REST**: `traPtitech/go-traq` (OpenAPI の生成物) を `pkg/traq` で薄く包む。
-- **traQ の WebSocket** (`/api/v3/ws`): go-traq に無いので `coder/websocket` で自前で書く。
+- **traQ の REST**: `pkg/traq` に自前の薄い client を書く (`net/http` + `encoding/json`、使う field だけの型)。
+  go-traq (OpenAPI の生成物) は使わない。go-traq の model は未知の JSON field があると decode に失敗する
+  (`DisallowUnknownFields`) ので、traQ server が field を足すたびに bridge が壊れる。
+- **traQ の WebSocket** (`/api/v3/ws`): `coder/websocket` で書く。`Authorization: Bearer` で接続できる。
 
 ## repository の構成
 
@@ -55,7 +57,7 @@ cmd/traq-matrix-bridge/main.go   mxmain に connector を渡して起動する�
 pkg/connector/                   bridgev2 の NetworkConnector / NetworkAPI の実装
   connector.go    設定、機能一覧、起動
   login.go        OAuth + PKCE の login flow
-  client.go       接続、切断、token の更新
+  client.go       接続、切断、WebSocket の維持
   sync.go         購読 → portal、未読の同期、DM 一覧
   handle_traq.go  traQ の event → bridgev2 の remote event
   handle_matrix.go Matrix の message / edit / redaction / reaction / read receipt → traQ
@@ -63,7 +65,7 @@ pkg/connector/                   bridgev2 の NetworkConnector / NetworkAPI の�
   backfill.go     過去ログ
   commands.go     search command
   ids.go          networkid と traQ の ID の対応
-pkg/traq/       REST (go-traq)、WebSocket client、OAuth (PKCE) helper
+pkg/traq/       REST client、WebSocket client、OAuth (PKCE) helper
 pkg/msgconv/    traQ の Markdown・埋め込み ↔ Matrix の本文 (副作用の無い関数)
 pkg/stampconv/  スタンプ ↔ reaction の key (副作用の無い関数)
 testenv/        結合テスト用の traQ (compose.yaml)
@@ -104,21 +106,22 @@ network:
 
 ## login (OAuth 2.0 authorization code + PKCE)
 
-traQ は redirect 先が http(s) 以外なら PKCE (S256) を必須とし、`/oauth2/token` は refresh token を返す。
+traQ は redirect 先が http(s) 以外なら PKCE (S256) を必須とする。token endpoint は access token だけを返し
+(有効期間 `expires_in: 31536000` = 1 年)、refresh token は返さない (traQ 3.32.1 で確認)。
 
 1. login flow `oauth` を始めると、bridge は `code_verifier` と `state` を作り、
    `<server_url>/api/v3/oauth2/authorize?response_type=code&client_id=…&redirect_uri=…&scope=read+write&state=…&code_challenge=…&code_challenge_method=S256`
    を `user_input` step の説明に出す。入力欄は「承認後に開いた URL」1 つ。
 2. user がブラウザで承認すると `redirect_uri` に飛ばされる (ページは開けない)。その URL を bot に貼り返す。
-3. bridge は `state` を照合し、`code` と `code_verifier` で `/oauth2/token` を叩いて access token と
-   refresh token を得る。`/users/me` で自分の user を引き、`UserLoginID` にする。
+3. bridge は `state` を照合し、`code` と `code_verifier` で `/oauth2/token` を叩いて access token を得る。
+   `/users/me` で自分の user を引き、`UserLoginID` にする。
 4. token は `UserLogin` の metadata (bridge の database) にだけ置く。log に出さない。
 
 `code_verifier` は login 処理の memory にだけあり、外に出ない。貼り返す URL の `code` は verifier 無しでは
 token に換えられないので、provisioning API が homeserver などの中継 (Beeper なら hungryserv) を通っても token は漏れない。
 
-token は期限の 1 日前と、REST が 401 を返したときに refresh する。refresh が失敗したら bridge state を
-`BAD_CREDENTIALS` にし、user に再 login を求める。logout では `/oauth2/revoke` で token を無効にする。
+token が期限切れになるか、REST / WebSocket が 401 を返したら、bridge state を `BAD_CREDENTIALS` にして user に
+再 login を求める。logout では `/oauth2/revoke` で token を無効にする。
 
 ## 受信
 
@@ -127,13 +130,15 @@ traQ の WebSocket は event ごとに届く相手が違う。
 | event | 届く相手 |
 |---|---|
 | `MESSAGE_CREATED` | そのチャンネルを閲覧中の session、通知を付けている人、メンションされた人。`timeline_streaming:on` で全 public チャンネル分 |
-| `MESSAGE_UPDATED` / `DELETED` / `STAMPED` / `UNSTAMPED` | そのチャンネルを閲覧中の session だけ |
+| `MESSAGE_UPDATED` / `DELETED` | 仕様上は閲覧中の session だけ。**実測 (3.32.1) では `timeline_streaming:on` で public チャンネルの分も届く。DM の分は届かない** |
+| `MESSAGE_STAMPED` / `UNSTAMPED` | 閲覧中の session だけ (実測でも、public チャンネル・DM とも viewstate が要る) |
 | `MESSAGE_READ` | 自分 |
 
 閲覧中のチャンネルは `viewstate:<channel>:<state>` で 1 session に 1 つだけ指定できる。traQ の通常チャンネルは
 すべて public で、private なのは DM だけ。これに合わせて次のように受信する。
 
-- **WebSocket を 1 本**張り、接続直後に `timeline_streaming:on` を送る。新着はこれと DM で全部届く。
+- **WebSocket を 1 本**張り、接続直後に `timeline_streaming:on` を送る。新着は全部、public チャンネルの編集・削除も
+  これで届く。
   event は ID しか持たないので、本文などは REST で取る。
 - **今読んでいるチャンネル**: Matrix で read receipt (または message の送信) があった room のチャンネルに
   `viewstate:<channel>:monitoring` を送る。そのチャンネルの編集・削除・スタンプは WebSocket で届く。
@@ -187,7 +192,7 @@ traQ の WebSocket は event ごとに届く相手が違う。
 
 ### 引用
 
-- **traQ → Matrix**: 本文中の `<server_url>/messages/<uuid>` について、
+- **traQ → Matrix**: 本文中の `<server_url>/messages/<uuid>` と `!{"type":"message",...,"id":"<uuid>"}` について、
   - 同じチャンネルで portal に bridge 済みの message への最初の引用 → Matrix の reply relation にし、本文からその URL を消す。
   - それ以外 → bridge 済みならその Matrix event への link (matrix.to)、未 bridge なら traQ の URL のまま。
 - **Matrix → traQ**: reply の相手が bridge 済みの traQ message なら、その URL を本文の先頭行に付ける。
@@ -216,7 +221,7 @@ traQ の WebSocket は event ごとに届く相手が違う。
 
 ### ファイル
 
-- 本文中の `<server_url>/files/<uuid>` を見つけたら `/files/{id}/meta` と `/files/{id}` を認証付きで取り、
+- 本文中の `<server_url>/files/<uuid>` と `!{"type":"file",...,"id":"<uuid>"}` を見つけたら `/files/{id}/meta` と `/files/{id}` を認証付きで取り、
   画像は `m.image`、それ以外は `m.file` として本文とは別の part で送る。本文からその URL を消す。
   bridgev2 の最大 file size を超えるものは、traQ の URL を残して上げない。
 - Matrix からのファイル (`m.image` などの msgtype) は送らずに error を返す。
@@ -246,7 +251,7 @@ traQ の WebSocket は event ごとに届く相手が違う。
 
 ## 失敗時の扱い
 
-- REST の 401: token を refresh して 1 回だけやり直す。だめなら `BAD_CREDENTIALS`。
+- REST / WebSocket の 401: `BAD_CREDENTIALS` にし、再 login を求める。
 - REST の 429 / 5xx: `Retry-After` か backoff で待ってやり直す。Matrix からの送信が失敗したら message status で返す。
 - WebSocket の切断: bridge state を `TRANSIENT_DISCONNECT` にし、繋ぎ直したら「受信」の再接続の手順で取りこぼしを拾う。
 - poller の失敗: log に残し、次の間隔でやり直す。
@@ -260,7 +265,7 @@ traQ の WebSocket は event ごとに届く相手が違う。
 2. **結合テスト** (`go test -tags integration ./pkg/traq/...`): `testenv/compose.yaml` で
    `ghcr.io/traptitech/traq:3.32.1`、MariaDB、Elasticsearch を立てる。テストの中で管理者 (`traq`/`traq`) で
    login し、OAuth client を作り、PKCE で認可して token に換える。その token で投稿・編集・削除、stamp、
-   `timeline_streaming` と `viewstate` の event、既読、検索、token の refresh を確かめる。
+   `timeline_streaming` と `viewstate` で届く event (「受信」の表の実測どおりであること)、既読、検索を確かめる。
 3. **通しの確認** (手動): 実際の traQ と homeserver に繋ぎ、Matrix client から「目的」の操作一式を試す。
 
 CI (GitHub Actions) は PR ごとに `go vet`、単体テスト、結合テスト (compose) を回す。
