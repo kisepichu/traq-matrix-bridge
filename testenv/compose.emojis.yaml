@@ -1,0 +1,6 @@
+# Override for `TRAQ_INIT_EMOJIS=1 testenv/dev.sh up`: traQ installs the Unicode stamps (twemoji, downloaded from
+# GitHub) when it initializes a fresh database, before it starts serving. That takes minutes. Integration tests and CI
+# do not use this file.
+services:
+  traq:
+    command: ["serve", "--dev"]

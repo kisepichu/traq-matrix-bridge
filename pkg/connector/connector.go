@@ -2,39 +2,61 @@ package connector
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 
 	"go.mau.fi/util/configupgrade"
+	"go.mau.fi/util/dbutil"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 
+	"github.com/kisepichu/traq-matrix-bridge/pkg/connector/stampdb"
 	"github.com/kisepichu/traq-matrix-bridge/pkg/stampconv"
-	"github.com/kisepichu/traq-matrix-bridge/pkg/traq"
 )
 
-// TraQConnector implements bridgev2.NetworkConnector (+ ConfigValidatingNetwork, MaxFileSizeingNetwork).
+// TraQConnector implements bridgev2.NetworkConnector (+ ConfigValidatingNetwork, MaxFileSizeingNetwork,
+// StoppableNetwork).
 type TraQConnector struct {
 	Bridge *bridgev2.Bridge
 	Config NetworkConfig
-	// Stamps holds every stamp of the server. Start creates it empty; the first login to connect fills it.
+	// Stamps holds every stamp of the server. Start loads it from stampDB; the stamp sync job (stamps.go) and
+	// the STAMP_* events keep both up to date.
 	Stamps *stampconv.Table
 
-	stampsLoaded atomic.Bool
-	uploadLimit  atomic.Int64 // the homeserver's upload limit; 0 until SetMaxFileSize
+	stampDB     *stampdb.Store
+	stampSync   stampSync
+	uploadLimit atomic.Int64 // the homeserver's upload limit; 0 until SetMaxFileSize
 }
 
 var (
 	_ bridgev2.NetworkConnector        = (*TraQConnector)(nil)
 	_ bridgev2.ConfigValidatingNetwork = (*TraQConnector)(nil)
 	_ bridgev2.MaxFileSizeingNetwork   = (*TraQConnector)(nil)
+	_ bridgev2.StoppableNetwork        = (*TraQConnector)(nil)
 )
 
 func (c *TraQConnector) Init(br *bridgev2.Bridge) {
 	c.Bridge = br
 }
 
+// Start upgrades the connector's tables (bridgev2 has upgraded its own just before) and loads the stamp table.
 func (c *TraQConnector) Start(ctx context.Context) error {
-	c.Stamps = stampconv.NewTable(nil, false)
+	db := c.Bridge.DB.Database.Child(stampdb.VersionTableName, stampdb.UpgradeTable,
+		dbutil.ZeroLogger(c.Bridge.Log.With().Str("db_section", "traq").Logger()))
+	if err := db.Upgrade(ctx); err != nil {
+		return bridgev2.DBUpgradeError{Section: "traq", Err: err}
+	}
+	c.stampDB = stampdb.New(db)
+	stamps, err := c.stampDB.All(ctx)
+	if err != nil {
+		return fmt.Errorf("load the stamp table: %w", err)
+	}
+	complete, err := c.stampDB.Complete(ctx)
+	if err != nil {
+		return fmt.Errorf("load the stamp table: %w", err)
+	}
+	c.Stamps = stampconv.NewTable(stamps, complete)
+	c.Bridge.Log.Info().Int("stamps", len(stamps)).Bool("complete", complete).Msg("Loaded the stamp table")
 	return nil
 }
 
@@ -53,23 +75,6 @@ func (c *TraQConnector) maxFileSize() int64 {
 		return size
 	}
 	return defaultMaxFileSize
-}
-
-// loadStamps fills Stamps from Stamps() once per process; later changes arrive as STAMP_* events.
-// Concurrent first calls may both load, which is harmless.
-func (c *TraQConnector) loadStamps(ctx context.Context, api *traq.Client) error {
-	if c.stampsLoaded.Load() {
-		return nil
-	}
-	stamps, err := api.Stamps(ctx)
-	if err != nil {
-		return err
-	}
-	for i := range stamps {
-		c.Stamps.Put(stampFromTraQ(&stamps[i]))
-	}
-	c.stampsLoaded.Store(true)
-	return nil
 }
 
 // GetName is called before the config is loaded, so it must not read c.Config.

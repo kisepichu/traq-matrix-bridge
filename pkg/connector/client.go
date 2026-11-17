@@ -144,6 +144,7 @@ func (c *TraQClient) Connect(ctx context.Context) {
 	go func() {
 		defer close(s.done)
 		defer cancel()
+		defer c.Main.stampClientGone(c)
 		c.run(runCtx)
 	}()
 }
@@ -221,9 +222,6 @@ func (c *TraQClient) loadOnce(ctx context.Context) (*traq.Me, map[string]channel
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("get unread channels: %w", err)
 	}
-	if err := c.Main.loadStamps(ctx, c.API); err != nil {
-		return nil, nil, nil, fmt.Errorf("get stamps: %w", err)
-	}
 	tree := buildChannelTree(list)
 	targets := subscriptionSnapshot(tree, subs)
 	c.users.setAll(users)
@@ -284,6 +282,7 @@ func (c *TraQClient) websocketLoop(ctx context.Context, stop context.CancelCause
 		if err == nil {
 			c.Login.Log.Info().Msg("Connected to the traQ WebSocket")
 			c.Login.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
+			c.Main.stampClientConnected(c)
 			if !lostAt.IsZero() {
 				c.catchUp(ctx, lostAt.Add(-catchUpMargin))
 			}

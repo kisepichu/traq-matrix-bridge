@@ -3,7 +3,6 @@ package connector
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"time"
 	"unicode/utf8"
 
@@ -96,7 +95,7 @@ func (c *TraQClient) handleEvent(ctx context.Context, w *workerState, evt traq.E
 	case "STAMP_CREATED", "STAMP_UPDATED":
 		err = c.handleStampUpdated(ctx, evt)
 	case "STAMP_DELETED":
-		err = c.handleStampDeleted(evt)
+		err = c.handleStampDeleted(ctx, evt)
 	default:
 		log.Debug().Msg("Ignoring traQ event")
 		return
@@ -406,23 +405,13 @@ func (c *TraQClient) handleStampUpdated(ctx context.Context, evt traq.Event) err
 	if err != nil {
 		return err
 	}
-	st, err := c.API.Stamp(ctx, body.ID)
-	if traq.IsStatus(err, http.StatusNotFound) {
-		c.Main.Stamps.Delete(body.ID)
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("get stamp %s: %w", body.ID, err)
-	}
-	c.Main.Stamps.Put(stampFromTraQ(st))
-	return nil
+	return c.Main.refreshStamp(ctx, c.API, body.ID)
 }
 
-func (c *TraQClient) handleStampDeleted(evt traq.Event) error {
+func (c *TraQClient) handleStampDeleted(ctx context.Context, evt traq.Event) error {
 	body, err := decodeEvent[traq.IDEvent](evt)
 	if err != nil {
 		return err
 	}
-	c.Main.Stamps.Delete(body.ID)
-	return nil
+	return c.Main.deleteStamp(ctx, body.ID)
 }
