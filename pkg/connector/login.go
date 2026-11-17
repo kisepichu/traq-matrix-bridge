@@ -139,7 +139,7 @@ func loginError(msg string) error {
 }
 
 func (c *TraQConnector) LoadUserLogin(_ context.Context, login *bridgev2.UserLogin) error {
-	client := &TraQClient{Main: c, Login: login}
+	client := &TraQClient{Main: c, Login: login, users: newUserCache()}
 	if meta, _ := login.Metadata.(*UserLoginMetadata); meta != nil && meta.AccessToken != "" {
 		api, err := traq.NewClient(c.Config.ServerURL, httpClient, meta.AccessToken, userAgent)
 		if err != nil {
