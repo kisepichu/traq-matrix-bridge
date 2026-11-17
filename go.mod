@@ -3,6 +3,7 @@ module github.com/kisepichu/traq-matrix-bridge
 go 1.26.0
 
 require (
+	github.com/coder/websocket v1.8.15
 	github.com/yuin/goldmark v1.8.7
 	go.mau.fi/util v0.11.1
 	gopkg.in/yaml.v3 v3.0.1
@@ -11,7 +12,6 @@ require (
 
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
-	github.com/coder/websocket v1.8.15 // indirect
 	github.com/coreos/go-systemd/v22 v22.7.0 // indirect
 	github.com/lib/pq v1.12.3 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
