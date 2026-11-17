@@ -32,3 +32,12 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Bridge runtime files
+/result
+/config.yaml
+/registration.yaml
+*.db
+*.db-*
+/logs/
+/.superpowers/

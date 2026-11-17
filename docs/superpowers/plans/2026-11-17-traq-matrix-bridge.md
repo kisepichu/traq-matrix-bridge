@@ -85,7 +85,7 @@ func (c *NetworkConfig) Validate() error // server_url: absolute http(s) URL wit
 - Go は mautrix-go v0.33.0 の要求 (1.26 以上) に合わせ、`go.mod` を `go 1.26` にする。
 - `flake.nix`: input は `nixpkgs` (nixos-unstable) だけ。`packages.x86_64-linux.default` / `aarch64-linux` / `x86_64-darwin` / `aarch64-darwin` を `buildGoModule` で作る (`subPackages = [ "cmd/traq-matrix-bridge" ]`、`buildInputs = [ olm ]`、`ldflags` に `-X main.Tag=v${version}` など)。olm は nixpkgs で insecure なので、`import nixpkgs { inherit system; config.permittedInsecurePackages = [ "olm-3.2.16" ]; }` で読む。`devShells.default` に go、gopls、olm、pkg-config。`checks` に package。
 - CI (`.github/workflows/ci.yml`、`pull_request` と `push: main`): job `go` (ubuntu-latest、`actions/setup-go` で `go-version-file: go.mod`、`sudo apt-get install -y libolm-dev`、`go vet ./...`、`go test -race ./...`)、job `goolm` (`go build -tags goolm ./...`、libolm 無し)、job `nix` (`cachix/install-nix-action`、`nix build`、`nix flake check`)。結合テストの job は Task 4 で足す。
-- `.gitignore` に `/result`、`/config.yaml`、`/registration.yaml`、`*.db`、`*.db-*`、`/logs/` を足す。
+- `.gitignore` に `/result`、`/config.yaml`、`/registration.yaml`、`*.db`、`*.db-*`、`/logs/`、`/.superpowers/` を足す。
 
 - [ ] **Step 1: 失敗するテストを書く** (`pkg/connector/config_test.go`)
 
@@ -93,7 +93,6 @@ func (c *NetworkConfig) Validate() error // server_url: absolute http(s) URL wit
 package connector
 
 import (
-	"strings"
 	"testing"
 	"time"
 
@@ -149,7 +148,7 @@ func TestValidate(t *testing.T) {
 func TestServerURLTrailingSlashIsAccepted(t *testing.T) {
 	c := validConfig()
 	c.ServerURL = "https://q.trap.jp/"
-	if err := c.Validate(); err != nil || !strings.HasPrefix(c.ServerURL, "https://") {
+	if err := c.Validate(); err != nil {
 		t.Errorf("trailing slash: %v", err)
 	}
 }
