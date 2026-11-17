@@ -4,6 +4,8 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"iter"
+	"maps"
 	"net/http"
 	"slices"
 	"time"
@@ -60,22 +62,28 @@ func (c *TraQClient) noteActivity(channelID string, t time.Time) {
 
 // loadLastActivity starts the session's last activity map from the newest bridged message of each target.
 func (c *TraQClient) loadLastActivity(ctx context.Context, targets map[string]channelInfo) {
-	activity := make(map[string]time.Time, len(targets))
-	for id, ch := range targets {
+	activity := c.newestBridged(ctx, maps.Values(targets))
+	c.stateMu.Lock()
+	c.lastActivity = activity
+	c.stateMu.Unlock()
+}
+
+// newestBridged returns the time of the newest bridged message of each channel that has one, by channel ID.
+func (c *TraQClient) newestBridged(ctx context.Context, channels iter.Seq[channelInfo]) map[string]time.Time {
+	activity := make(map[string]time.Time)
+	for ch := range channels {
 		rows, err := c.Login.Bridge.DB.Message.GetLastNInPortal(ctx, c.portalKey(ch), 1)
 		if err != nil {
 			if ctx.Err() == nil {
-				c.Login.Log.Err(err).Str("traq_channel_id", id).Msg("Failed to get the newest bridged message")
+				c.Login.Log.Err(err).Str("traq_channel_id", ch.ID).Msg("Failed to get the newest bridged message")
 			}
 			continue
 		}
 		if len(rows) > 0 {
-			activity[id] = rows[0].Timestamp
+			activity[ch.ID] = rows[0].Timestamp
 		}
 	}
-	c.stateMu.Lock()
-	c.lastActivity = activity
-	c.stateMu.Unlock()
+	return activity
 }
 
 // pollLoop re-reads the recently active channels every poll.interval until ctx ends, to bridge the edits,

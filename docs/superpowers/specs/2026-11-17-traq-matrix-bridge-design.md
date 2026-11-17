@@ -204,9 +204,10 @@ traQ の WebSocket は event ごとに届く相手が違う。
   public チャンネルの portal の半分より多く (かつ 5 件以上) が消える、または購読が 1 件も無いのに public チャンネルの
   portal があるときは、traQ の一時的な異常とみなしてその回は消さず、警告を log に出す。次の読み直しでも同じ portal が
   消えるなら消す。接続時も同じ規則で判断する (比べる相手は、この login の room のある portal)。消さなかった portal は
-  対象のまま残すので、最初の読み直しで同じ portal が消えれば消し、そうでなければ元どおり続ける (接続時の取り込みは
-  しない)。既知の制限: DM の portal はこの規則で数えない。DM だけが消える答え (DM の無いチャンネル一覧など) では
-  DM の portal はそのまま消える (public チャンネルの portal とともに保留になるときだけ残る)。
+  対象のまま残す (poller も見る) ので、次の読み直しで同じ portal が消えれば消し、そうでなければ残して、保留の間に
+  投稿された message を取り込む (traQ の最新が database の最新 message より新しければその後を取り込む。接続時に
+  保留にした portal では停止中の分も)。既知の制限: DM の portal はこの規則で数えない。DM だけが消える答え (DM の無い
+  チャンネル一覧など) では DM の portal はそのまま消える (public チャンネルの portal とともに保留になるときだけ残る)。
 - room 名はフルパス (`#` 無しの `gps/times/kise`)、topic はチャンネルの topic。DM は相手の表示名。
 - ghost の表示名は traQ の `displayName`、アイコンは `/public/icon/{name}` (認証不要)。bot user は表示名に `(bot)` を付ける。
 

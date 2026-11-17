@@ -3,6 +3,7 @@ package connector
 import (
 	"cmp"
 	"context"
+	"maps"
 	"slices"
 	"time"
 
@@ -304,8 +305,8 @@ func (c *TraQClient) hasBridgedMessages(channelID string) bool {
 //
 // The portals are not left when that looks like a bad answer from traQ (see startupRemovals): they are kept
 // in c.targets and in c.heldRemovals, as if the previous subscription sync had held their removals back, so
-// the first subscription sync leaves them if it agrees and keeps them otherwise. They get no resync, so no
-// catch-up either.
+// the first subscription sync leaves them if it agrees, and otherwise keeps them and catches them up (see
+// syncSubscriptions); they get no resync here. Their last activity is loaded, so the poller sees them meanwhile.
 func (c *TraQClient) initialSync(ctx context.Context, l loaded) {
 	log := c.Login.Log
 	targets := l.targets
@@ -379,10 +380,15 @@ func (c *TraQClient) initialSync(ctx context.Context, l loaded) {
 		goneKeys = append(goneKeys, up.Portal)
 	}
 	if held := startupRemovals(kept, gone, l.subscriptions == 0); held != nil {
+		activity := c.newestBridged(ctx, slices.Values(gone))
 		c.stateMu.Lock()
 		for _, ch := range gone {
 			c.targets[ch.ID] = ch
 		}
+		if c.lastActivity == nil {
+			c.lastActivity = make(map[string]time.Time, len(activity))
+		}
+		maps.Copy(c.lastActivity, activity)
 		c.heldRemovals = held
 		c.stateMu.Unlock()
 		log.Warn().Int("portals", len(held)).Int("subscriptions", l.subscriptions).
@@ -418,6 +424,8 @@ func (c *TraQClient) formerTarget(portal *bridgev2.Portal) channelInfo {
 // paced (see resyncPacer); one that cannot be queued is reverted in c.targets, so the next sync emits it again.
 // A new DM gets no room until its first message (see initialSync). Removals that look like a bad answer from
 // traQ are held back (see holdRemovals): those channels stay in c.targets, so the next sync emits them again.
+// The held channels that the sync keeps get a resync with newerMessages, as at startup: a channel held back at
+// startup got no catch-up then (see initialSync).
 // It runs on the subscription sync loop (periodically, and when the event worker sees a channel change);
 // syncMu serializes it with the worker's CHANNEL_CREATED handling.
 func (c *TraQClient) syncSubscriptions(ctx context.Context) error {
@@ -435,6 +443,12 @@ func (c *TraQClient) syncSubscriptions(ctx context.Context) error {
 	snap := subscriptionSnapshot(tree, subs)
 	c.stateMu.Lock()
 	old, prevHeld := c.targets, c.heldRemovals
+	var kept []channelInfo
+	for _, id := range prevHeld {
+		if ch, ok := snap[id]; ok {
+			kept = append(kept, ch)
+		}
+	}
 	changes, held := holdRemovals(old, portalDiff(old, snap), len(subs) == 0, prevHeld)
 	for _, id := range held {
 		snap[id] = old[id]
@@ -447,6 +461,8 @@ func (c *TraQClient) syncSubscriptions(ctx context.Context) error {
 			Msg("Not leaving the portals of many channels at once until the next subscription sync agrees")
 	case len(prevHeld) > 0 && slices.Equal(removedIDs(changes), prevHeld):
 		c.Login.Log.Info().Int("portals", len(prevHeld)).Msg("Leaving the portals held back by the previous subscription sync")
+	case len(kept) > 0:
+		c.Login.Log.Info().Int("portals", len(kept)).Msg("Catching up the portals kept after their removal was held back")
 	}
 
 	for _, change := range changes {
@@ -464,6 +480,13 @@ func (c *TraQClient) syncSubscriptions(ctx context.Context) error {
 		case changeRemove:
 			c.queueLeave(c.portalKey(ch))
 		}
+	}
+	// Added after the upserts, so a merged resync keeps the upsert's revert.
+	for _, ch := range kept {
+		if ch.isDM() && !c.hasRoom(ctx, c.portalKey(ch)) {
+			continue
+		}
+		c.addResync(ctx, pendingResync{ch: ch, needsBackfill: c.newerMessages(ch.ID)})
 	}
 	return nil
 }
