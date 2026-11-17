@@ -151,12 +151,12 @@ func (c *TraQClient) handleMessageCreated(ctx context.Context, w *workerState, e
 	if err != nil {
 		return fmt.Errorf("get message %s: %w", body.ID, err)
 	}
-	c.noteMessageAt(msg.CreatedAt)
 	key, ok := c.portalKeyFor(msg.ChannelID)
 	if !ok {
 		zerolog.Ctx(ctx).Debug().Str("traq_channel_id", msg.ChannelID).Msg("Ignoring message in a channel without a portal")
 		return nil
 	}
+	c.noteActivity(msg.ChannelID, msg.CreatedAt)
 	c.queue(&simplevent.Message[*traq.Message]{
 		EventMeta: simplevent.EventMeta{
 			Type:       bridgev2.RemoteEventMessage,
@@ -175,15 +175,6 @@ func (c *TraQClient) handleMessageCreated(ctx context.Context, w *workerState, e
 	return nil
 }
 
-// noteMessageAt records the newest message time seen, where a catch-up after a reconnect can start.
-func (c *TraQClient) noteMessageAt(t time.Time) {
-	c.stateMu.Lock()
-	defer c.stateMu.Unlock()
-	if t.After(c.lastMessageAt) {
-		c.lastMessageAt = t
-	}
-}
-
 func (c *TraQClient) handleMessageUpdated(ctx context.Context, evt traq.Event) error {
 	body, err := decodeEvent[traq.IDEvent](evt)
 	if err != nil {
@@ -197,6 +188,13 @@ func (c *TraQClient) handleMessageUpdated(ctx context.Context, evt traq.Event) e
 	if !ok {
 		return nil
 	}
+	c.queueEdit(key, msg)
+	return nil
+}
+
+// queueEdit queues the edit of a bridged message to its content in msg. convertEdit ignores content that
+// the message was already bridged from.
+func (c *TraQClient) queueEdit(key networkid.PortalKey, msg *traq.Message) {
 	c.queue(&simplevent.Message[*traq.Message]{
 		EventMeta: simplevent.EventMeta{
 			Type:       bridgev2.RemoteEventEdit,
@@ -209,7 +207,19 @@ func (c *TraQClient) handleMessageUpdated(ctx context.Context, evt traq.Event) e
 		TargetMessage:   MessageID(msg.ID),
 		ConvertEditFunc: c.convertEdit,
 	})
-	return nil
+}
+
+// queueRemove queues the removal of a bridged message posted by userID.
+func (c *TraQClient) queueRemove(key networkid.PortalKey, messageID, userID string) {
+	c.queue(&simplevent.MessageRemove{
+		EventMeta: simplevent.EventMeta{
+			Type:       bridgev2.RemoteEventMessageRemove,
+			LogContext: func(lc zerolog.Context) zerolog.Context { return lc.Str("traq_message_id", messageID) },
+			PortalKey:  key,
+			Sender:     c.sender(userID),
+		},
+		TargetMessage: MessageID(messageID),
+	})
 }
 
 // messageTarget is where the remote events about a bridged message go.
@@ -246,15 +256,7 @@ func (c *TraQClient) handleMessageDeleted(ctx context.Context, w *workerState, e
 	if err != nil || !ok {
 		return err
 	}
-	c.queue(&simplevent.MessageRemove{
-		EventMeta: simplevent.EventMeta{
-			Type:       bridgev2.RemoteEventMessageRemove,
-			LogContext: func(lc zerolog.Context) zerolog.Context { return lc.Str("traq_message_id", body.ID) },
-			PortalKey:  target.portal,
-			Sender:     c.sender(target.userID),
-		},
-		TargetMessage: MessageID(body.ID),
-	})
+	c.queueRemove(target.portal, body.ID, target.userID)
 	return nil
 }
 

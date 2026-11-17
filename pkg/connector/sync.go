@@ -121,8 +121,9 @@ func (c *TraQClient) queue(evt bridgev2.RemoteEvent) bool {
 }
 
 // queueResync queues the ChatResync that creates the portal of ch or updates its info, and reports whether
-// it was queued. Every portal resync is built here.
-func (c *TraQClient) queueResync(ctx context.Context, ch channelInfo) bool {
+// it was queued. Every portal resync is built here. A non-nil needsBackfill makes bridgev2 check, on an
+// existing room, whether to fetch the messages after the newest bridged one (see newerMessages).
+func (c *TraQClient) queueResync(ctx context.Context, ch channelInfo, needsBackfill backfillCheck) bool {
 	info, err := c.chatInfo(ctx, ch)
 	if err != nil {
 		c.Login.Log.Err(err).Str("traq_channel_id", ch.ID).Msg("Failed to build chat info")
@@ -135,7 +136,8 @@ func (c *TraQClient) queueResync(ctx context.Context, ch channelInfo) bool {
 			PortalKey:    c.portalKey(ch),
 			CreatePortal: true,
 		},
-		ChatInfo: info,
+		ChatInfo:               info,
+		CheckNeedsBackfillFunc: needsBackfill,
 	})
 }
 
@@ -156,6 +158,10 @@ func (c *TraQClient) queueLeave(key networkid.PortalKey) {
 // have no unread messages as read. Each portal's event loop is serial, so the receipt is handled after the
 // resync. Targets whose resync could not be queued are dropped from c.targets, so the next subscription sync
 // retries them.
+//
+// The resyncs of the channels that may have messages posted while the bridge was not running (see
+// catchUpChannels) carry newerMessages, so bridgev2 fetches those messages into existing rooms. They are
+// queued before the WebSocket is read, so each portal handles its catch-up before any live message.
 func (c *TraQClient) initialSync(ctx context.Context, me *traq.Me, targets map[string]channelInfo, unread []traq.UnreadChannel) {
 	log := c.Login.Log
 	ids := make([]string, 0, len(targets))
@@ -163,12 +169,17 @@ func (c *TraQClient) initialSync(ctx context.Context, me *traq.Me, targets map[s
 		ids = append(ids, id)
 	}
 	slices.Sort(ids)
+	catchUp := c.catchUpCandidates(ctx, unread, time.Time{})
 	keys := make(map[networkid.PortalKey]struct{}, len(ids))
 	var failed []channelInfo
 	for _, id := range ids {
 		ch := targets[id]
 		keys[c.portalKey(ch)] = struct{}{}
-		if !c.queueResync(ctx, ch) {
+		var needsBackfill backfillCheck
+		if _, ok := catchUp[id]; ok {
+			needsBackfill = c.newerMessages(id)
+		}
+		if !c.queueResync(ctx, ch, needsBackfill) {
 			failed = append(failed, ch)
 		}
 	}
@@ -243,7 +254,7 @@ func (c *TraQClient) syncSubscriptions(ctx context.Context) error {
 	for _, change := range portalDiff(old, snap) {
 		switch change.Kind {
 		case changeUpsert:
-			if !c.queueResync(ctx, change.Channel) {
+			if !c.queueResync(ctx, change.Channel, nil) {
 				failed = append(failed, change.Channel)
 			}
 		case changeRemove:

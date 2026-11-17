@@ -1685,14 +1685,14 @@ func pollCandidates(lastActivity map[string]time.Time, viewed string, now time.T
 決まり:
 
 - 最終書き込み時刻の map (`channelID → time`): `Connect` のとき各 portal の `br.DB.Message.GetLastNInPortal(ctx, key, 1)` の Timestamp で初期化し、`MESSAGE_CREATED` と poller・catch-up で取り込んだ message で更新する。
-- poller は `poll.interval` ごとに `pollCandidates` の各チャンネルについて `Messages(Limit: poll.depth, Order: desc)` を読み、database から `known` を作る: `GetLastNInPortal(key, poll.depth*4)` を message ID でまとめ (file の part があるので)、本文の part の `ContentHash`、`br.DB.Reaction.GetAllToMessage` の (sender, emoji) の組。
+- poller は `poll.interval` ごとに `pollCandidates` の各チャンネルについて `Messages(Limit: poll.depth, Order: desc)` を読み、database から `known` を作る: `GetLastNInPortal(key, poll.depth*4)` を message ID でまとめ (file の part があるので)、本文の part の `ContentHash`、`br.DB.Reaction.GetAllToMessage` の (sender, emoji) の組。`GetLastNInPortal` は `Messages` より先に読む (known の message はどれも取る時点で traQ にあったので、取れた最古より新しいのに無ければ消えている。チャンネルの最新の message の削除もこれで拾う)。
 - 差分の出し方: `Edited` → `RemoteEventEdit` (Task 10 と同じ `convertEdit`)、`Deleted` → `MessageRemove`、`ReactionChanged` → `simplevent.ReactionSync{Reactions: {Users: 全 user 分, HasAllUsers: true}}` (bridgev2 が足し引きを計算する)。
 - 1 回の poll の中で、チャンネルごとの失敗は log に残して次のチャンネルへ。REST の負荷を抑えるため、チャンネルの間で 200ms 空ける。
 - 再接続の catch-up (`catchup.go`): 切断時刻を覚えておき、繋がったら `Unread` のチャンネル、`ActivityTimeline(perChannel: true)` のチャンネル、全 DM のうち portal のあるものに `ChatResync{CheckNeedsBackfillFunc}` を queue する。`CheckNeedsBackfillFunc` は `Messages(Limit: 1, Order: desc)` の最新が database の最新 (`latestMessage`) より新しいかを返す (true なら bridgev2 が `FetchMessages` の forward で `max_catchup_messages` まで取り込む。Task 13)。
 - 初回の `Connect` (bridge が止まっていた間の分): 新しく queue を作らず、Task 9 の手順 3 で queue する `ChatResync` のうち、上の候補 (Unread・activity timeline・DM) に当たるものに同じ `CheckNeedsBackfillFunc` を付ける。
 
 - [ ] **Step 1: 失敗するテストを書く**
-  - `pollerdiff_test.go` (table test): 変化なし → 空。本文の hash が違う → Edited。範囲内で消えた → Deleted。範囲より古い known → Deleted にしない。範囲より新しい known (取った後に来た) → Deleted にしない。stamp の組が増えた / 減った → ReactionChanged。count だけ増えた → 変化なし。fetched が空 → 空。known に無い fetched (poller の前に未 bridge) → 何も出さない (新着は WebSocket と catch-up の担当)。
+  - `pollerdiff_test.go` (table test): 変化なし → 空。本文の hash が違う → Edited。範囲内で消えた → Deleted。範囲より古い known → Deleted にしない。取れた最新より新しい known (取る前に読んだので、消えた最新の message) → Deleted。stamp の組が増えた / 減った → ReactionChanged。count だけ増えた → 変化なし。fetched が空 → 空。known に無い fetched (poller の前に未 bridge) → 何も出さない (新着は WebSocket と catch-up の担当)。
   - `poller_test.go`: window 外を除く、viewed を除く、新しい順、max で切る、同時刻の順は channel ID の順 (安定)。
 - [ ] **Step 2: 失敗を確かめる** — `go test ./pkg/connector/ -run 'Diff|Candidates'` → FAIL
 - [ ] **Step 3: 実装する**

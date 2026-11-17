@@ -149,7 +149,8 @@ traQ の WebSocket は event ごとに届く相手が違う。
   `/channels/{id}/messages?limit=<poll.depth>` を読む。DM もこれで対象になる。取れたメッセージと database の
   状態を比べて、次の remote event を出す。
   - 本文か `updatedAt` が変わった → 編集
-  - database にあり、取れた範囲 (最古〜最新) の中なのに無い → 削除
+  - database にある (取る前に読む) のに、取れた最古より新しいのに無い → 削除 (取る前から traQ にあった
+    message なので、取れた最新より新しいもの、つまりチャンネルの最新の message の削除も拾う)
   - stamp の (user, stamp) の組が増えた・減った → reaction の追加・削除
   
   `/activity/timeline` は候補選びに使わない。`limit` が最大 50 で、public チャンネルしか返さない (DM が漏れる) ため。
