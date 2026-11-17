@@ -99,3 +99,79 @@ func TestRevertFailedUpserts(t *testing.T) {
 		})
 	}
 }
+
+// A snapshot that would remove many public portals at once, or that has no subscriptions while public portals
+// exist, is more likely a bad answer from traQ than the user's doing: its removals are held back, and applied
+// only when the next snapshot removes the same portals.
+func TestHoldRemovals(t *testing.T) {
+	pub := func(id string) channelInfo { return channelInfo{ID: id, Path: "p/" + id, Level: 1} }
+	dm := func(id string) channelInfo { return channelInfo{ID: id, DMUserID: "user-" + id, Level: dmLevel} }
+	snap := func(chs ...channelInfo) map[string]channelInfo {
+		m := make(map[string]channelInfo, len(chs))
+		for _, ch := range chs {
+			m[ch.ID] = ch
+		}
+		return m
+	}
+	pubs := func(ids ...string) []channelInfo {
+		var chs []channelInfo
+		for _, id := range ids {
+			chs = append(chs, pub(id))
+		}
+		return chs
+	}
+	ten := snap(pubs("a", "b", "c", "d", "e", "f", "g", "h", "i", "j")...)
+	upsert := func(ch channelInfo) portalChange { return portalChange{Channel: ch, Kind: changeUpsert} }
+	removals := func(ids ...string) []portalChange {
+		var cs []portalChange
+		for _, id := range ids {
+			cs = append(cs, portalChange{Channel: pub(id), Kind: changeRemove})
+		}
+		return cs
+	}
+
+	for name, tc := range map[string]struct {
+		old       map[string]channelInfo
+		changes   []portalChange
+		noSubs    bool
+		held      []string
+		wantApply []portalChange
+		wantHeld  []string
+	}{
+		"a few removals": {ten, removals("a", "b"), false, nil, removals("a", "b"), nil},
+		"exactly half":   {ten, removals("a", "b", "c", "d", "e"), false, nil, removals("a", "b", "c", "d", "e"), nil},
+		"more than half": {
+			ten, append([]portalChange{upsert(pub("new"))}, removals("a", "b", "c", "d", "e", "f")...), false, nil,
+			[]portalChange{upsert(pub("new"))}, []string{"a", "b", "c", "d", "e", "f"},
+		},
+		"more than half again": {
+			ten, removals("a", "b", "c", "d", "e", "f"), false, []string{"a", "b", "c", "d", "e", "f"},
+			removals("a", "b", "c", "d", "e", "f"), nil,
+		},
+		"more than half, but other ones than before": {
+			ten, removals("a", "b", "c", "d", "e", "g"), false, []string{"a", "b", "c", "d", "e", "f"},
+			nil, []string{"a", "b", "c", "d", "e", "g"},
+		},
+		"all of fewer than the minimum": {snap(pubs("a", "b", "c", "d")...), removals("a", "b", "c", "d"), false, nil, removals("a", "b", "c", "d"), nil},
+		"no subscriptions":              {snap(pubs("a", "b")...), removals("a", "b"), true, nil, nil, []string{"a", "b"}},
+		"no subscriptions again":        {snap(pubs("a", "b")...), removals("a", "b"), true, []string{"a", "b"}, removals("a", "b"), nil},
+		"no subscriptions and no public portals": {
+			snap(dm("d")), nil, true, nil, nil, nil,
+		},
+		"DMs do not count": {
+			snap(append(pubs("a"), dm("d1"), dm("d2"), dm("d3"), dm("d4"), dm("d5"), dm("d6"))...),
+			[]portalChange{{Channel: dm("d1"), Kind: changeRemove}, {Channel: dm("d2"), Kind: changeRemove}, {Channel: dm("d3"), Kind: changeRemove}, {Channel: dm("d4"), Kind: changeRemove}, {Channel: dm("d5"), Kind: changeRemove}},
+			false, nil,
+			[]portalChange{{Channel: dm("d1"), Kind: changeRemove}, {Channel: dm("d2"), Kind: changeRemove}, {Channel: dm("d3"), Kind: changeRemove}, {Channel: dm("d4"), Kind: changeRemove}, {Channel: dm("d5"), Kind: changeRemove}},
+			nil,
+		},
+		"held removals no longer wanted": {ten, nil, false, []string{"a", "b", "c", "d", "e", "f"}, nil, nil},
+	} {
+		t.Run(name, func(t *testing.T) {
+			apply, held := holdRemovals(tc.old, tc.changes, tc.noSubs, tc.held)
+			if !reflect.DeepEqual(apply, tc.wantApply) || !reflect.DeepEqual(held, tc.wantHeld) {
+				t.Errorf("holdRemovals = %+v, held %v; want %+v, held %v", apply, held, tc.wantApply, tc.wantHeld)
+			}
+		})
+	}
+}

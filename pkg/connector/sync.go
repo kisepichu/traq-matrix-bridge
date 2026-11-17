@@ -51,6 +51,46 @@ func portalDiff(old, new map[string]channelInfo) []portalChange {
 	return changes
 }
 
+// massRemovalMin is the least number of public portals whose removal by one snapshot can be held back (see
+// holdRemovals).
+const massRemovalMin = 5
+
+// holdRemovals guards against a bad answer from traQ, which would make the next sync leave, and so delete,
+// the rooms of many channels: a snapshot is suspect when it removes more than half of the public portals in
+// old and at least massRemovalMin of them, or when it has no subscription at all (noSubscriptions) and removes
+// public portals. The removals of a suspect snapshot are held back: apply is changes without them, and
+// nowHeld their channel IDs. They are applied when the next snapshot removes the same portals (held, the IDs
+// the previous sync held back), so a real change waits for one more sync. DMs do not count, but are held back
+// with the rest.
+func holdRemovals(old map[string]channelInfo, changes []portalChange, noSubscriptions bool, held []string) (apply []portalChange, nowHeld []string) {
+	public, removedPublic := 0, 0
+	for _, ch := range old {
+		if ch.isTarget() && !ch.isDM() {
+			public++
+		}
+	}
+	var removed []string
+	for _, change := range changes {
+		if change.Kind != changeRemove {
+			continue
+		}
+		removed = append(removed, change.Channel.ID)
+		if !change.Channel.isDM() {
+			removedPublic++
+		}
+	}
+	suspect := removedPublic > 0 && (noSubscriptions || removedPublic*2 > public && removedPublic >= massRemovalMin)
+	if !suspect || slices.Equal(removed, held) {
+		return changes, nil
+	}
+	for _, change := range changes {
+		if change.Kind != changeRemove {
+			apply = append(apply, change)
+		}
+	}
+	return apply, removed
+}
+
 // revertFailedUpserts undoes, in the stored snapshot, the upserts that could not be queued, so that the next
 // portalDiff emits them again: a channel that was in old gets its old entry back, a new one is dropped.
 func revertFailedUpserts(stored, old map[string]channelInfo, failed []channelInfo) {
@@ -237,9 +277,10 @@ func (c *TraQClient) initialSync(ctx context.Context, me *traq.Me, targets map[s
 }
 
 // syncSubscriptions re-reads the channels and subscriptions and queues only what changed. Upserts that could
-// not be queued are reverted in c.targets, so the next sync emits them again. It runs on the subscription
-// sync loop (periodically, and when the event worker sees a channel change); syncMu serializes it with the
-// worker's CHANNEL_CREATED handling.
+// not be queued are reverted in c.targets, so the next sync emits them again. Removals that look like a bad
+// answer from traQ are held back (see holdRemovals): those channels stay in c.targets, so the next sync emits
+// them again. It runs on the subscription sync loop (periodically, and when the event worker sees a channel
+// change); syncMu serializes it with the worker's CHANNEL_CREATED handling.
 func (c *TraQClient) syncSubscriptions(ctx context.Context) error {
 	c.syncMu.Lock()
 	defer c.syncMu.Unlock()
@@ -255,11 +296,19 @@ func (c *TraQClient) syncSubscriptions(ctx context.Context) error {
 	snap := subscriptionSnapshot(tree, subs)
 	c.stateMu.Lock()
 	old := c.targets
-	c.channels, c.targets = tree, snap
+	changes, held := holdRemovals(old, portalDiff(old, snap), len(subs) == 0, c.heldRemovals)
+	for _, id := range held {
+		snap[id] = old[id]
+	}
+	c.channels, c.targets, c.heldRemovals = tree, snap, held
 	c.stateMu.Unlock()
+	if len(held) > 0 {
+		c.Login.Log.Warn().Int("portals", len(held)).Int("subscriptions", len(subs)).
+			Msg("Not leaving the portals of many channels at once until the next subscription sync agrees")
+	}
 
 	var failed []channelInfo
-	for _, change := range portalDiff(old, snap) {
+	for _, change := range changes {
 		switch change.Kind {
 		case changeUpsert:
 			if !c.queueResync(ctx, change.Channel, nil) {

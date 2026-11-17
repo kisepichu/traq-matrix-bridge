@@ -65,6 +65,9 @@ type TraQClient struct {
 	// syncMu serializes the changes of channels and targets that are based on a fresh read from traQ, so an
 	// older read cannot overwrite a newer one.
 	syncMu sync.Mutex
+	// heldRemovals is the channels whose removal the last subscription sync held back (see holdRemovals). It is
+	// written by syncSubscriptions under syncMu, and reset by loadOnce before the session's loops start.
+	heldRemovals []string
 
 	stateMu  sync.RWMutex
 	me       *traq.Me               // nil until Connect has loaded it
@@ -231,7 +234,7 @@ func (c *TraQClient) loadOnce(ctx context.Context) (*traq.Me, map[string]channel
 	targets := subscriptionSnapshot(tree, subs)
 	c.users.setAll(users)
 	c.stateMu.Lock()
-	c.me, c.channels, c.targets = me, tree, targets
+	c.me, c.channels, c.targets, c.heldRemovals = me, tree, targets, nil
 	c.stateMu.Unlock()
 	return me, targets, unread, nil
 }
