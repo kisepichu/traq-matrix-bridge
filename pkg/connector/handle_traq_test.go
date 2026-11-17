@@ -158,8 +158,9 @@ func TestChannelEventSyncs(t *testing.T) {
 }
 
 // The worker reads the message of MESSAGE_CREATED and MESSAGE_UPDATED again a few times, a moment apart, when
-// the read fails in a way that may pass (a 5xx or a network error), before it drops the event. A 4xx is final,
-// and a 502 or 504 has already been retried by the traQ client (1 + 3 requests).
+// the read fails in a way that may pass (a 5xx or a connection error), before it drops the event. A 4xx is
+// final, a 502 or 504 has already been retried by the traQ client (1 + 3 requests), and a client timeout is not
+// retried, so a hung traQ does not stall the worker for several timeouts.
 func TestMessageEventRetriesTransientFailures(t *testing.T) {
 	ok := func(w http.ResponseWriter) {
 		_, _ = w.Write([]byte(`{"id":"0193a1b2-0000-7000-8000-000000000001","channelId":"ch-none","content":"hi"}`))
@@ -170,15 +171,17 @@ func TestMessageEventRetriesTransientFailures(t *testing.T) {
 	errNet := errors.New("connection reset by peer")
 	cases := []struct {
 		name      string
-		responses []func(http.ResponseWriter) // nil: a network error
+		responses []func(http.ResponseWriter) // nil: an error, err
+		err       error
 		calls     int
 		dropped   bool
 	}{
-		{"500 then ok", []func(http.ResponseWriter){status(500), status(500), ok}, 3, false},
-		{"network error then ok", []func(http.ResponseWriter){nil, ok}, 2, false},
-		{"503 every time", []func(http.ResponseWriter){status(503), status(503), status(503), status(503)}, messageFetchAttempts, true},
-		{"404", []func(http.ResponseWriter){status(404), ok}, 1, true},
-		{"502 every time", []func(http.ResponseWriter){status(502)}, 4, true},
+		{"500 then ok", []func(http.ResponseWriter){status(500), status(500), ok}, nil, 3, false},
+		{"network error then ok", []func(http.ResponseWriter){nil, ok}, errNet, 2, false},
+		{"timeout", []func(http.ResponseWriter){nil, ok}, timeoutError{}, 1, true},
+		{"503 every time", []func(http.ResponseWriter){status(503), status(503), status(503), status(503)}, nil, messageFetchAttempts, true},
+		{"404", []func(http.ResponseWriter){status(404), ok}, nil, 1, true},
+		{"502 every time", []func(http.ResponseWriter){status(502)}, nil, 4, true},
 	}
 	for _, tc := range cases {
 		for _, typ := range []string{"MESSAGE_CREATED", "MESSAGE_UPDATED"} {
@@ -189,7 +192,7 @@ func TestMessageEventRetriesTransientFailures(t *testing.T) {
 						respond := tc.responses[min(calls, len(tc.responses)-1)]
 						calls++
 						if respond == nil {
-							return nil, errNet
+							return nil, tc.err
 						}
 						rec := httptest.NewRecorder()
 						respond(rec)
@@ -214,3 +217,9 @@ func TestMessageEventRetriesTransientFailures(t *testing.T) {
 		}
 	}
 }
+
+// timeoutError is the error of a request that timed out, as net/http reports it (url.Error.Timeout).
+type timeoutError struct{}
+
+func (timeoutError) Error() string { return "i/o timeout" }
+func (timeoutError) Timeout() bool { return true }

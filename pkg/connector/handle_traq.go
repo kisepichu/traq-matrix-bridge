@@ -200,14 +200,15 @@ func (c *TraQClient) fetchMessage(ctx context.Context, id string) (*traq.Message
 	}
 }
 
-// isTransient reports whether a failed traQ request may succeed when sent again: a 5xx response, or no
-// response at all (a network error or a timeout).
+// isTransient reports whether a failed traQ request may succeed when sent again soon: a 5xx response, or no
+// response because of a connection error. A timeout is not: the request already took the whole client timeout,
+// and a hung traQ would stall the worker for several of them.
 func isTransient(err error) bool {
 	if he := (*traq.HTTPError)(nil); errors.As(err, &he) {
 		return he.Status >= http.StatusInternalServerError
 	}
 	var ue *url.Error
-	return errors.As(err, &ue)
+	return errors.As(err, &ue) && !ue.Timeout()
 }
 
 // queueMessage queues a new traQ message. bridgev2 drops one already bridged (by its ID) in the portal's
