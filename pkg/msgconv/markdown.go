@@ -99,10 +99,12 @@ var originLinkKey = parser.NewContextKey()
 // autolinks (<https://...>) never pass through linkify and so are not recorded.
 //
 // Where goldmark finds no URL, the traQ origin's own parser (originLinkKey) is
-// tried, for an origin whose host goldmark does not take: its pattern needs a
-// dotted host with a lower-case TLD, so http://localhost:3080 (the dev traQ) is
-// never linked. For an origin goldmark does take, the fallback never applies,
-// because goldmark already links every URL that starts with the origin.
+// tried. goldmark's pattern needs a dotted host with a lower-case TLD, and links
+// every URL of such an origin itself, so for one (any production traQ with a
+// usual host name) the fallback never applies and nothing changes. Other
+// origins, such as http://localhost:3080 (the dev traQ), an IP host or a host
+// with an upper-case TLD, get their bare URLs linked by the fallback, so their
+// /files and /messages URLs are recognized too.
 type bareLinkParser struct{ parser.InlineParser }
 
 func (p bareLinkParser) Parse(parent ast.Node, block text.Reader, pc parser.Context) ast.Node {
