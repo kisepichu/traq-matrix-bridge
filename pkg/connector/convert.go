@@ -152,7 +152,7 @@ func buildEdit(existing []*database.Message, res msgconv.ToMatrixResult, meta *M
 	}
 	if text != nil {
 		if stored, ok := text.Metadata.(*MessageMetadata); ok {
-			if !stored.UpdatedAt.IsZero() && !meta.UpdatedAt.After(stored.UpdatedAt) || stored.ContentHash == meta.ContentHash {
+			if (!stored.UpdatedAt.IsZero() && !meta.UpdatedAt.After(stored.UpdatedAt)) || stored.ContentHash == meta.ContentHash {
 				return nil, bridgev2.ErrIgnoringRemoteEvent
 			}
 		}

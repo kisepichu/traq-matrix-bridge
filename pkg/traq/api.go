@@ -78,7 +78,9 @@ func (c *Client) ReadChannel(ctx context.Context, channelID string) error {
 	return c.doJSON(ctx, http.MethodDelete, "/users/me/unread/"+esc(channelID), nil, nil, nil)
 }
 
-// Messages: GET /channels/{channelId}/messages. more reports the X-TRAQ-MORE response header.
+// Messages: GET /channels/{channelId}/messages. more is false only when the X-TRAQ-MORE response header is
+// exactly "false". A missing or any other value gives true, so a stripped header is never read as a complete
+// fetch (callers redact known messages that were not fetched when more is false).
 func (c *Client) Messages(ctx context.Context, channelID string, q MessagesQuery) (msgs []Message, more bool, err error) {
 	query := url.Values{}
 	if q.Limit > 0 {
@@ -105,7 +107,7 @@ func (c *Client) Messages(ctx context.Context, channelID string, q MessagesQuery
 	if err := json.NewDecoder(resp.Body).Decode(&msgs); err != nil {
 		return nil, false, fmt.Errorf("decode GET %s response: %w", path, err)
 	}
-	return msgs, resp.Header.Get("X-TRAQ-MORE") == "true", nil
+	return msgs, resp.Header.Get("X-TRAQ-MORE") != "false", nil
 }
 
 // Message: GET /messages/{messageId}

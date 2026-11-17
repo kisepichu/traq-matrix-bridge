@@ -119,6 +119,33 @@ func TestMessagesQueryAndMoreHeader(t *testing.T) {
 	}
 }
 
+func TestMessagesMoreHeaderFailsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name, header string
+		want         bool
+	}{
+		{"true", "true", true},
+		{"false", "false", false},
+		{"missing", "", true},
+		{"unparseable", "no", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if tc.header != "" {
+					w.Header().Set("X-TRAQ-MORE", tc.header)
+				}
+				_, _ = w.Write([]byte(`[]`))
+			}))
+			defer srv.Close()
+			c, _ := NewClient(srv.URL, srv.Client(), "t", "test")
+			_, more, err := c.Messages(context.Background(), "c1", MessagesQuery{Limit: 30})
+			if err != nil || more != tc.want {
+				t.Errorf("more = %v, want %v, err = %v", more, tc.want, err)
+			}
+		})
+	}
+}
+
 func TestPostMessageSendsEmbed(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
