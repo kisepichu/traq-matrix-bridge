@@ -25,6 +25,7 @@ type viewState struct {
 
 	mu           sync.Mutex
 	current      string    // the channel traQ was last told about, "" if none
+	wanted       string    // the channel of the last Touch, "" once cleared for idle; current may lag behind
 	lastActivity time.Time // time of the last Touch
 }
 
@@ -33,11 +34,12 @@ func newViewState(idle time.Duration, send func(ctx context.Context, channelID s
 }
 
 // Touch records Matrix activity in channelID and makes it the viewed channel if it is not already. A failed
-// send is logged and leaves the viewed channel unchanged, so the next Touch tries again.
+// send is logged and leaves the viewed channel unchanged; the next Touch or Resend tries again.
 func (v *viewState) Touch(ctx context.Context, channelID string) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.lastActivity = v.now()
+	v.wanted = channelID
 	if channelID != v.current {
 		v.sendLocked(ctx, channelID)
 	}
@@ -55,17 +57,24 @@ func (v *viewState) Current() string {
 func (v *viewState) Tick(ctx context.Context) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	if v.current != "" && v.now().Sub(v.lastActivity) >= v.idle {
+	if v.now().Sub(v.lastActivity) < v.idle {
+		return
+	}
+	v.wanted = ""
+	if v.current != "" {
 		v.sendLocked(ctx, "")
 	}
 }
 
-// Resend sends the viewed channel again, for a new WebSocket connection, which starts without a viewstate.
+// Resend is called on a new WebSocket connection, which starts without a viewstate. It sends the channel of
+// the last Touch, also when its send failed while the connection was down. If the viewstate was cleared for
+// idle meanwhile, nothing is sent. If the send fails, nothing is current, so the next Touch sends again.
 func (v *viewState) Resend(ctx context.Context) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	if v.current != "" && v.sendLocked(ctx, v.current) {
-		zerolog.Ctx(ctx).Info().Str("traq_channel_id", v.current).Msg("Sent the traQ viewstate again on the new connection")
+	v.current = ""
+	if v.wanted != "" && v.sendLocked(ctx, v.wanted) {
+		zerolog.Ctx(ctx).Info().Str("traq_channel_id", v.wanted).Msg("Sent the traQ viewstate again on the new connection")
 	}
 }
 

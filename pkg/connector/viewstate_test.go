@@ -159,3 +159,59 @@ func TestViewStateSendError(t *testing.T) {
 		t.Errorf("Current() = %q, want b", v.Current())
 	}
 }
+
+// A channel change while the WebSocket was down is sent once it is back.
+func TestViewStateResendAfterFailedTouch(t *testing.T) {
+	ctx := context.Background()
+	v, sender, _ := newTestViewState()
+	v.Touch(ctx, "a")
+	sender.takeSent()
+
+	sender.setErr(errors.New("not connected"))
+	v.Touch(ctx, "b")
+	sender.setErr(nil)
+	v.Resend(ctx)
+	expectSent(t, sender, "b")
+	if v.Current() != "b" {
+		t.Errorf("Current() = %q after Resend, want b", v.Current())
+	}
+}
+
+// After an idle clear that failed while the WebSocket was down, the new connection (which starts without a
+// viewstate) gets nothing and the viewstate counts as cleared.
+func TestViewStateResendAfterFailedClear(t *testing.T) {
+	ctx := context.Background()
+	v, sender, clock := newTestViewState()
+	v.Touch(ctx, "a")
+	sender.takeSent()
+
+	sender.setErr(errors.New("not connected"))
+	clock.advance(testIdle + time.Second)
+	v.Tick(ctx)
+	sender.setErr(nil)
+	v.Resend(ctx)
+	expectSent(t, sender)
+	if v.Current() != "" {
+		t.Errorf("Current() = %q after Resend, want empty", v.Current())
+	}
+	v.Tick(ctx)
+	expectSent(t, sender) // nothing left to clear
+}
+
+// A Resend that fails leaves the new connection without a viewstate, so the next Touch of the same channel
+// sends it.
+func TestViewStateResendFails(t *testing.T) {
+	ctx := context.Background()
+	v, sender, _ := newTestViewState()
+	v.Touch(ctx, "a")
+	sender.takeSent()
+
+	sender.setErr(errors.New("not connected"))
+	v.Resend(ctx)
+	if v.Current() != "" {
+		t.Errorf("Current() = %q after a failed Resend, want empty", v.Current())
+	}
+	sender.setErr(nil)
+	v.Touch(ctx, "a")
+	expectSent(t, sender, "a")
+}

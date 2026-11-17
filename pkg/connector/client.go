@@ -367,8 +367,10 @@ func (c *TraQClient) setWebSocket(ws *traq.WSConn, connCtx context.Context) {
 // write closes the connection (see traq.WSConn). A write can block only on a connection that is dead but
 // not detected yet; keepAlive notices that within pingInterval + pingTimeout and ends the connection's
 // context, which ends the write. The caller, often a Matrix handler in a portal's event loop, waits for at
-// most viewStateSendWait (or until ctx ends) and gets an error; the write itself goes on in the background
-// and may still succeed.
+// most viewStateSendWait per send (or until ctx ends) and gets an error; the write itself goes on in the
+// background and may still succeed. viewState holds its lock during a send, so concurrent handlers on such
+// a dead connection wait in turn, each up to viewStateSendWait; overall they are bounded by keepAlive's
+// detection, after which the connection is unregistered and sends fail at once.
 func (c *TraQClient) sendViewState(ctx context.Context, channelID string) error {
 	c.wsMu.Lock()
 	ws, connCtx := c.ws, c.wsCtx

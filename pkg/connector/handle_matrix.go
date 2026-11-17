@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"unicode/utf8"
 
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
+	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
@@ -25,11 +27,14 @@ var (
 
 var (
 	errEditNotOwn = bridgev2.WrapErrorInStatus(errors.New("traQ only allows editing your own messages")).
-			WithIsCertain(true).WithErrorAsMessage().WithSendNotice(true).WithErrorReason(event.MessageStatusUnsupported)
+			WithIsCertain(true).WithErrorAsMessage().WithSendNotice(true).
+			WithStatus(event.MessageStatusFail).WithErrorReason(event.MessageStatusUnsupported)
 	errDeleteNotOwn = bridgev2.WrapErrorInStatus(errors.New("traQ only allows deleting your own messages")).
-			WithIsCertain(true).WithErrorAsMessage().WithSendNotice(true).WithErrorReason(event.MessageStatusNoPermission)
+			WithIsCertain(true).WithErrorAsMessage().WithSendNotice(true).
+			WithStatus(event.MessageStatusFail).WithErrorReason(event.MessageStatusNoPermission)
 	errUnstampNotOwn = bridgev2.WrapErrorInStatus(errors.New("traQ only allows removing your own stamps")).
-				WithIsCertain(true).WithErrorAsMessage().WithSendNotice(true).WithErrorReason(event.MessageStatusNoPermission)
+				WithIsCertain(true).WithErrorAsMessage().WithSendNotice(true).
+				WithStatus(event.MessageStatusFail).WithErrorReason(event.MessageStatusNoPermission)
 )
 
 // roomFeatures are the capabilities of every traQ room. traQ has no file messages from Matrix in v1:
@@ -88,11 +93,35 @@ func (c *TraQClient) toTraQ(ctx context.Context, content *event.MessageEventCont
 		FormattedBody: content.FormattedBody,
 		ReplyTo:       replyTo,
 		ServerURL:     c.API.ServerURL(),
-	}, &traqUserResolver{ctx: ctx, c: c})
+	}, c.newTraQUserResolver(ctx))
+	return text, tooLongStatus(err)
+}
+
+// tooLongStatus makes msgconv.ErrTooLong a permanent failure that the user is told about.
+func tooLongStatus(err error) error {
 	if errors.Is(err, msgconv.ErrTooLong) {
-		return "", bridgev2.WrapErrorInStatus(err).WithSendNotice(true).WithIsCertain(true).WithErrorAsMessage().WithStatus(event.MessageStatusFail)
+		return bridgev2.WrapErrorInStatus(err).WithSendNotice(true).WithIsCertain(true).WithErrorAsMessage().WithStatus(event.MessageStatusFail)
 	}
-	return text, err
+	return err
+}
+
+// withFileURLs appends the URL of every file part to content, one per line in part order. A traQ message
+// keeps its files only while their URLs are in its content, so an edit of a message with files repeats them.
+func withFileURLs(content string, parts []*database.Message, origin string) (string, error) {
+	for _, part := range parts {
+		fileID, ok := fileIDOfPart(part.PartID)
+		if !ok {
+			continue
+		}
+		if content != "" {
+			content += "\n"
+		}
+		content += fileURL(origin, fileID)
+	}
+	if n := utf8.RuneCountInString(content); n > msgconv.MaxTraQLength {
+		return "", fmt.Errorf("%w: %d characters", msgconv.ErrTooLong, n)
+	}
+	return content, nil
 }
 
 // HandleMatrixMessage posts a text message. The echo of the post (MESSAGE_CREATED) is handled by the
@@ -129,8 +158,9 @@ func (c *TraQClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matr
 }
 
 // HandleMatrixEdit edits one of the user's messages. The reply quote line is rebuilt from the stored reply
-// target. The content hash is updated from the edited message as traQ stored it, so the echo
-// (MESSAGE_UPDATED) is recognized as already bridged; bridgev2 saves EditTarget after this returns.
+// target, and the URLs of the message's file parts are kept. The content hash is updated from the edited
+// message as traQ stored it, so the echo (MESSAGE_UPDATED) is recognized as already bridged; bridgev2 saves
+// EditTarget after this returns.
 func (c *TraQClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdit) error {
 	me, err := c.requireMe()
 	if err != nil {
@@ -143,9 +173,17 @@ func (c *TraQClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixE
 	if !isTextMsgType(msg.Content.MsgType) {
 		return bridgev2.ErrUnsupportedMessageType
 	}
-	content, err := c.toTraQ(ctx, msg.Content, TraQMessageID(target.ReplyTo.MessageID))
+	text, err := c.toTraQ(ctx, msg.Content, TraQMessageID(target.ReplyTo.MessageID))
 	if err != nil {
 		return err
+	}
+	parts, err := c.Login.Bridge.DB.Message.GetAllPartsByID(ctx, msg.Portal.Receiver, target.ID)
+	if err != nil {
+		return fmt.Errorf("get message parts: %w", err)
+	}
+	content, err := withFileURLs(text, parts, c.origin())
+	if err != nil {
+		return tooLongStatus(err)
 	}
 	messageID := TraQMessageID(target.ID)
 	if err := c.API.EditMessage(ctx, messageID, content); err != nil {
@@ -206,6 +244,11 @@ func (c *TraQClient) PreHandleMatrixReaction(_ context.Context, msg *bridgev2.Ma
 // HandleMatrixReaction adds the stamp. traQ stamps a whole message, and stamps from traQ go to the first part
 // of a message, so the reaction is saved on the first part too: the echo (MESSAGE_STAMPED) then finds it and
 // is dropped as a duplicate even when the reaction was on a file part.
+//
+// Rare case: the same stamp reacted on two parts of one message. bridgev2 looks for a duplicate on the
+// reacted part, so the second reaction calls AddStamp too (traQ counts the stamp up), and its row, saved on
+// the first part as well, replaces the first reaction's row. Redacting the first reaction then finds no row
+// and leaves traQ alone; redacting the second removes the stamp.
 func (c *TraQClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.MatrixReaction) (*database.Reaction, error) {
 	target := msg.TargetMessage
 	if err := c.API.AddStamp(ctx, TraQMessageID(target.ID), StampID(msg.PreHandleResp.EmojiID)); err != nil {
@@ -251,11 +294,44 @@ func (c *TraQClient) HandleMatrixReadReceipt(ctx context.Context, msg *bridgev2.
 	return nil
 }
 
-// traqUserResolver maps the Matrix users in pills to traQ users: ghosts by their ID, and Matrix users of
-// this bridge by their login. The ctx of the conversion is captured because the interface has none.
+// traqUserResolver maps the Matrix users in pills to traQ user names: ghosts by their ID, and Matrix users of
+// this bridge by their default login. The ctx of the conversion is captured because the interface has none.
 type traqUserResolver struct {
-	ctx context.Context
-	c   *TraQClient
+	ctx         context.Context
+	ghostUserID func(id.UserID) (networkid.UserID, bool)
+	selfMXID    id.UserID
+	selfUserID  string
+	// loginUserID returns the traQ user of a Matrix user's default login; false if it has none.
+	loginUserID func(context.Context, id.UserID) (string, bool, error)
+	userName    func(ctx context.Context, traqUserID string) (string, error)
+}
+
+func (c *TraQClient) newTraQUserResolver(ctx context.Context) *traqUserResolver {
+	br := c.Login.Bridge
+	return &traqUserResolver{
+		ctx:         ctx,
+		ghostUserID: br.Matrix.ParseGhostMXID,
+		selfMXID:    c.Login.UserMXID,
+		selfUserID:  string(c.Login.ID),
+		loginUserID: func(ctx context.Context, mxid id.UserID) (string, bool, error) {
+			user, err := br.GetExistingUserByMXID(ctx, mxid)
+			if err != nil || user == nil {
+				return "", false, err
+			}
+			login := user.GetDefaultLogin()
+			if login == nil {
+				return "", false, nil
+			}
+			return string(login.ID), true, nil
+		},
+		userName: func(ctx context.Context, traqUserID string) (string, error) {
+			u, err := c.users.Get(ctx, c.API, traqUserID)
+			if err != nil {
+				return "", err
+			}
+			return u.Name, nil
+		},
+	}
 }
 
 func (r *traqUserResolver) TraQUserName(mxid id.UserID) (string, bool) {
@@ -263,35 +339,28 @@ func (r *traqUserResolver) TraQUserName(mxid id.UserID) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	u, err := r.c.users.Get(r.ctx, r.c.API, userID)
+	name, err := r.userName(r.ctx, userID)
 	if err != nil {
 		zerolog.Ctx(r.ctx).Warn().Err(err).Str("traq_user_id", userID).Msg("Failed to get the traQ user of a mention")
 		return "", false
 	}
-	return u.Name, true
+	return name, true
 }
 
 func (r *traqUserResolver) traqUserID(mxid id.UserID) (string, bool) {
 	if mxid == "" {
 		return "", false
 	}
-	br := r.c.Login.Bridge
-	if ghostID, ok := br.Matrix.ParseGhostMXID(mxid); ok {
+	if ghostID, ok := r.ghostUserID(mxid); ok {
 		return TraQUserID(ghostID), true
 	}
-	if mxid == r.c.Login.UserMXID {
-		return string(r.c.Login.ID), true
+	if mxid == r.selfMXID {
+		return r.selfUserID, true
 	}
-	user, err := br.GetExistingUserByMXID(r.ctx, mxid)
+	userID, ok, err := r.loginUserID(r.ctx, mxid)
 	if err != nil {
 		zerolog.Ctx(r.ctx).Warn().Err(err).Stringer("user_id", mxid).Msg("Failed to look up a mentioned Matrix user")
 		return "", false
 	}
-	if user == nil {
-		return "", false
-	}
-	if login := user.GetDefaultLogin(); login != nil {
-		return string(login.ID), true
-	}
-	return "", false
+	return userID, ok
 }

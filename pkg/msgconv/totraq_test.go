@@ -48,6 +48,19 @@ func TestToTraQ(t *testing.T) {
 		{"mx-reply stripped", ToTraQInput{Body: "yes", Format: "org.matrix.custom.html",
 			FormattedBody: "<mx-reply><blockquote>old</blockquote></mx-reply>yes", ReplyTo: m1},
 			"https://q.example.jp/messages/" + m1 + "\nyes"},
+		{"pill followed by a name character is separated", ToTraQInput{Body: "x", Format: "org.matrix.custom.html",
+			FormattedBody: `<a href="https://matrix.to/#/@traq_alice:example.org">Alice</a>san`}, "@alice san"},
+		{"pill followed by a hyphen is separated", ToTraQInput{Body: "x", Format: "org.matrix.custom.html",
+			FormattedBody: `<a href="https://matrix.to/#/@traq_alice:example.org">Alice</a>-x`}, "@alice -x"},
+		{"pill followed by an underscore is separated", ToTraQInput{Body: "x", Format: "org.matrix.custom.html",
+			FormattedBody: `<a href="https://matrix.to/#/@traq_alice:example.org">Alice</a>_1`}, "@alice _1"},
+		{"pill followed by a non-name character is kept", ToTraQInput{Body: "x", Format: "org.matrix.custom.html",
+			FormattedBody: `<a href="https://matrix.to/#/@traq_alice:example.org">Alice</a>さん`}, "@aliceさん"},
+		{"unknown pill followed by a name character is kept", ToTraQInput{Body: "x", Format: "org.matrix.custom.html",
+			FormattedBody: `<a href="https://matrix.to/#/@bob:example.org">bob</a>by`}, "bobby"},
+		{"private-use characters in the text are kept", ToTraQInput{Body: "x", Format: "org.matrix.custom.html",
+			FormattedBody: "\ue000&#xe001;<a href=\"https://matrix.to/#/@traq_alice:example.org\">A</a>x\ue000\ue001"},
+			"\ue000\ue001@alice x\ue000\ue001"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

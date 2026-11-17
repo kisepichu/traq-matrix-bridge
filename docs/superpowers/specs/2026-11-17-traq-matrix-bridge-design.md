@@ -185,11 +185,14 @@ traQ の WebSocket は event ごとに届く相手が違う。
   投稿と編集は `embed: true` で送り、pill から作った `@name` も、pill を使わずに打った `@name` / `#channel` も、traQ に
   埋め込み `!{"type":"user","raw":"@name","id":"<uuid>"}` へ直させる (traQ の web client で打ったときと同じになる)。
   pill を自分で埋め込みにはしない: traQ (3.32.1) は既存の埋め込みの `raw` の中の `@name` も埋め込みに直すので、二重になる。
+  pill の直後が traQ の名前に使える文字 (`[A-Za-z0-9_-]`) なら `@name` の後に空白を入れる (別の user と読まれないように)。
   traQ の上限 (10000 文字) を超える場合は送らずに error を返す。
 
 ### 編集・削除
 
 - Matrix の edit (`m.replace`) → `PUT /messages/{id}`。traQ の `MESSAGE_UPDATED` (と poller の差分) → Matrix の edit。
+  traQ の message の file は本文中の URL なので、file の part がある message の編集では、変換した本文の後に
+  各 file の `<server_url>/files/<id>` を 1 行ずつ (part の順に) 付けて file を残す。
 - Matrix の redaction → `DELETE /messages/{id}` (自分の message だけ)。traQ の `MESSAGE_DELETED` → redaction。
 
 ### 引用

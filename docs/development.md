@@ -55,12 +55,14 @@ Matrix 側の返信・編集・削除・reaction・既読も `@dev` として送
 ev=$(testenv/dev.sh send '<room ID>' 'hello')              # 送った event の ID
 testenv/dev.sh reply '<room ID>' "$ev" 'a reply'           # 返信 (m.in_reply_to)
 testenv/dev.sh edit '<room ID>' "$ev" 'hello (edited)'     # 編集 (m.replace)
-r=$(testenv/dev.sh react '<room ID>' "$ev" '👍')            # reaction (m.annotation)。key は絵文字か :stamp名:
+r=$(testenv/dev.sh react '<room ID>' "$ev" ':<stamp名>:')    # reaction (m.annotation)。key は :stamp名: か絵文字 (*)
 testenv/dev.sh redact '<room ID>' "$r"                     # reaction の取り消し (reaction を redact する)
 testenv/dev.sh redact '<room ID>' "$ev"                    # message の削除
 testenv/dev.sh read '<room ID>' "$ev"                      # 既読 (m.read receipt)
 testenv/dev.sh send-raw '<room ID>' '{"msgtype":"m.text","body":"hi bob","format":"org.matrix.custom.html","formatted_body":"hi <a href=\"https://matrix.to/#/@traq_<bob の ID>:localhost\">bob</a>"}'
 ```
+
+(*) key は traQ に作った custom stamp の `:stamp名:` を使う。`👍` のような Unicode 絵文字の key は絵文字と stamp の対応表ができてから (Task 14) 通る。それまでは「the emoji to stamp table is still being built」の notice で拒否される。
 
 `traq <user> <METHOD> <path> [json]` は毎回 traQ に login し直した session で `/api/v3<path>` を叩き、response body を表示する。user のパスワードは `admin` (user 名 `traq`) が `traq`、それ以外は `<user>-password` (`alice` なら `alice-password`)。
 

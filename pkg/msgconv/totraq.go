@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"html"
 	"net/url"
 	"strings"
 	"unicode/utf8"
@@ -41,14 +42,21 @@ type ToTraQInput struct {
 func ToTraQ(ctx context.Context, in ToTraQInput, r TraQUserResolver) (string, error) {
 	var text string
 	if in.Format == string(event.FormatHTML) {
+		// A pill's "@name" is followed by mark, a rune not in the input; separatePills replaces it once the
+		// text after the pill is known.
+		mark := unusedRune(html.UnescapeString(in.FormattedBody))
 		parser := *format.MarkdownHTMLParser
 		parser.PillConverter = func(displayname, mxid, eventID string, _ format.Context) string {
-			return traqPill(r, displayname, mxid, eventID)
+			s, isName := traqPill(r, displayname, mxid, eventID)
+			if isName {
+				s += string(mark)
+			}
+			return s
 		}
 		parser.SpoilerConverter = func(text, _ string, _ format.Context) string {
 			return "!!" + text + "!!"
 		}
-		text = parser.Parse(event.TrimReplyFallbackHTML(in.FormattedBody), format.NewContext(ctx))
+		text = separatePills(parser.Parse(event.TrimReplyFallbackHTML(in.FormattedBody), format.NewContext(ctx)), mark)
 	} else {
 		text = in.Body
 		if in.ReplyTo != "" {
@@ -68,19 +76,53 @@ func ToTraQ(ctx context.Context, in ToTraQInput, r TraQUserResolver) (string, er
 }
 
 // traqPill renders a matrix.to link: a resolvable user becomes "@name" (which
-// traQ embeds), an unknown user its display name, and a room or event link its URL.
-func traqPill(r TraQUserResolver, displayname, mxid, eventID string) string {
+// traQ embeds; isName is true), an unknown user its display name, and a room
+// or event link its URL.
+func traqPill(r TraQUserResolver, displayname, mxid, eventID string) (s string, isName bool) {
 	if mxid == "" || mxid[0] == '@' {
 		if name, ok := r.TraQUserName(id.UserID(mxid)); ok {
-			return "@" + name
+			return "@" + name, true
 		}
-		return displayname
+		return displayname, false
 	}
 	link := "https://matrix.to/#/" + mxid
 	if eventID != "" {
 		link += "/" + eventID
 	}
-	return link
+	return link, false
+}
+
+// unusedRune returns a rune that s does not contain, from the private use
+// area unless s holds all of it.
+func unusedRune(s string) rune {
+	r := rune(0xE000)
+	for strings.ContainsRune(s, r) {
+		r++
+	}
+	return r
+}
+
+// separatePills removes each mark that ends an "@name" pill, putting a space
+// there if a traQ name character follows: traQ would otherwise read the
+// characters after the pill as part of the name and mention another user.
+func separatePills(text string, mark rune) string {
+	var b strings.Builder
+	b.Grow(len(text))
+	for i, c := range text {
+		if c != mark {
+			b.WriteRune(c)
+			continue
+		}
+		if next, _ := utf8.DecodeRuneInString(text[i+utf8.RuneLen(mark):]); isTraQNameRune(next) {
+			b.WriteByte(' ')
+		}
+	}
+	return b.String()
+}
+
+// isTraQNameRune reports whether c may appear in a traQ user name.
+func isTraQNameRune(c rune) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-'
 }
 
 // trimReplyFallbackBody drops the "> <@user> ..." quote and the blank line
