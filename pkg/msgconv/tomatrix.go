@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/yuin/goldmark/ast"
+	east "github.com/yuin/goldmark/extension/ast"
 	"github.com/yuin/goldmark/parser"
 	"github.com/yuin/goldmark/text"
 	"maunium.net/go/mautrix/id"
@@ -340,7 +341,8 @@ func (c *converter) endsInSpace(n ast.Node) bool {
 func (c *converter) tidy(n ast.Node) {
 	for n != nil && n.Parent() != nil {
 		c.trimEdges(n)
-		if n.HasChildren() {
+		if n.HasChildren() || n.Kind() == east.KindTableCell {
+			// An emptied table cell stays, so that every row keeps its cell count.
 			return
 		}
 		parent := n.Parent()

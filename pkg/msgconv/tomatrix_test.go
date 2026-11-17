@@ -95,6 +95,8 @@ func TestToMatrix(t *testing.T) {
 		{"code block keeps spoiler marks", "```\ncode !!x!!\n```", ToMatrixResult{Body: "```\ncode !!x!!\n```", HTML: "<pre><code>code !!x!!\n</code></pre>"}},
 		{"table", "|a|b|\n|-|-|\n|1|2|", ToMatrixResult{Body: "|a|b|\n|-|-|\n|1|2|",
 			HTML: "<table>\n<thead>\n<tr>\n<th>a</th>\n<th>b</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>1</td>\n<td>2</td>\n</tr>\n</tbody>\n</table>"}},
+		{"table cell holding only a file url stays", "|a|b|\n|-|-|\n|1|" + fileURL + "|", ToMatrixResult{Body: "|a|b|\n|-|-|\n|1||", FileIDs: []string{f1},
+			HTML: "<table>\n<thead>\n<tr>\n<th>a</th>\n<th>b</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>1</td>\n<td></td>\n</tr>\n</tbody>\n</table>"}},
 		{"raw html block escaped", "<div>\nhi\n</div>\n\nx", ToMatrixResult{Body: "<div>\nhi\n</div>\n\nx", HTML: "<p>&lt;div&gt;<br>hi<br>&lt;/div&gt;</p>\n<p>x</p>"}},
 		{"file url alone on a middle line", "a\n" + fileURL + "\nb", ToMatrixResult{Body: "a\nb", HTML: "a<br>b", FileIDs: []string{f1}}},
 		{"file url alone on a middle line, CRLF", "a\r\n" + fileURL + "\r\nb", ToMatrixResult{Body: "a\nb", HTML: "a<br>b", FileIDs: []string{f1}}},
