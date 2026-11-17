@@ -2,6 +2,7 @@ package connector
 
 import (
 	"context"
+	"maps"
 	"strings"
 	"sync"
 
@@ -77,6 +78,13 @@ func (t *channelTree) Get(channelID string) (channelInfo, bool) {
 	return ch, ok
 }
 
+// withDM returns a copy of the tree with one more DM channel. Paths are shared: DMs have none.
+func (t *channelTree) withDM(ch channelInfo) *channelTree {
+	byID := maps.Clone(t.byID)
+	byID[ch.ID] = ch
+	return &channelTree{byID: byID, byPath: t.byPath}
+}
+
 // ByPath looks up a public channel by its path, with or without a leading '#'.
 func (t *channelTree) ByPath(path string) (channelInfo, bool) {
 	id, ok := t.byPath[strings.TrimPrefix(path, "#")]
@@ -145,4 +153,37 @@ func (u *userCache) ByName(name string) (*traq.User, bool) {
 	defer u.mu.RUnlock()
 	user, ok := u.byName[name]
 	return user, ok
+}
+
+// recentMessages maps the IDs of the last messages added to where they were queued, forgetting the oldest
+// once it holds limit messages. It is not safe for concurrent use.
+type recentMessages struct {
+	targets map[string]messageTarget
+	order   []string // ring of the IDs in targets, oldest at next once full
+	next    int
+}
+
+func newRecentMessages(limit int) *recentMessages {
+	return &recentMessages{targets: make(map[string]messageTarget, limit), order: make([]string, 0, limit)}
+}
+
+// add records t for messageID. An ID already present is updated in place and keeps its age.
+func (r *recentMessages) add(messageID string, t messageTarget) {
+	if _, ok := r.targets[messageID]; ok {
+		r.targets[messageID] = t
+		return
+	}
+	if len(r.order) < cap(r.order) {
+		r.order = append(r.order, messageID)
+	} else {
+		delete(r.targets, r.order[r.next])
+		r.order[r.next] = messageID
+		r.next = (r.next + 1) % len(r.order)
+	}
+	r.targets[messageID] = t
+}
+
+func (r *recentMessages) get(messageID string) (messageTarget, bool) {
+	t, ok := r.targets[messageID]
+	return t, ok
 }

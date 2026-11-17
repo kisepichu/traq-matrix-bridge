@@ -51,12 +51,18 @@ type TraQClient struct {
 	Main  *TraQConnector
 	Login *bridgev2.UserLogin
 	API   *traq.Client // nil when the stored token is missing
+	Files *traq.Client // file downloads, without httpTimeout (see fileHTTPClient); nil with API
 	users *userCache
 
-	stateMu  sync.RWMutex
-	me       *traq.Me               // nil until Connect has loaded it
-	channels *channelTree           // nil until Connect has loaded it
-	targets  map[string]channelInfo // channels that have a portal, by ID: the last subscription snapshot
+	// syncMu serializes the changes of channels and targets that are based on a fresh read from traQ, so an
+	// older read cannot overwrite a newer one.
+	syncMu sync.Mutex
+
+	stateMu       sync.RWMutex
+	me            *traq.Me               // nil until Connect has loaded it
+	channels      *channelTree           // nil until Connect has loaded it
+	targets       map[string]channelInfo // channels that have a portal, by ID: the last subscription snapshot
+	lastMessageAt time.Time              // CreatedAt of the newest message seen on the WebSocket
 
 	runMu   sync.Mutex
 	running *session // the last session started by Connect; nil before the first Connect
@@ -155,8 +161,14 @@ func (c *TraQClient) runLoops(ctx context.Context, stop context.CancelCauseFunc)
 		return
 	}
 	c.initialSync(ctx, me, targets, unread)
-	wg.Go(func() { c.subscriptionSyncLoop(ctx, stop) })
-	c.websocketLoop(ctx, stop)
+	// One queue and one worker per session, so events are handled in the order traQ sent them, across
+	// reconnects too.
+	queue := make(chan traq.Event, eventQueueSize)
+	// Size 1: the channel events of a burst add up to at most one pending sync.
+	syncRequests := make(chan struct{}, 1)
+	wg.Go(func() { c.eventWorker(ctx, queue, syncRequests) })
+	wg.Go(func() { c.subscriptionSyncLoop(ctx, stop, syncRequests) })
+	c.websocketLoop(ctx, stop, queue)
 }
 
 // load reads what the bridge needs from traQ, retrying with backoff. The bool is false when ctx ended or the
@@ -194,6 +206,9 @@ func (c *TraQClient) loadOnce(ctx context.Context) (*traq.Me, map[string]channel
 	unread, err := c.API.Unread(ctx)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("get unread channels: %w", err)
+	}
+	if err := c.Main.loadStamps(ctx, c.API); err != nil {
+		return nil, nil, nil, fmt.Errorf("get stamps: %w", err)
 	}
 	tree := buildChannelTree(list)
 	targets := subscriptionSnapshot(tree, subs)
@@ -245,7 +260,8 @@ func (b *backoff) wait(ctx context.Context, log zerolog.Logger) bool {
 func (b *backoff) reset() { b.next = 0 }
 
 // websocketLoop keeps the WebSocket open, reconnecting with backoff, until ctx ends or the token is rejected.
-func (c *TraQClient) websocketLoop(ctx context.Context, stop context.CancelCauseFunc) {
+// Events go to queue.
+func (c *TraQClient) websocketLoop(ctx context.Context, stop context.CancelCauseFunc, queue chan<- traq.Event) {
 	var retry backoff
 	for {
 		ws, err := c.dialWebSocket(ctx)
@@ -255,7 +271,7 @@ func (c *TraQClient) websocketLoop(ctx context.Context, stop context.CancelCause
 			// A catch-up of what was missed while disconnected belongs here, for every connection but the first
 			// (initialSync covers the time before Connect).
 			start := time.Now()
-			err = c.readWebSocket(ctx, ws)
+			err = c.readWebSocket(ctx, ws, queue)
 			_ = ws.Close()
 			// Only a connection that stayed up resets the backoff, so a server that drops every connection
 			// right away is not hammered.
@@ -283,8 +299,8 @@ func (c *TraQClient) dialWebSocket(ctx context.Context) (*traq.WSConn, error) {
 	return ws, nil
 }
 
-// readWebSocket reads and dispatches events until the connection fails, a ping fails or ctx ends.
-func (c *TraQClient) readWebSocket(ctx context.Context, ws *traq.WSConn) error {
+// readWebSocket reads events and hands them to queue until the connection fails, a ping fails or ctx ends.
+func (c *TraQClient) readWebSocket(ctx context.Context, ws *traq.WSConn, queue chan<- traq.Event) error {
 	// One context for the whole connection: its end closes the connection and unblocks ReadEvent.
 	connCtx, cancel := context.WithCancelCause(ctx)
 	var wg sync.WaitGroup
@@ -299,7 +315,7 @@ func (c *TraQClient) readWebSocket(ctx context.Context, ws *traq.WSConn) error {
 			}
 			return fmt.Errorf("read WebSocket: %w", err)
 		}
-		c.handleEvent(connCtx, evt)
+		c.enqueueEvent(connCtx, queue, evt)
 	}
 }
 
@@ -324,20 +340,10 @@ func keepAlive(ctx context.Context, ws *traq.WSConn, fail context.CancelCauseFun
 	}
 }
 
-// handleEvent dispatches one WebSocket event. Events without a handler are ignored.
-//
-// It runs on the WebSocket reader goroutine, and keepAlive's pongs are only processed while that goroutine
-// is inside ReadEvent: a handler that blocks for longer than pingTimeout makes the ping fail and recycles the
-// connection, and every event behind it waits. Handlers must therefore not block. Slow work, such as REST
-// fetches, belongs in a worker goroutine or in bridgev2's portal event loop (queue a remote event whose
-// convert func does the fetch). ctx is the per-connection context and ends when the connection closes.
-func (c *TraQClient) handleEvent(_ context.Context, evt traq.Event) {
-	c.Login.Log.Debug().Str("event_type", evt.Type).Msg("Ignoring traQ event")
-}
-
-// subscriptionSyncLoop re-syncs the subscriptions every subscription_sync_interval. A rejected token stops the
-// session with errTokenRejected.
-func (c *TraQClient) subscriptionSyncLoop(ctx context.Context, stop context.CancelCauseFunc) {
+// subscriptionSyncLoop re-syncs the subscriptions every subscription_sync_interval and when the event worker
+// asks for it through requests (a channel was changed or deleted). A rejected token stops the session with
+// errTokenRejected.
+func (c *TraQClient) subscriptionSyncLoop(ctx context.Context, stop context.CancelCauseFunc, requests <-chan struct{}) {
 	t := time.NewTicker(c.Main.Config.SubscriptionSyncInterval)
 	defer t.Stop()
 	for {
@@ -345,6 +351,7 @@ func (c *TraQClient) subscriptionSyncLoop(ctx context.Context, stop context.Canc
 		case <-ctx.Done():
 			return
 		case <-t.C:
+		case <-requests:
 		}
 		err := c.syncSubscriptions(ctx)
 		switch {

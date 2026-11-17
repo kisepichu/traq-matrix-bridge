@@ -145,7 +145,11 @@ func (c *TraQConnector) LoadUserLogin(_ context.Context, login *bridgev2.UserLog
 		if err != nil {
 			return fmt.Errorf("failed to create the traQ client: %w", err)
 		}
-		client.API = api
+		files, err := traq.NewClient(c.Config.ServerURL, fileHTTPClient, meta.AccessToken, userAgent)
+		if err != nil {
+			return fmt.Errorf("failed to create the traQ file client: %w", err)
+		}
+		client.API, client.Files = api, files
 	}
 	login.Client = client
 	return nil
