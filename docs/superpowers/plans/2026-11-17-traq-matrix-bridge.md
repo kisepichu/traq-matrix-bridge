@@ -658,7 +658,7 @@ type Token struct {
 	ExpiresAt   time.Time // zero if the server did not send expires_in
 }
 func NewPKCE() (PKCE, error)                                          // 32 random bytes each, base64url without padding; Challenge = base64url(sha256(Verifier))
-func (c OAuthConfig) AuthorizeURL(p PKCE) string                      // <origin>/api/v3/oauth2/authorize?response_type=code&client_id&redirect_uri&scope=read write&state&code_challenge&code_challenge_method=S256
+func (c OAuthConfig) AuthorizeURL(p PKCE) (string, error)             // <origin>/api/v3/oauth2/authorize?response_type=code&client_id&redirect_uri&scope=read write&state&code_challenge&code_challenge_method=S256; error if ServerURL is not an absolute http(s) URL; origin parsed by the same code as NewClient
 func ParseRedirect(redirected, expectedState string) (code string, err error)
 func (c OAuthConfig) Exchange(ctx context.Context, code, verifier string) (Token, error)       // POST /oauth2/token, form: grant_type=authorization_code, code, redirect_uri, client_id, code_verifier
 func (c OAuthConfig) Revoke(ctx context.Context, token string) error                           // POST /oauth2/revoke, form: token
@@ -669,7 +669,7 @@ var ErrStateMismatch, ErrNoCode error
 
 - JSON は `encoding/json` の既定 (未知の field は無視) で decode する。`DisallowUnknownFields` を使わない。
 - `Authorization: Bearer <token>`。401 はやり直さずに `*HTTPError` で返す (呼び出し側が再 login を求める)。
-- 429、502、504 は最大 3 回やり直す。待ち時間は `Retry-After` (秒) があればそれ、無ければ 1s → 2s → 4s。`ctx` が切れたら待たずに返す。503 はやり直さずに `*HTTPError` で返す (search の「検索が無効」を呼び出し側が判定するため)。
+- 429 はどの method でも、502 と 504 は GET / PUT / DELETE だけ、最大 3 回やり直す (POST は 502 / 504 の時点で traQ が保存済みのことがあり、やり直すと二重投稿になる)。待ち時間は `Retry-After` (秒、上限 60 秒) があればそれ、無ければ 1s → 2s → 4s。`ctx` が切れたら待たずに返す。503 はやり直さずに `*HTTPError` で返す (search の「検索が無効」を呼び出し側が判定するため)。
 - 2xx 以外は `*HTTPError{Status, Message}`。`Message` は body の JSON `{"message": "..."}` か、無ければ body の先頭 200 byte。
 - `ParseRedirect` は URL の query の `state` が `expectedState` と違えば `ErrStateMismatch`、`error` があれば `fmt.Errorf("authorization denied: %s", error)`、`code` が無ければ `ErrNoCode`。前後の空白は取り除く。
 - token の `expires_in` は秒。`ExpiresAt = now + expires_in`。
@@ -851,7 +851,11 @@ func TestPKCEChallengeIsS256OfVerifier(t *testing.T) {
 
 func TestAuthorizeURL(t *testing.T) {
 	cfg := OAuthConfig{ServerURL: "https://q.example.jp", ClientID: "cid", RedirectURI: "http://localhost:29399/callback"}
-	u, err := url.Parse(cfg.AuthorizeURL(PKCE{Verifier: "v", Challenge: "ch", State: "st"}))
+	authURL, err := cfg.AuthorizeURL(PKCE{Verifier: "v", Challenge: "ch", State: "st"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := url.Parse(authURL)
 	if err != nil {
 		t.Fatal(err)
 	}
