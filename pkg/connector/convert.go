@@ -56,7 +56,14 @@ type mediaUploader interface {
 // convertMessage builds the Matrix content for a traQ message: one text part (if the body is not empty)
 // followed by one part per file. ReplyTo is set from msgconv's ReplyTo.
 func (c *TraQClient) convertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *traq.Message) (*bridgev2.ConvertedMessage, error) {
-	res := msgconv.ToMatrix(c.toMatrixInput(msg.Content), &resolver{ctx: ctx, c: c, portal: portal})
+	return c.convertMessageAfter(ctx, portal, intent, msg, nil)
+}
+
+// convertMessageAfter is convertMessage for a backfill batch: earlier are the IDs of the messages of the
+// batch that are sent before this one, so a quote of one of them becomes a reply although the database
+// does not have it yet.
+func (c *TraQClient) convertMessageAfter(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *traq.Message, earlier map[string]struct{}) (*bridgev2.ConvertedMessage, error) {
+	res := msgconv.ToMatrix(c.toMatrixInput(msg.Content), &resolver{ctx: ctx, c: c, portal: portal, earlier: earlier})
 	up := &portalUploader{api: c.API, files: c.Files, limit: c.Main.maxFileSize(), roomID: portal.MXID, intent: intent}
 	return buildMessage(ctx, res, msg.Content, c.origin(), up, messageFilesTimeout)
 }
@@ -267,6 +274,8 @@ type resolver struct {
 	// edit restricts CanReplyTo to editReplyTo, the reply target of the message being edited.
 	edit        bool
 	editReplyTo networkid.MessageID
+	// earlier is the IDs of the backfill batch's messages that are sent before the one being converted.
+	earlier map[string]struct{}
 }
 
 var _ msgconv.Resolver = (*resolver)(nil)
@@ -312,6 +321,9 @@ func (r *resolver) MessageLink(messageID string) (string, bool) {
 func (r *resolver) CanReplyTo(messageID string) bool {
 	if r.edit {
 		return r.editReplyTo != "" && MessageID(messageID) == r.editReplyTo
+	}
+	if _, ok := r.earlier[messageID]; ok {
+		return true
 	}
 	msg := r.bridged(messageID, r.portal.Receiver)
 	return msg != nil && msg.Room == r.portal.PortalKey
