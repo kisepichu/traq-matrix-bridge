@@ -81,26 +81,30 @@ traq_login_session() {
 }
 
 # with_traq_session <user> <command...>: run a command with COOKIE_JAR set to a fresh logged-in session of the user.
+# The cookie jar is removed on every exit path: the command runs in a subshell (so `die` cannot skip the cleanup), the
+# status is captured, and INT/TERM remove the jar too.
 with_traq_session() {
-  local user=$1
+  local user=$1 status
   shift
-  local jar
-  jar=$(mktemp)
-  # shellcheck disable=SC2064
-  trap "rm -f '$jar'" RETURN
-  traq_login_session "$user" "$jar"
-  COOKIE_JAR=$jar "$@"
+  TRAQ_JAR=$(mktemp)
+  trap 'rm -f "$TRAQ_JAR"; exit 130' INT TERM
+  set +e
+  (
+    set -e
+    traq_login_session "$user" "$TRAQ_JAR"
+    COOKIE_JAR=$TRAQ_JAR "$@"
+  )
+  status=$?
+  set -e
+  trap - INT TERM
+  rm -f "$TRAQ_JAR"
+  return "$status"
 }
 
 build_tools() {
   mkdir -p "$DEV"
   (cd "$ROOT" && go build -tags goolm -o "$DEV/traq-matrix-bridge" ./cmd/traq-matrix-bridge \
     && go build -o "$DEV/cfgedit" ./testenv/cfgedit)
-}
-
-# registration_token <file> <as_token|hs_token>: read a token from a registration file.
-registration_token() {
-  sed -n "s/^$2: *//p" "$1" | tr -d "\"'"
 }
 
 # generate_bridge_files: bridge config, appservice registration and the double puppet registration. Synapse reads the
@@ -142,7 +146,9 @@ namespaces:
     - regex: '@.*:$SERVER_NAME'
       exclusive: false
 EOF
-  ./cfgedit config.yaml 'double_puppet/servers={}' "double_puppet/secrets={\"$SERVER_NAME\": \"as_token:$as_token\"}"
+  # The secret reaches cfgedit through the environment, not argv (which any local user can read from /proc).
+  DOUBLE_PUPPET_SECRET="as_token:$as_token" ./cfgedit config.yaml 'double_puppet/servers={}' \
+    "double_puppet/secrets={\"$SERVER_NAME\": \"\${DOUBLE_PUPPET_SECRET}\"}"
   chmod 600 config.yaml registration.yaml doublepuppet.yaml
 }
 
@@ -209,12 +215,15 @@ cmd_bridge() {
   exec ./traq-matrix-bridge -c config.yaml -r registration.yaml
 }
 
-# management_room: the DM with the bridge bot; created (and the bot invited) when missing.
+# management_room: the DM with the bridge bot; created (and the bot invited) when missing. An existing room must have
+# the bot in it, otherwise commands would go unanswered.
 management_room() {
   local file=$DEV/management_room room
   if [[ -s $file ]]; then
     room=$(<"$file")
     if mx GET /joined_rooms | jq -e --arg r "$room" '.joined_rooms | index($r)' >/dev/null; then
+      mx GET "/rooms/$(urlencode "$room")/joined_members" | jq -e --arg b "$BOT_MXID" '.joined | has($b)' >/dev/null ||
+        die "bot is not in $room; is the bridge running?"
       echo "$room"
       return 0
     fi
@@ -236,7 +245,9 @@ cmd_send() {
 cmd_bot() {
   [[ $# -ge 1 ]] || die "usage: bot <text>"
   need_dev
-  cmd_send "$(management_room)" "$*"
+  local room
+  room=$(management_room)
+  cmd_send "$room" "$*"
 }
 
 cmd_tail() {
@@ -278,8 +289,7 @@ cmd_traq() {
   with_traq_session "$user" bash -c '
     args=(-sS --fail-with-body -b "$COOKIE_JAR" -X "$1" "$0/api/v3$2")
     if [[ $# -ge 3 ]]; then args+=(-H "Content-Type: application/json" -d "$3"); fi
-    curl "${args[@]}"
-    echo
+    curl "${args[@]}" && echo
   ' "$TRAQ" "$method" "$path" "$@"
 }
 

@@ -1369,7 +1369,7 @@ func TestToTraQLength(t *testing.T) {
 **Files:**
 - Create: `testenv/synapse/homeserver.yaml`、`testenv/synapse/log.config` (開発用 synapse の設定)
 - Modify: `testenv/compose.yaml` (profile `matrix` の service `synapse`。profile を付けない起動 (結合テスト、CI) には影響させない)
-- Create: `testenv/dev.sh` (開発用の操作 script)
+- Create: `testenv/dev.sh` (開発用の操作 script)、`testenv/cfgedit/main.go` (コメントを保ったまま YAML の値を差し替える小さな Go program。`${NAME}` を環境変数で置換するので、secret を引数に出さずに渡せる)
 - Create: `docs/development.md` (開発者向けの手順、日本語)
 - Modify: `.gitignore` (`/testenv/.dev/`)
 
@@ -1378,28 +1378,29 @@ func TestToTraQLength(t *testing.T) {
 - Produces (Task 8 以降の確認に使う): `testenv/dev.sh` の subcommand。状態 (生成した設定、registration、DB、token) は `testenv/.dev/` に置く。
 
 ```text
-testenv/dev.sh up            # docker compose -p tmb -f testenv/compose.yaml --profile matrix up -d、traQ と synapse の起動を待つ
-testenv/dev.sh down          # docker compose ... down -v、testenv/.dev/ を消す
-testenv/dev.sh setup         # traQ: OAuth client を作る (admin traq/traq)、traQ user alice / bob を作る
-                             # synapse: Matrix user @dev:localhost を作る、access token を .dev/ に保存
+testenv/dev.sh up            # bridge の binary と cfgedit をビルドし、bridge の設定と registration 2 つ (appservice、double puppet) を作ってから
+                             # docker compose -p tmb -f testenv/compose.yaml --profile matrix up -d、traQ と synapse の起動を待つ
                              # bridge: -e で設定を作り、homeserver / appservice / database / permissions / double puppet /
-                             #         network (server_url=http://localhost:3080, client_id) を埋め、-g で registration を作る
+                             #         network.server_url=http://localhost:3080 を埋め、-g で registration を作る (synapse は registration を起動時にしか読まない)
+testenv/dev.sh down          # docker compose ... down -v、testenv/.dev/ を消す
+testenv/dev.sh setup         # traQ: OAuth client を作り (admin traq/traq)、bridge の設定の network.oauth.client_id を埋める。traQ user alice / bob を作る
+                             # synapse: Matrix user @dev:localhost を作る、access token を .dev/ に保存
 testenv/dev.sh bridge        # go build -tags goolm して、.dev/config.yaml で前景で起動する (log は stdout)
 testenv/dev.sh bot <text>    # @dev として bot (management room。無ければ作る) に text を送る
 testenv/dev.sh tail [room]   # room (既定 management room) の最新 20 event を「sender: body」で表示する
 testenv/dev.sh rooms         # @dev が入っている room の一覧 (room ID と name)
 testenv/dev.sh send <room> <text>   # @dev として room に送る
-testenv/dev.sh traq-login <user>    # traQ user の OAuth 認可を行い、bot に貼る redirect URL を表示する (Task 8 の login 用)
+testenv/dev.sh traq-login <user> <authorize-url>   # traQ user として OAuth の authorize URL を承認し、bot に貼る redirect URL を表示する (Task 8 の login 用)
 testenv/dev.sh traq <user> <METHOD> <path> [json]  # traQ user の session で REST を叩く (相手側の操作の再現用)
 ```
 
 決まり:
 
-- synapse の image は実装時点の最新の安定版 tag に固定する。server name `localhost`、client API は host の `localhost:8008`。registration は無効、user は `register_new_matrix_user` (shared secret) で作る。
+- synapse の image は実装時点の最新の安定版 tag に固定する。server name `localhost`、client API は host の `127.0.0.1:8008` だけに公開する。registration は無効、user は `register_new_matrix_user` (shared secret) で作る。
 - appservice の registration file は `testenv/.dev/registration.yaml` を container に mount し、`app_service_config_files` で読ませる。bridge は host で動くので、registration の `url` は `http://host.docker.internal:29338` (compose の `extra_hosts: ["host.docker.internal:host-gateway"]`)。
 - double puppeting: bridgev2 の `double_puppet.secrets` に `localhost: "as_token:<token>"` を入れ、user namespace `@.*:localhost` (exclusive: false) を持つ 2 つ目の registration (`testenv/.dev/doublepuppet.yaml`) を synapse に読ませる。方式は mautrix の double puppeting の文書どおり (確かめて使う)。
 - bridge の設定: database は SQLite (`testenv/.dev/bridge.db`)、`encryption.allow: false`、`bridge.permissions` は `"localhost": admin`、`backfill.enabled: true`、`bridge.mute_only_on_create: false`。log は console に debug。
-- `dev.sh` は bash、`set -euo pipefail`、依存は curl と jq と docker だけ。token は `.dev/` の file に置き、表示しない (`traq-login` が表示する redirect URL は例外: bot に貼るためのもの)。
+- `dev.sh` は bash、`set -euo pipefail`、依存は curl と jq と docker と go (go は bridge と `cfgedit` のビルド用)。token は `.dev/` の file に置き、表示しない (`traq-login` が表示する redirect URL は例外: bot に貼るためのもの)。double puppet の `as_token` は `cfgedit` に環境変数で渡し、引数に出さない。bridge の appservice listener は docker の synapse から届くよう `0.0.0.0:29338` で待ち受ける (理由は `docs/development.md`)。
 - `docs/development.md`: 上の subcommand を使った開発の流れ (up → setup → bridge → bot に login → 確認 → down)、単体・結合テストの実行、bridge の設定のどこを dev.sh が書き換えるか。開発環境と結合テストは同じ port 3080 の traQ を使うので、開発環境を立てている間は結合テストをその traQ に対して実行する (テストは毎回新しい user とチャンネルを作るので干渉しない)。
 
 - [ ] **Step 1: compose の profile と synapse の設定を書く** — `docker compose -p tmb -f testenv/compose.yaml --profile matrix up -d` で 4 service が起動し、`curl localhost:8008/_matrix/client/versions` が返る。profile 無しの `up` では synapse が起動しない。

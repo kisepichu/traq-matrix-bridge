@@ -6,6 +6,10 @@
 // a list replaces the whole node ("bridge/permissions={\"localhost\": admin}"). Every key must already exist, which
 // keeps typos from silently adding unused settings. testenv/dev.sh uses it to fill in the bridge config that
 // `traq-matrix-bridge -e` generates.
+//
+// Secrets must not be passed on the command line (other users can read it from /proc): write "${NAME}" in a value
+// and cfgedit substitutes the environment variable NAME before parsing it. $NAME is expanded the same way, an unset
+// variable is an error, and values must not contain a literal "$".
 package main
 
 import (
@@ -19,7 +23,7 @@ import (
 
 func main() {
 	if len(os.Args) < 3 {
-		fmt.Fprintln(os.Stderr, "usage: cfgedit <file> <path>=<yaml value> ...")
+		fmt.Fprintln(os.Stderr, "usage: cfgedit <file> <path>=<yaml value> ...\n  ${NAME} in a value is replaced by the environment variable NAME (keeps secrets off the command line)")
 		os.Exit(2)
 	}
 	if err := run(os.Args[1], os.Args[2:]); err != nil {
@@ -44,6 +48,17 @@ func run(file string, assignments []string) error {
 		path, value, ok := strings.Cut(a, "=")
 		if !ok {
 			return fmt.Errorf("%q: want <path>=<yaml value>", a)
+		}
+		var missing string
+		value = os.Expand(value, func(name string) string {
+			v, set := os.LookupEnv(name)
+			if !set {
+				missing = name
+			}
+			return v
+		})
+		if missing != "" {
+			return fmt.Errorf("%s: environment variable %s is not set", path, missing)
 		}
 		if err := set(doc.Content[0], strings.Split(path, "/"), value); err != nil {
 			return fmt.Errorf("%s: %w", path, err)

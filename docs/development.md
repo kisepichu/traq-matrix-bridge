@@ -5,7 +5,7 @@ bridge を手元で動かして確認するための環境と、その操作 scr
 構成:
 
 - traQ (3.32.1) + MariaDB + Elasticsearch: docker、`http://localhost:3080`
-- Synapse: docker、server name `localhost`、client API は `http://localhost:8008` (federation 無し、rate limit 無し、SQLite)
+- Synapse: docker、server name `localhost`、client API は `http://localhost:8008` (host の `127.0.0.1` だけに公開。federation 無し、rate limit 無し、SQLite)
 - bridge: host で `go build` して前景で実行 (Synapse から `host.docker.internal:29338` で到達する)
 
 必要なもの: bash、curl、jq、docker (compose v2)、go。libolm のヘッダが無い環境でも動くように、`dev.sh bridge` は `-tags goolm` でビルドする。
@@ -99,14 +99,16 @@ token は表示しない。Synapse は registration を起動時にしか読ま�
 | `database.type` / `database.uri` | `sqlite3-fk-wal` / `file:<repo>/testenv/.dev/bridge.db?_txlock=immediate` |
 | `homeserver.address` / `homeserver.domain` | `http://localhost:8008` / `localhost` |
 | `appservice.address` | `http://host.docker.internal:29338` (registration の `url` になる) |
-| `appservice.hostname` / `appservice.port` | `0.0.0.0` / `29338` (docker の Synapse から host の bridge に届くよう、全 interface で待ち受ける) |
+| `appservice.hostname` / `appservice.port` | `0.0.0.0` / `29338` (docker の Synapse から host の bridge に届くよう、全 interface で待ち受ける。理由は下の注意を参照) |
 | `double_puppet.servers` | 空 |
 | `double_puppet.secrets` | `localhost: "as_token:<doublepuppet.yaml の as_token>"` |
 | `encryption.allow` | `false` |
 | `backfill.enabled` | `true` |
 | `logging` | console に debug (file には書かない) |
 
-double puppeting は mautrix の文書 (https://docs.mau.fi/bridges/general/double-puppeting.html) の appservice 方式。`doublepuppet.yaml` は URL を持たない 2 つ目の registration で、user namespace `@.*:localhost` (exclusive: false) を持ち、Synapse の `app_service_config_files` に `registration.yaml` と一緒に載せている。bridge は起動時にこの `as_token` で double puppet を使えるか確かめ、log に出す。
+double puppeting は mautrix の文書 (https://docs.mau.fi/bridges/general/double-puppeting.html) の appservice 方式。`doublepuppet.yaml` は URL を持たない 2 つ目の registration で、user namespace `@.*:localhost` (exclusive: false) を持ち、Synapse の `app_service_config_files` に `registration.yaml` と一緒に載せている。この `as_token` を使った `whoami?user_id=@dev:localhost` が成功することは確認してあるが、bridge が起動時に確かめたり log に出したりはしない。実際に使えるかどうかは user が login したときに分かる (Task 8)。`as_token` は設定ファイルにだけ書かれ、`cfgedit` には環境変数 (`${DOUBLE_PUPPET_SECRET}` の置換) で渡すので、コマンドラインには出ない。
+
+注意: bridge の appservice listener (`0.0.0.0:29338`) は LAN にも見える。docker の Synapse は host の bridge に `host.docker.internal` (docker bridge network の gateway) 経由で接続するため、`127.0.0.1` だけの待ち受けでは届かない。到達には `hs_token` が要るので、開発用の設定としては許容しているが、信用できないネットワークでは使わない。Synapse の `8008` は loopback だけに公開している。
 
 ## テスト
 
