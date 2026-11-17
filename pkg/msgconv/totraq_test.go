@@ -66,6 +66,11 @@ func TestToTraQ(t *testing.T) {
 			FormattedBody: `see <a href="https://matrix.to/#/!gen:example.org/$ev2">msg</a>`}, "see https://q.example.jp/messages/" + m2},
 		{"bridged event in an unknown room becomes the traQ message URL", ToTraQInput{Body: "e", Format: "org.matrix.custom.html",
 			FormattedBody: `<a href="https://matrix.to/#/!other:example.org/$ev2">msg</a>`}, "https://q.example.jp/messages/" + m2},
+		// As bridgev2 and Matrix clients write them: the room ID percent-encoded, with a via parameter.
+		{"encoded portal room pill with via", ToTraQInput{Body: "r", Format: "org.matrix.custom.html",
+			FormattedBody: `<a href="https://matrix.to/#/%21gen:example.org?via=example.org">#gps/general</a>`}, "#gps/general"},
+		{"encoded event pill with via", ToTraQInput{Body: "e", Format: "org.matrix.custom.html",
+			FormattedBody: `<a href="https://matrix.to/#/%21gen:example.org/$ev2?via=example.org">msg</a>`}, "https://q.example.jp/messages/" + m2},
 		{"spoiler", ToTraQInput{Body: "s", Format: "org.matrix.custom.html",
 			FormattedBody: `a <span data-mx-spoiler>s</span>`}, "a !!s!!"},
 		{"reply prefix", ToTraQInput{Body: "yes", ReplyTo: m1}, "https://q.example.jp/messages/" + m1 + "\nyes"},
