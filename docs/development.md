@@ -8,6 +8,8 @@ bridge を手元で動かして確認するための環境と、その操作 scr
 - Synapse: docker、server name `localhost`、client API は `http://localhost:8008` (host の `127.0.0.1` だけに公開。federation 無し、rate limit 無し、SQLite)
 - bridge: host で `go build` して前景で実行 (Synapse から `host.docker.internal:29338` で到達する)
 
+traQ の origin `http://localhost:3080` の host には `.` で区切った TLD が無いが、本文中の bare な `http://localhost:3080/files/<id>` と `http://localhost:3080/messages/<id>` も production の traQ と同じく file と引用として扱う (msgconv は goldmark の linkify が拾わない URL を、設定の origin で始まるものに限って拾う)。`127.0.0.1.nip.io` のような `.` 入りの別名を `network.server_url` に設定する必要は無い。
+
 必要なもの: bash、curl、jq、docker (compose v2)、go。libolm のヘッダが無い環境でも動くように、`dev.sh bridge` は `-tags goolm` でビルドする。
 
 ## 開発の流れ
