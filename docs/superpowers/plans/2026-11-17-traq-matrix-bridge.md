@@ -1107,7 +1107,6 @@ type Resolver interface {
 type ToMatrixInput struct {
 	Content    string
 	ServerURL  *url.URL // traQ origin
-	SelfUserID string   // logged-in traQ user
 	SelfGroups []string // group IDs of the logged-in user
 	SelfMXID   id.UserID
 }
@@ -1178,7 +1177,6 @@ func input(content string) ToMatrixInput {
 	return ToMatrixInput{
 		Content:    content,
 		ServerURL:  &url.URL{Scheme: "https", Host: "q.example.jp"},
-		SelfUserID: uSelf,
 		SelfGroups: []string{gSelf},
 		SelfMXID:   "@me:example.org",
 	}

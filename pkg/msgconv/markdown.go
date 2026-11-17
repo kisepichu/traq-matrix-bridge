@@ -61,7 +61,16 @@ func (spoilerParser) Parse(parent ast.Node, block text.Reader, pc parser.Context
 	before := block.PrecendingCharacter()
 	line, segment := block.PeekLine()
 	node := parser.ScanDelimiter(line, before, 2, spoilerDelimiters{})
-	if node == nil || node.OriginalLength > 2 || before == '!' {
+	if node == nil || before == '!' {
+		return nil
+	}
+	if node.OriginalLength == 3 {
+		// "!!" right before an embed: the run's last "!" belongs to the embed.
+		if _, _, ok := parseEmbed(line[2:]); ok {
+			node.OriginalLength, node.Length = 2, 2
+		}
+	}
+	if node.OriginalLength > 2 {
 		return nil
 	}
 	node.Segment = segment.WithStop(segment.Start + node.OriginalLength)

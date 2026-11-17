@@ -25,7 +25,6 @@ type Resolver interface {
 type ToMatrixInput struct {
 	Content    string
 	ServerURL  *url.URL // traQ origin
-	SelfUserID string   // logged-in traQ user
 	SelfGroups []string // group IDs of the logged-in user
 	SelfMXID   id.UserID
 }
@@ -59,7 +58,8 @@ type converter struct {
 
 // ToMatrix converts traQ message content to Matrix body and formatted_body.
 func ToMatrix(in ToMatrixInput, r Resolver) ToMatrixResult {
-	c := &converter{in: in, r: r, src: []byte(in.Content)}
+	// CRLF is normalised so that Body and the parsed text agree on line ends.
+	c := &converter{in: in, r: r, src: []byte(strings.ReplaceAll(in.Content, "\r\n", "\n"))}
 	pc := parser.NewContext()
 	doc := markdown.Parser().Parse(text.NewReader(c.src), parser.WithContext(pc))
 	c.spans, _ = pc.Get(bareLinkKey).(map[*ast.AutoLink]span)
@@ -78,7 +78,7 @@ func ToMatrix(in ToMatrixInput, r Resolver) ToMatrixResult {
 	for _, n := range nodes {
 		parent := n.Parent()
 		if c.convert(n) {
-			parent.RemoveChild(parent, n)
+			c.remove(n)
 			if !slices.Contains(emptied, parent) {
 				emptied = append(emptied, parent)
 			}
@@ -93,6 +93,10 @@ func ToMatrix(in ToMatrixInput, r Resolver) ToMatrixResult {
 		return c.res
 	}
 	c.res.HTML = c.render(doc)
+	if len(emptied) > 0 && !visible(c.res.HTML) {
+		// Removals left nothing to show; Body would only hold stray Markdown marks.
+		c.res.Body, c.res.HTML = "", ""
+	}
 	return c.res
 }
 
@@ -118,12 +122,12 @@ func (c *converter) embed(n *embedNode) bool {
 	remove := false
 	switch e.Type {
 	case "user":
-		if mxid, ok := c.r.UserMXID(e.ID); ok {
+		if mxid, ok := c.r.UserMXID(strings.ToLower(e.ID)); ok {
 			n.href = "https://matrix.to/#/" + string(mxid)
 			c.mention(mxid)
 		}
 	case "group":
-		if slices.Contains(c.in.SelfGroups, e.ID) {
+		if slices.ContainsFunc(c.in.SelfGroups, func(g string) bool { return strings.EqualFold(g, e.ID) }) {
 			c.mention(c.in.SelfMXID)
 		}
 	case "channel":
@@ -136,10 +140,10 @@ func (c *converter) embed(n *embedNode) bool {
 		c.file(strings.ToLower(e.ID))
 		remove = true
 	case "message":
-		id := strings.ToLower(e.ID)
-		if c.reply(id) {
+		messageID := strings.ToLower(e.ID)
+		if c.reply(messageID) {
 			remove = true
-		} else if link, ok := c.r.MessageLink(id); ok {
+		} else if link, ok := c.r.MessageLink(messageID); ok {
 			n.href = link
 		}
 	}
@@ -157,14 +161,14 @@ func (c *converter) bareURL(n *ast.AutoLink) bool {
 		return false
 	}
 	label := string(n.Label(c.src))
-	kind, id, ok := c.traqURL(string(n.URL(c.src)))
+	kind, uuid, ok := c.traqURL(string(n.URL(c.src)))
 	if !ok {
 		return false
 	}
 	if kind == "files" {
-		c.file(id)
-	} else if !c.reply(id) {
-		if link, ok := c.r.MessageLink(id); ok {
+		c.file(uuid)
+	} else if !c.reply(uuid) {
+		if link, ok := c.r.MessageLink(uuid); ok {
 			parent := n.Parent()
 			parent.ReplaceChild(parent, n, &embedNode{href: link, text: label})
 		}
@@ -176,7 +180,7 @@ func (c *converter) bareURL(n *ast.AutoLink) bool {
 
 // traqURL reports whether raw is exactly <origin>/files/<uuid> or
 // <origin>/messages/<uuid>, and returns the kind and the lower-cased UUID.
-func (c *converter) traqURL(raw string) (kind, id string, ok bool) {
+func (c *converter) traqURL(raw string) (kind, uuid string, ok bool) {
 	srv := c.in.ServerURL
 	if srv == nil {
 		return "", "", false
@@ -261,6 +265,76 @@ func (c *converter) htmlBlockToText(n *ast.HTMLBlock) {
 	parent.ReplaceChild(parent, n, p)
 }
 
+// remove cuts n out of its parent and tidies the line it leaves: whitespace
+// around the gap collapses, and a line that ends up empty goes entirely. That
+// is what body() does to the source.
+func (c *converter) remove(n ast.Node) {
+	parent := n.Parent()
+	gap := ast.NewTextSegment(text.NewSegment(0, 0))
+	parent.ReplaceChild(parent, n, gap)
+
+	prev, next := gap.PreviousSibling(), gap.NextSibling()
+	atStart := prev == nil || endsLine(prev)
+	atEnd := next == nil || (endsLine(next) && c.blank(next))
+	if t, ok := prev.(*ast.Text); ok && atEnd && !atStart {
+		t.Segment = t.Segment.TrimRightSpace(c.src)
+		if t.Segment.Len() == 0 && !endsLine(t) {
+			parent.RemoveChild(parent, t)
+		}
+	}
+	if t, ok := next.(*ast.Text); ok && !atEnd && (atStart || c.endsInSpace(prev)) {
+		t.Segment = t.Segment.TrimLeftSpace(c.src)
+		if t.Segment.Len() == 0 && !endsLine(t) {
+			parent.RemoveChild(parent, t)
+		}
+	}
+
+	// The line around the gap, up to and including its line break.
+	line := []ast.Node{gap}
+	empty := true
+	for x := gap.PreviousSibling(); x != nil && !endsLine(x); x = x.PreviousSibling() {
+		line = append(line, x)
+	}
+	for x := ast.Node(gap); x != nil; x = x.NextSibling() {
+		if x != gap {
+			line = append(line, x)
+		}
+		if endsLine(x) {
+			break
+		}
+	}
+	for _, x := range line {
+		if !c.blank(x) {
+			empty = false
+			break
+		}
+	}
+	if !empty {
+		parent.RemoveChild(parent, gap)
+		return
+	}
+	for _, x := range line {
+		parent.RemoveChild(parent, x)
+	}
+}
+
+// endsLine reports whether n is a text that ends a source line.
+func endsLine(n ast.Node) bool {
+	t, ok := n.(*ast.Text)
+	return ok && (t.SoftLineBreak() || t.HardLineBreak())
+}
+
+// blank reports whether n is a text with nothing but whitespace in it.
+func (c *converter) blank(n ast.Node) bool {
+	t, ok := n.(*ast.Text)
+	return ok && len(bytes.TrimSpace(t.Segment.Value(c.src))) == 0
+}
+
+func (c *converter) endsInSpace(n ast.Node) bool {
+	t, ok := n.(*ast.Text)
+	return ok && t.Segment.Len() > 0 && isSpace(c.src[t.Segment.Stop-1])
+}
+
 // tidy cleans up n after children were removed: edge whitespace and line
 // breaks go, and nodes left empty are removed too.
 func (c *converter) tidy(n ast.Node) {
@@ -271,8 +345,14 @@ func (c *converter) tidy(n ast.Node) {
 		}
 		parent := n.Parent()
 		parent.RemoveChild(parent, n)
+		// An emptied block takes its container with it, unless that is something
+		// whose shape matters, such as a table row.
 		if n.Type() == ast.TypeBlock {
-			return
+			switch parent.Kind() {
+			case ast.KindBlockquote, ast.KindList, ast.KindListItem:
+			default:
+				return
+			}
 		}
 		n = parent
 	}
@@ -306,11 +386,13 @@ func (c *converter) trimEdges(n ast.Node) {
 }
 
 // body applies the recorded edits to the source. Lines that an edit emptied
-// are dropped; other blank lines stay.
+// are dropped, and so are the blank lines that would then sit next to each
+// other; blank lines of the source stay otherwise.
 func (c *converter) body() string {
-	src := c.in.Content
+	src := string(c.src)
 	var out []string
 	pos, next := 0, 0
+	dropped := false // a line was dropped since the last kept line
 	for _, line := range strings.Split(src, "\n") {
 		end := pos + len(line)
 		var b strings.Builder
@@ -321,20 +403,46 @@ func (c *converter) body() string {
 			b.WriteString(src[cur:e.start])
 			b.WriteString(e.text)
 			cur = e.end
+			if e.text == "" && (e.start == pos || isSpace(src[e.start-1])) {
+				// The removal sat after whitespace: the whitespace behind it goes too.
+				for cur < end && isSpace(src[cur]) {
+					cur++
+				}
+			}
 			touched = true
 		}
 		b.WriteString(src[cur:end])
 		pos = end + 1
 		s := b.String()
 		if touched {
-			s = strings.TrimRight(s, " \t\r")
+			s = strings.TrimRight(s, " \t")
 			if strings.TrimSpace(s) == "" {
+				dropped = true
 				continue
 			}
 		}
+		if dropped && s == "" && len(out) > 0 && out[len(out)-1] == "" {
+			continue
+		}
+		dropped = false
 		out = append(out, s)
 	}
 	return strings.TrimSpace(strings.Join(out, "\n"))
+}
+
+func isSpace(b byte) bool { return b == ' ' || b == '\t' }
+
+var tagRe = regexp.MustCompile(`<[^>]*>`)
+
+// visible reports whether rendered HTML shows anything: text, or an image,
+// rule or checkbox.
+func visible(html string) bool {
+	for _, tag := range []string{"<img", "<hr", "<input"} {
+		if strings.Contains(html, tag) {
+			return true
+		}
+	}
+	return strings.TrimSpace(tagRe.ReplaceAllString(html, "")) != ""
 }
 
 func (c *converter) render(doc ast.Node) string {

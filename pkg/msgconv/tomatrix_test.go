@@ -3,6 +3,7 @@ package msgconv
 import (
 	"net/url"
 	"reflect"
+	"strings"
 	"testing"
 
 	"maunium.net/go/mautrix/id"
@@ -23,7 +24,8 @@ func (f fakeResolver) CanReplyTo(m string) bool            { return f.replies[m]
 const (
 	uAlice = "11111111-1111-1111-1111-111111111111"
 	uSelf  = "22222222-2222-2222-2222-222222222222"
-	gSelf  = "33333333-3333-3333-3333-333333333333"
+	uBob   = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+	gSelf  = "cccccccc-cccc-cccc-cccc-cccccccccccc"
 	gOther = "44444444-4444-4444-4444-444444444444"
 	cGen   = "55555555-5555-5555-5555-555555555555"
 	cNone  = "66666666-6666-6666-6666-666666666666"
@@ -32,18 +34,19 @@ const (
 	f1     = "99999999-9999-9999-9999-999999999999"
 )
 
+const fileURL = "https://q.example.jp/files/" + f1
+
 func input(content string) ToMatrixInput {
 	return ToMatrixInput{
 		Content:    content,
 		ServerURL:  &url.URL{Scheme: "https", Host: "q.example.jp"},
-		SelfUserID: uSelf,
 		SelfGroups: []string{gSelf},
 		SelfMXID:   "@me:example.org",
 	}
 }
 
 var resolver = fakeResolver{
-	users:    map[string]id.UserID{uAlice: "@traq_alice:example.org", uSelf: "@me:example.org"},
+	users:    map[string]id.UserID{uAlice: "@traq_alice:example.org", uSelf: "@me:example.org", uBob: "@traq_bob:example.org"},
 	channels: map[string]string{cGen: "https://matrix.to/#/!gen:example.org"},
 	links:    map[string]string{m2: "https://matrix.to/#/!gen:example.org/$ev2"},
 	replies:  map[string]bool{m1: true},
@@ -93,6 +96,21 @@ func TestToMatrix(t *testing.T) {
 		{"table", "|a|b|\n|-|-|\n|1|2|", ToMatrixResult{Body: "|a|b|\n|-|-|\n|1|2|",
 			HTML: "<table>\n<thead>\n<tr>\n<th>a</th>\n<th>b</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>1</td>\n<td>2</td>\n</tr>\n</tbody>\n</table>"}},
 		{"raw html block escaped", "<div>\nhi\n</div>\n\nx", ToMatrixResult{Body: "<div>\nhi\n</div>\n\nx", HTML: "<p>&lt;div&gt;<br>hi<br>&lt;/div&gt;</p>\n<p>x</p>"}},
+		{"file url alone on a middle line", "a\n" + fileURL + "\nb", ToMatrixResult{Body: "a\nb", HTML: "a<br>b", FileIDs: []string{f1}}},
+		{"file url alone on a middle line, CRLF", "a\r\n" + fileURL + "\r\nb", ToMatrixResult{Body: "a\nb", HTML: "a<br>b", FileIDs: []string{f1}}},
+		{"file url alone on the first line", fileURL + "\nb", ToMatrixResult{Body: "b", HTML: "b", FileIDs: []string{f1}}},
+		{"file url inline leaves one space", "a " + fileURL + " b", ToMatrixResult{Body: "a b", HTML: "a b", FileIDs: []string{f1}}},
+		{"file url between paragraphs leaves one blank line", "a\n\n" + fileURL + "\n\nb", ToMatrixResult{Body: "a\n\nb", HTML: "<p>a</p>\n<p>b</p>", FileIDs: []string{f1}}},
+		{"only a bold file url", "**" + fileURL + "**", ToMatrixResult{FileIDs: []string{f1}}},
+		{"only a quoted file url", "> " + fileURL, ToMatrixResult{FileIDs: []string{f1}}},
+		{"only a listed file url", "- " + fileURL, ToMatrixResult{FileIDs: []string{f1}}},
+		{"list keeps the text item", "- " + fileURL + "\n- x", ToMatrixResult{Body: "-\n- x", HTML: "<ul>\n<li>x</li>\n</ul>", FileIDs: []string{f1}}},
+		{"spoiler around an embed", `!!!{"type":"user","raw":"@alice","id":"` + uAlice + `"}!!`,
+			ToMatrixResult{Body: "!!@alice!!", HTML: `<span data-mx-spoiler><a href="https://matrix.to/#/@traq_alice:example.org">@alice</a></span>`, Mentions: []id.UserID{"@traq_alice:example.org"}}},
+		{"upper-case user id", `!{"type":"user","raw":"@bob","id":"` + strings.ToUpper(uBob) + `"}`,
+			ToMatrixResult{Body: "@bob", HTML: `<a href="https://matrix.to/#/@traq_bob:example.org">@bob</a>`, Mentions: []id.UserID{"@traq_bob:example.org"}}},
+		{"upper-case group id", `!{"type":"group","raw":"@all","id":"` + strings.ToUpper(gSelf) + `"}`,
+			ToMatrixResult{Body: "@all", HTML: "@all", Mentions: []id.UserID{"@me:example.org"}}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
