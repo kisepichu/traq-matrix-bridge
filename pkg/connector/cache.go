@@ -2,6 +2,7 @@ package connector
 
 import (
 	"context"
+	"maps"
 	"strings"
 	"sync"
 
@@ -75,6 +76,13 @@ func buildChannelTree(list *traq.ChannelList) *channelTree {
 func (t *channelTree) Get(channelID string) (channelInfo, bool) {
 	ch, ok := t.byID[channelID]
 	return ch, ok
+}
+
+// withDM returns a copy of the tree with one more DM channel. Paths are shared: DMs have none.
+func (t *channelTree) withDM(ch channelInfo) *channelTree {
+	byID := maps.Clone(t.byID)
+	byID[ch.ID] = ch
+	return &channelTree{byID: byID, byPath: t.byPath}
 }
 
 // ByPath looks up a public channel by its path, with or without a leading '#'.
