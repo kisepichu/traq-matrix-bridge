@@ -3,6 +3,7 @@ module github.com/kisepichu/traq-matrix-bridge
 go 1.26.0
 
 require (
+	github.com/yuin/goldmark v1.8.7
 	go.mau.fi/util v0.11.1
 	gopkg.in/yaml.v3 v3.0.1
 	maunium.net/go/mautrix v0.33.0
@@ -24,7 +25,6 @@ require (
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.3.0 // indirect
 	github.com/tidwall/sjson v1.2.5 // indirect
-	github.com/yuin/goldmark v1.8.7 // indirect
 	go.mau.fi/zeroconfig v0.2.0 // indirect
 	golang.org/x/crypto v0.59.0 // indirect
 	golang.org/x/exp v0.0.0-20261113113407-e3970619a1a4 // indirect
