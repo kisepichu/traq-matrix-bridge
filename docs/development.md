@@ -86,7 +86,7 @@ testenv/dev.sh setup
 
 `TRAQ_INIT_EMOJIS=1` は `testenv/compose.emojis.yaml` を重ねて traQ を `--skip-init-emojis` 無しで起動し、traQ が応答するまで最大 30 分待つ。絵文字の取得に失敗しても traQ はそのまま起動するので、stamp が少ない時は `docker compose -p tmb logs traq` で `failed to install unicode emojis` を確かめる。結合テストと CI は `compose.yaml` だけを使うので影響しない。
 
-bridge は最初に CONNECTED になった login の API で stamp の一覧を DB (`traq_stamp`) に取り込み、Unicode stamp の file 名 (`1f44d.svg` など) から絵文字を 100ms に 1 件ずつ解決する (約 1700 個で 3 分ほど)。進み具合は 500 件ごとに、終わると `The stamp table is complete` が log に出る。解決した表は DB に残るので、再起動後は解決し直さない。その途中でも、bridge する message や reaction に付いた Unicode stamp はその場で解決する。file 名が絵文字でないものや、meta の読み込みが 5 回失敗したものは解決できないものとして飛ばす (`Giving up on the emoji of a Unicode stamp`)。
+bridge は最初に CONNECTED になった login の API で stamp の一覧を DB (`traq_stamp`) に取り込み、Unicode stamp の file 名 (`1f44d.svg` など) から絵文字を 100ms に 1 件ずつ解決する (約 1700 個で 3 分ほど)。進み具合は 500 件ごとに、終わると `The stamp table is complete` が log に出る。解決した表は DB に残るので、再起動後は解決し直さない。その途中でも、bridge する message や reaction に付いた Unicode stamp はその場で解決する。file が無いものや file 名が絵文字でないものは、解決できないものとして DB に記録する。meta の読み込みがそれ以外の理由で 5 回失敗したものは、その process の間だけ飛ばし (`Giving up on the emoji of a Unicode stamp until the bridge restarts`)、次の起動で読み直す。
 
 ### 片付け
 

@@ -445,7 +445,9 @@ func (c *TraQClient) reactionKey(ctx context.Context, stampID string) (string, e
 			zerolog.Ctx(ctx).Warn().Err(err).Str("traq_stamp_id", stampID).
 				Msg("Failed to resolve the emoji of a Unicode stamp, using its name")
 		}
-		s = resolved
+		if resolved.ID != "" { // else deleted meanwhile: keep the stamp the reaction was made with
+			s = resolved
+		}
 	}
 	return stampconv.ReactionKey(s), nil
 }

@@ -171,76 +171,82 @@ func (h *countingHandler) count(id string) int {
 	return h.calls[id]
 }
 
-// A stamp whose file meta keeps failing uses up its retry budget and is marked unresolvable, so the job still
-// completes and the stored table is complete.
+// A stamp whose file meta keeps failing without a definite answer (an error status other than 404, a timeout,
+// a reset connection) uses up its retry budget and is given up on for this run only: the job completes and the
+// table is complete, but the stored stamp stays pending, so the next start tries it again.
 func TestSyncStampsRetryBudget(t *testing.T) {
-	var metas countingHandler
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/v3/stamps", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`[{"id":"bad","name":"bad","fileId":"f-bad","isUnicode":true},{"id":"ok","name":"thumbsup","fileId":"f-ok","isUnicode":true}]`))
-	})
-	mux.HandleFunc("GET /api/v3/files/{id}/meta", func(w http.ResponseWriter, r *http.Request) {
-		metas.add(r.PathValue("id"))
-		if r.PathValue("id") == "f-bad" {
-			http.Error(w, `{"message":"boom"}`, http.StatusInternalServerError)
-			return
+	// The traQ client itself retries a GET that got 502 or 504 3 times; Retry-After: 0 makes that quick.
+	proxyError := func(status int) func(w http.ResponseWriter) {
+		return func(w http.ResponseWriter) {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(status)
 		}
-		_, _ = w.Write([]byte(`{"id":"f-ok","name":"1f44d.svg"}`))
-	})
-	c := newStampConnector(t)
-	c.stampSync.clients = []*TraQClient{{API: newStampAPI(t, mux)}}
-	c.stampSync.retryMin = time.Millisecond
+	}
+	cases := []struct {
+		name     string
+		fail     func(w http.ResponseWriter)
+		requests int // HTTP requests per attempt of the job
+	}{
+		{"500", func(w http.ResponseWriter) { http.Error(w, `{"message":"boom"}`, http.StatusInternalServerError) }, 1},
+		{"502", proxyError(http.StatusBadGateway), 4},
+		{"503", func(w http.ResponseWriter) { http.Error(w, "unavailable", http.StatusServiceUnavailable) }, 1},
+		{"504", proxyError(http.StatusGatewayTimeout), 4},
+		{"timeout", func(http.ResponseWriter) { time.Sleep(200 * time.Millisecond) }, 1},
+		{"reset", func(w http.ResponseWriter) {
+			if conn, _, err := w.(http.Hijacker).Hijack(); err == nil {
+				_ = conn.Close() // no response at all
+			}
+		}, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var metas countingHandler
+			mux := http.NewServeMux()
+			mux.HandleFunc("GET /api/v3/stamps", func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(`[{"id":"bad","name":"bad","fileId":"f-bad","isUnicode":true},{"id":"ok","name":"thumbsup","fileId":"f-ok","isUnicode":true}]`))
+			})
+			mux.HandleFunc("GET /api/v3/files/{id}/meta", func(w http.ResponseWriter, r *http.Request) {
+				metas.add(r.PathValue("id"))
+				if r.PathValue("id") == "f-bad" {
+					tc.fail(w)
+					return
+				}
+				_, _ = w.Write([]byte(`{"id":"f-ok","name":"1f44d.svg"}`))
+			})
+			srv := httptest.NewServer(mux)
+			t.Cleanup(srv.Close)
+			// Without keep-alives, net/http does not resend a request whose reused connection was reset.
+			transport := srv.Client().Transport.(*http.Transport).Clone()
+			transport.DisableKeepAlives = true
+			api, err := traq.NewClient(srv.URL, &http.Client{Transport: transport, Timeout: 50 * time.Millisecond}, "token", userAgent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c := newStampConnector(t)
+			c.stampSync.clients = []*TraQClient{{API: api}}
+			c.stampSync.retryMin = time.Millisecond
 
-	ctx := context.Background()
-	if done, err := c.syncStamps(ctx); !done || err != nil {
-		t.Fatalf("syncStamps = %v, %v, want true, nil", done, err)
-	}
-	if n := metas.count("f-bad"); n != stampResolveAttempts {
-		t.Errorf("FileMeta of the failing stamp was called %d times, want %d", n, stampResolveAttempts)
-	}
-	if s, _ := c.Stamps.ByID("bad"); !s.Unresolvable || s.Emoji != "" {
-		t.Errorf("failing stamp = %+v, want it unresolvable", s)
-	}
-	if s, _ := c.Stamps.ByID("ok"); s.Emoji != "👍" {
-		t.Errorf("stamp after the failing one = %+v, want it resolved", s)
-	}
-	if complete, err := c.stampDB.Complete(ctx); !complete || err != nil {
-		t.Errorf("stored Complete = %v, %v, want true", complete, err)
-	}
-}
-
-// A traQ that cannot be reached says nothing about the stamp, so it uses no retry budget: the job keeps
-// retrying instead of marking every stamp unresolvable during an outage.
-func TestSyncStampsUnreachableUsesNoBudget(t *testing.T) {
-	var metas countingHandler
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/v3/stamps", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`[{"id":"u1","name":"thumbsup","fileId":"f-u1","isUnicode":true}]`))
-	})
-	mux.HandleFunc("GET /api/v3/files/{id}/meta", func(w http.ResponseWriter, r *http.Request) {
-		metas.add(r.PathValue("id"))
-		conn, _, err := w.(http.Hijacker).Hijack()
-		if err == nil {
-			_ = conn.Close() // no response at all
-		}
-	})
-	c := newStampConnector(t)
-	c.stampSync.clients = []*TraQClient{{API: newStampAPI(t, mux)}}
-	c.stampSync.retryMin = time.Millisecond
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() {
-		for metas.count("f-u1") < 2*stampResolveAttempts {
-			time.Sleep(time.Millisecond)
-		}
-		cancel()
-	}()
-	if done, err := c.syncStamps(ctx); done || !errors.Is(err, context.Canceled) {
-		t.Fatalf("syncStamps = %v, %v, want false, context.Canceled", done, err)
-	}
-	if s, _ := c.Stamps.ByID("u1"); !s.EmojiPending() {
-		t.Errorf("stamp = %+v, want it still pending", s)
+			ctx, cancel := context.WithTimeout(zerolog.Nop().WithContext(context.Background()), 10*time.Second)
+			defer cancel()
+			if done, err := c.syncStamps(ctx); !done || err != nil {
+				t.Fatalf("syncStamps = %v, %v, want true, nil", done, err)
+			}
+			if n, want := metas.count("f-bad"), stampResolveAttempts*tc.requests; n != want {
+				t.Errorf("FileMeta of the failing stamp was requested %d times, want %d", n, want)
+			}
+			if s, _ := c.Stamps.ByID("bad"); !s.Unresolvable || s.Emoji != "" {
+				t.Errorf("failing stamp = %+v, want it given up on", s)
+			}
+			if s, _ := c.Stamps.ByID("ok"); s.Emoji != "👍" {
+				t.Errorf("stamp after the failing one = %+v, want it resolved", s)
+			}
+			if _, err := c.Stamps.Resolve("🦄"); !errors.Is(err, stampconv.ErrUnknownStamp) {
+				t.Errorf("Resolve(🦄) = %v, want ErrUnknownStamp (the table is complete)", err)
+			}
+			if pending, _ := c.stampDB.PendingUnicode(ctx); !slices.Equal(pending, []stampdb.Pending{{ID: "bad", FileID: "f-bad"}}) {
+				t.Errorf("stored pending stamps = %+v, want the failing stamp, to try it again on the next start", pending)
+			}
+		})
 	}
 }
 
@@ -340,6 +346,141 @@ func TestReactionKeyOnDemandFailure(t *testing.T) {
 	}
 	if s, _ := c.Main.Stamps.ByID("gone"); !s.Unresolvable {
 		t.Errorf("stamp with a missing file = %+v, want it unresolvable", s)
+	}
+	// Only the definite answer is stored.
+	if pending, _ := c.Main.stampDB.PendingUnicode(ctx); !slices.Equal(pending, []stampdb.Pending{{ID: "flaky", FileID: "f-flaky"}}) {
+		t.Errorf("stored pending stamps = %+v, want only flaky", pending)
+	}
+}
+
+// awaitRequest waits until h has seen a request for id. If none comes, it closes release, so that the blocked
+// handlers return, and fails the test.
+func awaitRequest(t *testing.T, h *countingHandler, id string, release chan struct{}) {
+	t.Helper()
+	for deadline := time.Now().Add(2 * time.Second); h.count(id) == 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			close(release)
+			t.Fatalf("traQ was not asked for %s", id)
+		}
+	}
+}
+
+// within runs fn and fails the test if it does not return within 2 s, as when it waits for a lock that a
+// blocked FileMeta call holds.
+func within(t *testing.T, what string, fn func() error) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- fn() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("%s: %v", what, err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Errorf("%s waited for the FileMeta call", what)
+	}
+}
+
+// Concurrent resolutions of one stamp share one FileMeta call also when it fails, and every caller gets the
+// failure. The call is made without the write lock, so the STAMP_* handling is not held up by it.
+func TestResolveEmojiSharedFailure(t *testing.T) {
+	var metas countingHandler
+	release := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v3/files/{id}/meta", func(w http.ResponseWriter, r *http.Request) {
+		metas.add(r.PathValue("id"))
+		<-release
+		http.Error(w, `{"message":"boom"}`, http.StatusInternalServerError)
+	})
+	c := newStampConnector(t, stampconv.Stamp{ID: "u1", Name: "thumbsup", Unicode: true}, stampconv.Stamp{ID: "other", Name: "other"})
+	api := newStampAPI(t, mux)
+	ctx := zerolog.Nop().WithContext(context.Background())
+
+	const n = 10
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Go(func() { _, errs[i] = c.resolveEmoji(ctx, api, "u1") })
+	}
+	awaitRequest(t, &metas, "f-u1", release)
+	time.Sleep(50 * time.Millisecond) // let the other callers reach the resolution
+	within(t, "STAMP_DELETED of another stamp", func() error { return c.deleteStamp(ctx, "other") })
+	close(release)
+	wg.Wait()
+	for i, err := range errs {
+		if !traq.IsStatus(err, http.StatusInternalServerError) {
+			t.Errorf("resolveEmoji #%d: err = %v, want the 500", i, err)
+		}
+	}
+	if got := metas.count("f-u1"); got != 1 {
+		t.Errorf("FileMeta was called %d times, want 1", got)
+	}
+	if s, _ := c.Stamps.ByID("u1"); !s.EmojiPending() {
+		t.Errorf("stamp = %+v, want it still pending", s)
+	}
+}
+
+// A resolution is not stored when the stamp got another image meanwhile (STAMP_UPDATED): it is older.
+func TestResolveEmojiKeepsANewerFile(t *testing.T) {
+	var metas countingHandler
+	release := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v3/stamps/u1", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"u1","name":"thumbsup","fileId":"f-new","isUnicode":true}`))
+	})
+	mux.HandleFunc("GET /api/v3/files/{id}/meta", func(w http.ResponseWriter, r *http.Request) {
+		metas.add(r.PathValue("id"))
+		if r.PathValue("id") == "f-new" {
+			http.Error(w, `{"message":"boom"}`, http.StatusInternalServerError)
+			return
+		}
+		<-release
+		_, _ = w.Write([]byte(`{"id":"f-u1","name":"1f44d.svg"}`))
+	})
+	c := newStampConnector(t, stampconv.Stamp{ID: "u1", Name: "thumbsup", Unicode: true})
+	api := newStampAPI(t, mux)
+	ctx := zerolog.Nop().WithContext(context.Background())
+
+	res := make(chan stampconv.Stamp, 1)
+	go func() {
+		s, _ := c.resolveEmoji(ctx, api, "u1")
+		res <- s
+	}()
+	awaitRequest(t, &metas, "f-u1", release)
+	// The new image's meta fails, so the refresh stores the stamp pending with the new file.
+	within(t, "STAMP_UPDATED", func() error { return c.refreshStamp(ctx, api, "u1") })
+	close(release)
+	if s := <-res; !s.EmojiPending() {
+		t.Errorf("resolveEmoji = %+v, want the stamp as the refresh left it, pending", s)
+	}
+	if pending, _ := c.stampDB.PendingUnicode(ctx); !slices.Equal(pending, []stampdb.Pending{{ID: "u1", FileID: "f-new"}}) {
+		t.Errorf("stored pending stamps = %+v, want u1 with f-new", pending)
+	}
+}
+
+// A stamp deleted while its emoji is being resolved keeps the key it had.
+func TestReactionKeyStampDeletedMeanwhile(t *testing.T) {
+	var metas countingHandler
+	release := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v3/files/{id}/meta", func(w http.ResponseWriter, r *http.Request) {
+		metas.add(r.PathValue("id"))
+		<-release
+		_, _ = w.Write([]byte(`{"id":"f-u1","name":"1f44d.svg"}`))
+	})
+	c := &TraQClient{Main: newStampConnector(t, stampconv.Stamp{ID: "u1", Name: "thumbsup", Unicode: true}), API: newStampAPI(t, mux)}
+	ctx := zerolog.Nop().WithContext(context.Background())
+
+	keys := make(chan string, 1)
+	go func() {
+		key, _ := c.reactionKey(ctx, "u1")
+		keys <- key
+	}()
+	awaitRequest(t, &metas, "f-u1", release)
+	within(t, "STAMP_DELETED", func() error { return c.Main.deleteStamp(ctx, "u1") })
+	close(release)
+	if key := <-keys; key != ":thumbsup:" {
+		t.Errorf("reactionKey = %q, want :thumbsup:", key)
 	}
 }
 
