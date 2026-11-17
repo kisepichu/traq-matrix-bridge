@@ -1,0 +1,105 @@
+package msgconv
+
+import (
+	"net/url"
+	"reflect"
+	"testing"
+
+	"maunium.net/go/mautrix/id"
+)
+
+type fakeResolver struct {
+	users    map[string]id.UserID
+	channels map[string]string
+	links    map[string]string
+	replies  map[string]bool
+}
+
+func (f fakeResolver) UserMXID(u string) (id.UserID, bool) { v, ok := f.users[u]; return v, ok }
+func (f fakeResolver) ChannelLink(c string) (string, bool) { v, ok := f.channels[c]; return v, ok }
+func (f fakeResolver) MessageLink(m string) (string, bool) { v, ok := f.links[m]; return v, ok }
+func (f fakeResolver) CanReplyTo(m string) bool            { return f.replies[m] }
+
+const (
+	uAlice = "11111111-1111-1111-1111-111111111111"
+	uSelf  = "22222222-2222-2222-2222-222222222222"
+	gSelf  = "33333333-3333-3333-3333-333333333333"
+	gOther = "44444444-4444-4444-4444-444444444444"
+	cGen   = "55555555-5555-5555-5555-555555555555"
+	cNone  = "66666666-6666-6666-6666-666666666666"
+	m1     = "77777777-7777-7777-7777-777777777777"
+	m2     = "88888888-8888-8888-8888-888888888888"
+	f1     = "99999999-9999-9999-9999-999999999999"
+)
+
+func input(content string) ToMatrixInput {
+	return ToMatrixInput{
+		Content:    content,
+		ServerURL:  &url.URL{Scheme: "https", Host: "q.example.jp"},
+		SelfUserID: uSelf,
+		SelfGroups: []string{gSelf},
+		SelfMXID:   "@me:example.org",
+	}
+}
+
+var resolver = fakeResolver{
+	users:    map[string]id.UserID{uAlice: "@traq_alice:example.org", uSelf: "@me:example.org"},
+	channels: map[string]string{cGen: "https://matrix.to/#/!gen:example.org"},
+	links:    map[string]string{m2: "https://matrix.to/#/!gen:example.org/$ev2"},
+	replies:  map[string]bool{m1: true},
+}
+
+func TestToMatrix(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want ToMatrixResult
+	}{
+		{"plain", "hello", ToMatrixResult{Body: "hello", HTML: "hello"}},
+		{"hard wrap", "a\nb", ToMatrixResult{Body: "a\nb", HTML: "a<br>b"}},
+		{"bold and raw html escaped", "**x** <b>y</b>", ToMatrixResult{Body: "**x** <b>y</b>", HTML: "<strong>x</strong> &lt;b&gt;y&lt;/b&gt;"}},
+		{"user mention", `!{"type":"user","raw":"@alice","id":"` + uAlice + `"} hi`,
+			ToMatrixResult{Body: "@alice hi", HTML: `<a href="https://matrix.to/#/@traq_alice:example.org">@alice</a> hi`, Mentions: []id.UserID{"@traq_alice:example.org"}}},
+		{"self mention", `!{"type":"user","raw":"@me","id":"` + uSelf + `"}`,
+			ToMatrixResult{Body: "@me", HTML: `<a href="https://matrix.to/#/@me:example.org">@me</a>`, Mentions: []id.UserID{"@me:example.org"}}},
+		{"own group mentions self", `!{"type":"group","raw":"@all","id":"` + gSelf + `"}`,
+			ToMatrixResult{Body: "@all", HTML: "@all", Mentions: []id.UserID{"@me:example.org"}}},
+		{"other group", `!{"type":"group","raw":"@x","id":"` + gOther + `"}`, ToMatrixResult{Body: "@x", HTML: "@x"}},
+		{"bridged channel", `!{"type":"channel","raw":"#gps/general","id":"` + cGen + `"}`,
+			ToMatrixResult{Body: "#gps/general", HTML: `<a href="https://matrix.to/#/!gen:example.org">#gps/general</a>`}},
+		{"unbridged channel", `!{"type":"channel","raw":"#a/b","id":"` + cNone + `"}`,
+			ToMatrixResult{Body: "#a/b", HTML: `<a href="https://q.example.jp/channels/a/b">#a/b</a>`}},
+		{"embed in code span stays", "`!{\"type\":\"user\",\"raw\":\"@alice\",\"id\":\"" + uAlice + "\"}`",
+			ToMatrixResult{Body: "`!{\"type\":\"user\",\"raw\":\"@alice\",\"id\":\"" + uAlice + "\"}`", HTML: "<code>!{&quot;type&quot;:&quot;user&quot;,&quot;raw&quot;:&quot;@alice&quot;,&quot;id&quot;:&quot;" + uAlice + "&quot;}</code>"}},
+		{"broken embed stays", `!{"type":"user",`, ToMatrixResult{Body: `!{"type":"user",`, HTML: `!{&quot;type&quot;:&quot;user&quot;,`}},
+		{"spoiler", "a !!secret!! b", ToMatrixResult{Body: "a !!secret!! b", HTML: "a <span data-mx-spoiler>secret</span> b"}},
+		{"file url removed", "look\nhttps://q.example.jp/files/" + f1,
+			ToMatrixResult{Body: "look", HTML: "look", FileIDs: []string{f1}}},
+		{"file embed removed and deduplicated", `!{"type":"file","raw":"x","id":"` + f1 + `"} https://q.example.jp/files/` + f1,
+			ToMatrixResult{FileIDs: []string{f1}}},
+		{"first reply candidate becomes reply", "https://q.example.jp/messages/" + m1 + "\nyes",
+			ToMatrixResult{Body: "yes", HTML: "yes", ReplyTo: m1}},
+		{"bridged message elsewhere becomes link", "see https://q.example.jp/messages/" + m2,
+			ToMatrixResult{Body: "see https://q.example.jp/messages/" + m2, HTML: `see <a href="https://matrix.to/#/!gen:example.org/$ev2">https://q.example.jp/messages/` + m2 + `</a>`}},
+		{"explicit link untouched", "[x](https://q.example.jp/files/" + f1 + ")",
+			ToMatrixResult{Body: "[x](https://q.example.jp/files/" + f1 + ")", HTML: `<a href="https://q.example.jp/files/` + f1 + `">x</a>`}},
+		{"other origin untouched", "https://other.example/files/" + f1,
+			ToMatrixResult{Body: "https://other.example/files/" + f1, HTML: `<a href="https://other.example/files/` + f1 + `">https://other.example/files/` + f1 + `</a>`}},
+		{"upper-case file url is lower-cased", "https://q.example.jp/files/AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA x",
+			ToMatrixResult{Body: "x", HTML: "x", FileIDs: []string{"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}}},
+		{"two paragraphs", "a\n\nb", ToMatrixResult{Body: "a\n\nb", HTML: "<p>a</p>\n<p>b</p>"}},
+		{"list", "- x\n- y", ToMatrixResult{Body: "- x\n- y", HTML: "<ul>\n<li>x</li>\n<li>y</li>\n</ul>"}},
+		{"code block keeps spoiler marks", "```\ncode !!x!!\n```", ToMatrixResult{Body: "```\ncode !!x!!\n```", HTML: "<pre><code>code !!x!!\n</code></pre>"}},
+		{"table", "|a|b|\n|-|-|\n|1|2|", ToMatrixResult{Body: "|a|b|\n|-|-|\n|1|2|",
+			HTML: "<table>\n<thead>\n<tr>\n<th>a</th>\n<th>b</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>1</td>\n<td>2</td>\n</tr>\n</tbody>\n</table>"}},
+		{"raw html block escaped", "<div>\nhi\n</div>\n\nx", ToMatrixResult{Body: "<div>\nhi\n</div>\n\nx", HTML: "<p>&lt;div&gt;<br>hi<br>&lt;/div&gt;</p>\n<p>x</p>"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := ToMatrix(input(c.in), resolver)
+			if !reflect.DeepEqual(got, c.want) {
+				t.Errorf("ToMatrix(%q)\n got  %#v\n want %#v", c.in, got, c.want)
+			}
+		})
+	}
+}
