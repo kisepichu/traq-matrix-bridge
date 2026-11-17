@@ -5,6 +5,8 @@ package traq_test
 import (
 	"context"
 	"slices"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,6 +23,11 @@ const (
 type wsListener struct {
 	conn   *traq.WSConn
 	events chan traq.Event
+
+	exited  chan struct{} // closed when the reader goroutine has returned
+	mu      sync.Mutex
+	readErr error        // why the reader returned; set before exited is closed
+	dropped atomic.Int64 // events discarded because the events buffer was full
 }
 
 // listen authorizes cfg for s, dials the WebSocket and starts reading. Every received event is logged (-v).
@@ -33,39 +40,63 @@ func listen(t *testing.T, s *session, cfg traq.OAuthConfig) *wsListener {
 	if err != nil {
 		t.Fatalf("DialWS: %v", err)
 	}
-	l := &wsListener{conn: conn, events: make(chan traq.Event, 256)}
+	l := &wsListener{conn: conn, events: make(chan traq.Event, 256), exited: make(chan struct{})}
 	readCtx, stop := context.WithCancel(context.Background())
-	done := make(chan struct{})
 	go func() {
-		defer close(done)
+		defer close(l.exited)
 		for {
 			ev, err := conn.ReadEvent(readCtx)
 			if err != nil {
+				l.mu.Lock()
+				l.readErr = err
+				l.mu.Unlock()
 				return
 			}
 			select {
 			case l.events <- ev:
-			default: // a full buffer would only happen if the test is already failing
+			default:
+				l.dropped.Add(1)
 			}
 		}
 	}()
 	t.Cleanup(func() {
 		stop()
-		<-done
+		<-l.exited
 		conn.Close()
 	})
 	return l
 }
 
+// alive fails the test if the reader goroutine has exited (the connection died) or an event was dropped. A
+// negative assertion is only meaningful while both hold.
+func (l *wsListener) alive(t *testing.T) {
+	t.Helper()
+	select {
+	case <-l.exited:
+		l.mu.Lock()
+		err := l.readErr
+		l.mu.Unlock()
+		t.Fatalf("the WebSocket reader has exited: %v", err)
+	default:
+	}
+	if n := l.dropped.Load(); n > 0 {
+		t.Fatalf("%d events were dropped because the listener's buffer was full", n)
+	}
+}
+
 // sync sends a ping and waits for the pong. traQ handles a connection's frames in order, so the commands sent
-// before the ping have been applied once it returns.
+// before the ping have been applied once it returns. It also proves the connection is alive and the reader is
+// running, and every event traQ sent before the pong is in l.events when it returns.
 func (l *wsListener) sync(t *testing.T) {
 	t.Helper()
+	l.alive(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := l.conn.Ping(ctx); err != nil {
+		l.alive(t) // prefer the reader's error, which is the root cause
 		t.Fatalf("Ping: %v", err)
 	}
+	l.alive(t)
 }
 
 // idOf returns the "id" of an IDEvent body, or "" if the body is something else.
@@ -89,25 +120,46 @@ func (l *wsListener) expect(t *testing.T, what, typ string, match func(traq.Even
 			if ev.Type == typ && match(ev) {
 				return ev
 			}
+		case <-l.exited:
+			l.alive(t)
 		case <-timer.C:
+			l.alive(t)
 			t.Fatalf("%s: no %s event within %s", what, typ, wsEventTimeout)
 		}
 	}
 }
 
 // expectNone fails if a matching event arrives within wsQuietWindow. Other events are ignored (and logged).
+// Silence only counts if the connection is still alive afterwards: a final sync proves the reader is still
+// running and that no event was dropped, and the events that arrived before its pong are checked too.
 func (l *wsListener) expectNone(t *testing.T, what, typ string, match func(traq.Event) bool) {
 	t.Helper()
+	check := func(ev traq.Event) {
+		t.Helper()
+		t.Logf("event %s %s", ev.Type, ev.Body)
+		if ev.Type == typ && match(ev) {
+			t.Fatalf("%s: got %s %s, which traQ is expected not to deliver", what, ev.Type, ev.Body)
+		}
+	}
 	timer := time.NewTimer(wsQuietWindow)
 	defer timer.Stop()
+wait:
 	for {
 		select {
 		case ev := <-l.events:
-			t.Logf("event %s %s", ev.Type, ev.Body)
-			if ev.Type == typ && match(ev) {
-				t.Fatalf("%s: got %s %s, which traQ is expected not to deliver", what, ev.Type, ev.Body)
-			}
+			check(ev)
+		case <-l.exited:
+			l.alive(t)
 		case <-timer.C:
+			break wait
+		}
+	}
+	l.sync(t)
+	for {
+		select {
+		case ev := <-l.events:
+			check(ev)
+		default:
 			return
 		}
 	}

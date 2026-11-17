@@ -18,15 +18,23 @@ const (
 
 // WSConn is a connection to traQ's event WebSocket. Its methods are safe for concurrent use. Keepalive and
 // reconnection are the caller's job.
+//
+// A context that is cancelled or expires while a write (SetTimelineStreaming, SetViewState, the send phase
+// of Ping) or ReadEvent is blocked in I/O closes the whole connection, not just that call. Do not pass short
+// per-call timeouts unless you intend to reconnect afterwards. After that, every method returns an error.
+// (A context that is already done on entry makes the call fail but may leave the connection open.)
 type WSConn struct {
 	conn *websocket.Conn
-	mu   sync.Mutex // serializes writes
+	// mu makes each command a unit on our side. coder/websocket already serializes frame writes, so this is
+	// not what keeps concurrent writes from corrupting each other.
+	mu sync.Mutex
 }
 
 // DialWS connects to <serverURL>/api/v3/ws with "Authorization: Bearer <accessToken>". An https server URL
 // is dialed as wss and http as ws. A refused handshake is returned as *HTTPError, so a rejected token shows
-// up as IsStatus(err, 401). httpClient may be nil; its Timeout must be 0 because it would also cap the
-// lifetime of the connection.
+// up as IsStatus(err, 401). httpClient may be nil. ctx and httpClient.Timeout (coder/websocket v1.8.15
+// applies a non-zero Timeout to the handshake only, not to the established connection) bound the handshake;
+// once DialWS returns, ctx no longer affects the connection.
 func DialWS(ctx context.Context, serverURL, accessToken string, httpClient *http.Client) (*WSConn, error) {
 	origin, err := parseOrigin(serverURL)
 	if err != nil {
@@ -103,7 +111,8 @@ func (c *WSConn) ReadEvent(ctx context.Context) (Event, error) {
 }
 
 // Ping sends a WebSocket ping and waits for the pong. The pong is only processed while another goroutine is
-// inside ReadEvent.
+// inside ReadEvent. A ctx that ends while the ping is being written closes the connection; one that ends
+// while waiting for the pong only makes Ping return an error.
 func (c *WSConn) Ping(ctx context.Context) error {
 	if err := c.conn.Ping(ctx); err != nil {
 		return fmt.Errorf("ping the traQ WebSocket: %w", err)

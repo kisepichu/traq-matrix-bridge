@@ -192,3 +192,75 @@ func TestPing(t *testing.T) {
 		t.Fatalf("Ping: %v", err)
 	}
 }
+
+func TestWriteAfterReadContextCancelFails(t *testing.T) {
+	srv, _ := wsServer(t, func(ctx context.Context, c *websocket.Conn) {
+		c.Read(ctx)
+	})
+	c := dialTest(t, srv)
+	ctx, cancel := context.WithCancel(t.Context())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+	if _, err := c.ReadEvent(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ReadEvent err = %v, want it to wrap context.Canceled", err)
+	}
+	// The cancelled read closed the connection, so the caller has to reconnect.
+	if err := c.SetTimelineStreaming(t.Context(), true); err == nil {
+		t.Fatal("SetTimelineStreaming succeeded on a connection closed by a cancelled ReadEvent")
+	}
+}
+
+func TestDialHTTPSUsesWSS(t *testing.T) {
+	reqs := make(chan *http.Request, 1)
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqs <- r
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		c.Read(r.Context())
+	}))
+	t.Cleanup(srv.Close)
+	conn, err := traq.DialWS(t.Context(), srv.URL, "tok", srv.Client())
+	if err != nil {
+		t.Fatalf("DialWS: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	if r := <-reqs; r.TLS == nil {
+		t.Error("the handshake request did not arrive over TLS")
+	}
+}
+
+func TestReadEventFrameSizeLimit(t *testing.T) {
+	const limit = 1 << 20
+	frame := func(size int) []byte {
+		// {"type":"BIG","body":{"p":"aaa..."}} padded to exactly size bytes
+		const head, tail = `{"type":"BIG","body":{"p":"`, `"}}`
+		return []byte(head + strings.Repeat("a", size-len(head)-len(tail)) + tail)
+	}
+	srv, _ := wsServer(t, func(ctx context.Context, c *websocket.Conn) {
+		if c.Write(ctx, websocket.MessageText, frame(limit)) != nil {
+			return
+		}
+		c.Write(ctx, websocket.MessageText, frame(limit+1))
+		c.Read(ctx)
+	})
+	c := dialTest(t, srv)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	ev, err := c.ReadEvent(ctx)
+	if err != nil {
+		t.Fatalf("ReadEvent of a %d-byte frame: %v", limit, err)
+	}
+	if ev.Type != "BIG" {
+		t.Errorf("type = %q, want BIG", ev.Type)
+	}
+	if _, err := c.ReadEvent(ctx); err == nil {
+		t.Fatalf("ReadEvent of a %d-byte frame succeeded, want an error", limit+1)
+	} else if ctx.Err() != nil {
+		t.Fatalf("ReadEvent hung instead of rejecting the frame: %v", err)
+	}
+}
