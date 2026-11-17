@@ -3,6 +3,7 @@ package msgconv
 
 import (
 	"bytes"
+	"html"
 	"net/url"
 	"regexp"
 	"slices"
@@ -90,15 +91,29 @@ func ToMatrix(in ToMatrixInput, r Resolver) ToMatrixResult {
 	}
 
 	c.res.Body = c.body()
-	if c.res.Body == "" {
-		return c.res
+	if c.res.Body != "" {
+		c.res.HTML = c.render(doc)
+		if len(emptied) > 0 && !visible(c.res.HTML) {
+			// Removals left nothing to show; Body would only hold stray Markdown marks.
+			c.res.Body, c.res.HTML = "", ""
+		}
 	}
-	c.res.HTML = c.render(doc)
-	if len(emptied) > 0 && !visible(c.res.HTML) {
-		// Removals left nothing to show; Body would only hold stray Markdown marks.
-		c.res.Body, c.res.HTML = "", ""
+	if c.res.Body == "" && c.res.ReplyTo != "" && len(c.res.FileIDs) == 0 {
+		c.keepReplyQuote()
 	}
 	return c.res
+}
+
+// keepReplyQuote shows the quote that became the reply when nothing else is left to show: a Matrix event
+// without content would not be sent. It is linked like any other quote, to the bridged event if there is one.
+func (c *converter) keepReplyQuote() {
+	quote := c.origin() + "/messages/" + c.res.ReplyTo
+	link, ok := c.r.MessageLink(c.res.ReplyTo)
+	if !ok {
+		link = quote
+	}
+	c.res.Body = quote
+	c.res.HTML = `<a href="` + html.EscapeString(link) + `">` + html.EscapeString(quote) + `</a>`
 }
 
 // convert resolves one node, recording its effect on the result. It returns
