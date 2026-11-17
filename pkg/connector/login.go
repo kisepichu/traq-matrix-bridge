@@ -96,7 +96,8 @@ func (l *oauthLogin) SubmitUserInput(ctx context.Context, input map[string]strin
 		log.Err(err).Msg("Failed to exchange the authorization code")
 		return nil, loginError("traQ did not accept the authorization code. Start over with the `login` command.")
 	}
-	// From here on, a failure revokes the new token: it is stored nowhere, but would stay valid for a year.
+	// From here on, a failure revokes the new token: it is stored nowhere, but would stay valid for a year. A
+	// failed re-login is the exception (see NewLogin below).
 	api, err := traq.NewClient(l.main.Config.ServerURL, httpClient, token.AccessToken, userAgent)
 	if err != nil {
 		l.revoke(ctx, token.AccessToken, "new")
@@ -139,7 +140,13 @@ func (l *oauthLogin) SubmitUserInput(ctx context.Context, input map[string]strin
 	if err != nil {
 		// NewLogin's error may name another Matrix user (a login made meanwhile), so it only goes to the log.
 		log.Err(err).Msg("Failed to save the login")
-		l.revoke(ctx, token.AccessToken, "new")
+		// On a re-login, NewLogin may fail after it copied the new token into the cached login and loaded a
+		// client with it (e.g. when saving to the database fails), so the new token may be in use: neither token
+		// is revoked. Known limit: the old one, which the database still holds, may then stay valid until traQ
+		// expires it, because a later re-login revokes only the token of the cached login.
+		if existing == nil {
+			l.revoke(ctx, token.AccessToken, "new")
+		}
 		return nil, loginError("Failed to save the login. Start over with the `login` command.")
 	}
 	// A re-login replaced the stored token; the old one is no longer used anywhere.
