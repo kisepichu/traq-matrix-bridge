@@ -95,7 +95,7 @@ func (c *TraQClient) toTraQ(ctx context.Context, content *event.MessageEventCont
 		FormattedBody: content.FormattedBody,
 		ReplyTo:       replyTo,
 		ServerURL:     c.API.ServerURL(),
-	}, c.newTraQUserResolver(ctx))
+	}, c.newTraQResolver(ctx))
 	return text, tooLongStatus(err)
 }
 
@@ -304,9 +304,10 @@ func (c *TraQClient) HandleMatrixReadReceipt(ctx context.Context, msg *bridgev2.
 	return nil
 }
 
-// traqUserResolver maps the Matrix users in pills to traQ user names: ghosts by their ID, and Matrix users of
-// this bridge by their default login. The ctx of the conversion is captured because the interface has none.
-type traqUserResolver struct {
+// traqResolver maps Matrix to traQ for ToTraQ: the users in pills to traQ user names (ghosts by their ID, and
+// Matrix users of this bridge by their default login), portal rooms to their channel, and bridged events to
+// their message. The ctx of the conversion is captured because the interface has none.
+type traqResolver struct {
 	ctx         context.Context
 	ghostUserID func(id.UserID) (networkid.UserID, bool)
 	selfMXID    id.UserID
@@ -314,11 +315,16 @@ type traqUserResolver struct {
 	// loginUserID returns the traQ user of a Matrix user's default login; false if it has none.
 	loginUserID func(context.Context, id.UserID) (string, bool, error)
 	userName    func(ctx context.Context, traqUserID string) (string, error)
+	// roomChannelID returns the traQ channel of a portal room; false if the room is no portal.
+	roomChannelID func(context.Context, id.RoomID) (string, bool, error)
+	channel       func(channelID string) (channelInfo, bool)
+	// eventMessageID returns the traQ message of a bridged event; false if the event was not bridged.
+	eventMessageID func(context.Context, id.EventID) (string, bool, error)
 }
 
-func (c *TraQClient) newTraQUserResolver(ctx context.Context) *traqUserResolver {
+func (c *TraQClient) newTraQResolver(ctx context.Context) *traqResolver {
 	br := c.Login.Bridge
-	return &traqUserResolver{
+	return &traqResolver{
 		ctx:         ctx,
 		ghostUserID: br.Matrix.ParseGhostMXID,
 		selfMXID:    c.Login.UserMXID,
@@ -341,10 +347,25 @@ func (c *TraQClient) newTraQUserResolver(ctx context.Context) *traqUserResolver 
 			}
 			return u.Name, nil
 		},
+		roomChannelID: func(ctx context.Context, roomID id.RoomID) (string, bool, error) {
+			portal, err := br.GetPortalByMXID(ctx, roomID)
+			if err != nil || portal == nil {
+				return "", false, err
+			}
+			return ChannelID(portal.PortalKey), true, nil
+		},
+		channel: c.lookupChannel,
+		eventMessageID: func(ctx context.Context, eventID id.EventID) (string, bool, error) {
+			part, err := br.DB.Message.GetPartByMXID(ctx, eventID)
+			if err != nil || part == nil {
+				return "", false, err
+			}
+			return TraQMessageID(part.ID), true, nil
+		},
 	}
 }
 
-func (r *traqUserResolver) TraQUserName(mxid id.UserID) (string, bool) {
+func (r *traqResolver) TraQUserName(mxid id.UserID) (string, bool) {
 	userID, ok := r.traqUserID(mxid)
 	if !ok {
 		return "", false
@@ -357,7 +378,7 @@ func (r *traqUserResolver) TraQUserName(mxid id.UserID) (string, bool) {
 	return name, true
 }
 
-func (r *traqUserResolver) traqUserID(mxid id.UserID) (string, bool) {
+func (r *traqResolver) traqUserID(mxid id.UserID) (string, bool) {
 	if mxid == "" {
 		return "", false
 	}
@@ -373,4 +394,31 @@ func (r *traqUserResolver) traqUserID(mxid id.UserID) (string, bool) {
 		return "", false
 	}
 	return userID, ok
+}
+
+// ChannelPath returns the path of the public channel whose portal is roomID. A DM has no path.
+func (r *traqResolver) ChannelPath(roomID id.RoomID) (string, bool) {
+	channelID, ok, err := r.roomChannelID(r.ctx, roomID)
+	if err != nil {
+		zerolog.Ctx(r.ctx).Warn().Err(err).Stringer("room_id", roomID).Msg("Failed to look up a mentioned room")
+		return "", false
+	}
+	if !ok {
+		return "", false
+	}
+	ch, ok := r.channel(channelID)
+	if !ok || ch.isDM() {
+		return "", false
+	}
+	return ch.Path, true
+}
+
+// MessageID returns the traQ message that eventID (any part of it) was bridged from or to.
+func (r *traqResolver) MessageID(eventID id.EventID) (string, bool) {
+	messageID, ok, err := r.eventMessageID(r.ctx, eventID)
+	if err != nil {
+		zerolog.Ctx(r.ctx).Warn().Err(err).Stringer("event_id", eventID).Msg("Failed to look up a linked event")
+		return "", false
+	}
+	return messageID, ok
 }

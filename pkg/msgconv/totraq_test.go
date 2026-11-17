@@ -10,15 +10,32 @@ import (
 	"maunium.net/go/mautrix/id"
 )
 
-type fakeTraQUsers map[id.UserID]string
+// fakeTraQ resolves the users, portal rooms and bridged events in its maps.
+type fakeTraQ struct {
+	users  map[id.UserID]string
+	rooms  map[id.RoomID]string // room -> channel path
+	events map[id.EventID]string
+}
 
-func (f fakeTraQUsers) TraQUserName(mxid id.UserID) (string, bool) {
-	name, ok := f[mxid]
+func (f fakeTraQ) TraQUserName(mxid id.UserID) (string, bool) {
+	name, ok := f.users[mxid]
 	return name, ok
 }
 
-var traqUsers = fakeTraQUsers{
-	"@traq_alice:example.org": "alice",
+func (f fakeTraQ) ChannelPath(roomID id.RoomID) (string, bool) {
+	path, ok := f.rooms[roomID]
+	return path, ok
+}
+
+func (f fakeTraQ) MessageID(eventID id.EventID) (string, bool) {
+	messageID, ok := f.events[eventID]
+	return messageID, ok
+}
+
+var traqUsers = fakeTraQ{
+	users:  map[id.UserID]string{"@traq_alice:example.org": "alice"},
+	rooms:  map[id.RoomID]string{"!gen:example.org": "gps/general"},
+	events: map[id.EventID]string{"$ev2": m2},
 }
 var origin = &url.URL{Scheme: "https", Host: "q.example.jp"}
 
@@ -35,10 +52,20 @@ func TestToTraQ(t *testing.T) {
 			"@alice: hi"},
 		{"unknown pill", ToTraQInput{Body: "bob", Format: "org.matrix.custom.html",
 			FormattedBody: `<a href="https://matrix.to/#/@bob:example.org">bob</a>`}, "bob"},
-		{"room pill becomes its URL", ToTraQInput{Body: "r", Format: "org.matrix.custom.html",
+		{"unknown room pill keeps its URL", ToTraQInput{Body: "r", Format: "org.matrix.custom.html",
 			FormattedBody: `<a href="https://matrix.to/#/!room:example.org">some room</a>`}, "https://matrix.to/#/!room:example.org"},
-		{"event pill becomes its URL", ToTraQInput{Body: "e", Format: "org.matrix.custom.html",
+		{"unknown event pill keeps its URL", ToTraQInput{Body: "e", Format: "org.matrix.custom.html",
 			FormattedBody: `<a href="https://matrix.to/#/!room:example.org/$ev">msg</a>`}, "https://matrix.to/#/!room:example.org/$ev"},
+		{"portal room pill becomes the channel", ToTraQInput{Body: "r", Format: "org.matrix.custom.html",
+			FormattedBody: `see <a href="https://matrix.to/#/!gen:example.org">general</a>`}, "see #gps/general"},
+		{"portal room pill followed by a name character is separated", ToTraQInput{Body: "r", Format: "org.matrix.custom.html",
+			FormattedBody: `<a href="https://matrix.to/#/!gen:example.org">general</a>x`}, "#gps/general x"},
+		{"portal room pill after a colon is separated", ToTraQInput{Body: "r", Format: "org.matrix.custom.html",
+			FormattedBody: `in:<a href="https://matrix.to/#/!gen:example.org">general</a>`}, "in: #gps/general"},
+		{"bridged event pill becomes the traQ message URL", ToTraQInput{Body: "e", Format: "org.matrix.custom.html",
+			FormattedBody: `see <a href="https://matrix.to/#/!gen:example.org/$ev2">msg</a>`}, "see https://q.example.jp/messages/" + m2},
+		{"bridged event in an unknown room becomes the traQ message URL", ToTraQInput{Body: "e", Format: "org.matrix.custom.html",
+			FormattedBody: `<a href="https://matrix.to/#/!other:example.org/$ev2">msg</a>`}, "https://q.example.jp/messages/" + m2},
 		{"spoiler", ToTraQInput{Body: "s", Format: "org.matrix.custom.html",
 			FormattedBody: `a <span data-mx-spoiler>s</span>`}, "a !!s!!"},
 		{"reply prefix", ToTraQInput{Body: "yes", ReplyTo: m1}, "https://q.example.jp/messages/" + m1 + "\nyes"},

@@ -49,10 +49,10 @@ func TestWithFileURLsLength(t *testing.T) {
 	}
 }
 
-func TestTraQUserResolver(t *testing.T) {
+func TestTraQResolverUserName(t *testing.T) {
 	names := map[string]string{"u-ghost": "ghost", "u-me": "me", "u-carol": "carol"}
 	var lookedUp []string
-	r := &traqUserResolver{
+	r := &traqResolver{
 		ctx: context.Background(),
 		ghostUserID: func(mxid id.UserID) (networkid.UserID, bool) {
 			userID, ok := strings.CutPrefix(string(mxid), "@traq_")
@@ -97,6 +97,67 @@ func TestTraQUserResolver(t *testing.T) {
 		got, ok := r.TraQUserName(c.mxid)
 		if got != c.want || ok != c.wantOK || !slices.Equal(lookedUp, c.lookedUp) {
 			t.Errorf("TraQUserName(%q) = %q, %v, looked up %q; want %q, %v, %q", c.mxid, got, ok, lookedUp, c.want, c.wantOK, c.lookedUp)
+		}
+	}
+}
+
+// A pill of a public channel's portal becomes the channel; DM portals and rooms that are no portal stay links.
+func TestTraQResolverChannelPath(t *testing.T) {
+	channels := map[string]channelInfo{
+		"ch-gen": {ID: "ch-gen", Path: "gps/general", Level: 1},
+		"ch-dm":  {ID: "ch-dm", DMUserID: "u-bob", Level: dmLevel},
+	}
+	r := &traqResolver{
+		ctx: context.Background(),
+		roomChannelID: func(_ context.Context, roomID id.RoomID) (string, bool, error) {
+			switch roomID {
+			case "!broken:example.org":
+				return "", false, errors.New("database is down")
+			case "!gen:example.org":
+				return "ch-gen", true, nil
+			case "!dm:example.org":
+				return "ch-dm", true, nil
+			case "!gone:example.org":
+				return "ch-gone", true, nil
+			}
+			return "", false, nil
+		},
+		channel: func(channelID string) (channelInfo, bool) { ch, ok := channels[channelID]; return ch, ok },
+	}
+	cases := []struct {
+		room   id.RoomID
+		want   string
+		wantOK bool
+	}{
+		{"!gen:example.org", "gps/general", true},
+		{"!dm:example.org", "", false},
+		{"!gone:example.org", "", false},
+		{"!other:example.org", "", false},
+		{"!broken:example.org", "", false},
+	}
+	for _, c := range cases {
+		if got, ok := r.ChannelPath(c.room); got != c.want || ok != c.wantOK {
+			t.Errorf("ChannelPath(%q) = %q, %v; want %q, %v", c.room, got, ok, c.want, c.wantOK)
+		}
+	}
+}
+
+func TestTraQResolverMessageID(t *testing.T) {
+	r := &traqResolver{
+		ctx: context.Background(),
+		eventMessageID: func(_ context.Context, eventID id.EventID) (string, bool, error) {
+			switch eventID {
+			case "$bridged":
+				return "m-1", true, nil
+			case "$broken":
+				return "", false, errors.New("database is down")
+			}
+			return "", false, nil
+		},
+	}
+	for eventID, want := range map[id.EventID]string{"$bridged": "m-1", "$other": "", "$broken": ""} {
+		if got, ok := r.MessageID(eventID); got != want || ok != (want != "") {
+			t.Errorf("MessageID(%q) = %q, %v; want %q", eventID, got, ok, want)
 		}
 	}
 }
