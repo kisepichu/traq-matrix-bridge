@@ -17,6 +17,8 @@ func TestRoundTrip(t *testing.T) {
 		{"channel embed", `see !{"type":"channel","raw":"#gps/general","id":"` + cGen + `"} now`, "see #gps/general now"},
 		// The first quote becomes the reply, whose quote line goes first; the second stays a quote.
 		{"second quote", "a\n" + quote1 + "\n" + quote2, quote1 + "\na\n" + quote2},
+		// A lone quote stays visible in Matrix as the link to the reply target; it must not come back twice.
+		{"quote only", quote1, quote1},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

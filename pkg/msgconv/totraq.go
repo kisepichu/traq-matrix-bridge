@@ -73,7 +73,11 @@ func ToTraQ(ctx context.Context, in ToTraQInput, r TraQResolver) (string, error)
 		if in.ServerURL == nil {
 			return "", errors.New("reply target without a traQ server URL")
 		}
-		text = in.ServerURL.JoinPath("messages", in.ReplyTo).String() + "\n" + text
+		// A quote-only message keeps its quote visible in Matrix as a link to the reply target, which
+		// converts back to this URL: it is the quote already.
+		if quote := in.ServerURL.JoinPath("messages", in.ReplyTo).String(); text != quote && !strings.HasPrefix(text, quote+"\n") {
+			text = quote + "\n" + text
+		}
 	}
 	if n := utf8.RuneCountInString(text); n > MaxTraQLength {
 		return "", fmt.Errorf("%w: %d characters", ErrTooLong, n)

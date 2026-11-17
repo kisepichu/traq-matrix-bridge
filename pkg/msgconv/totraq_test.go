@@ -35,7 +35,7 @@ func (f fakeTraQ) MessageID(eventID id.EventID) (string, bool) {
 var traqUsers = fakeTraQ{
 	users:  map[id.UserID]string{"@traq_alice:example.org": "alice"},
 	rooms:  map[id.RoomID]string{"!gen:example.org": "gps/general"},
-	events: map[id.EventID]string{"$ev2": m2},
+	events: map[id.EventID]string{"$ev1": m1, "$ev2": m2},
 }
 var origin = &url.URL{Scheme: "https", Host: "q.example.jp"}
 
