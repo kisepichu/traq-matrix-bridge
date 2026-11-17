@@ -1,0 +1,26 @@
+# Base URL of the traQ server, without a path. Example: https://q.trap.jp
+server_url: ""
+
+# OAuth2 client registered on the traQ server (authorization code + PKCE, no client secret).
+oauth:
+    # Client ID of the OAuth2 client.
+    client_id: ""
+    # Redirect URI registered for the client. Users copy the final URL out of the browser during login.
+    redirect_uri: http://localhost:29399/callback
+
+# Polling of channels that are not currently being viewed. It catches edits, deletions and stamp changes.
+poll:
+    # How often to re-read recent messages.
+    interval: 3m
+    # Only channels whose last write is within this window are re-read.
+    window: 6h
+    # Number of most recent messages to re-read per channel (1-200).
+    depth: 30
+    # Maximum number of channels to re-read per round, newest last write first.
+    max_channels: 50
+
+# Drop the traQ viewstate when there has been no activity in Matrix for this long.
+view_idle_timeout: 10m
+
+# How often to re-read channels and subscription levels from traQ.
+subscription_sync_interval: 10m
