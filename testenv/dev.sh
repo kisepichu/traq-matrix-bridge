@@ -28,8 +28,15 @@ usage: testenv/dev.sh <command> [args]
   bridge                              build the bridge and run it in the foreground
   bot <text>                          send text to the bridge bot (management room) as @dev
   tail [room]                         show the last 20 events of a room (default: management room)
+  events <room> [limit]               show the last events of a room as JSON lines (default 20)
   rooms                               list the rooms @dev is in
-  send <room> <text>                  send text to a room as @dev
+  send <room> <text>                  send text to a room as @dev, print the event ID
+  send-raw <room> <content-json>      send an m.room.message with the given content, print the event ID
+  reply <room> <event-id> <text>      send text as a reply, print the event ID
+  edit <room> <event-id> <text>       replace the text of a message, print the event ID of the edit
+  redact <room> <event-id>            redact an event (a message, or a reaction to remove it), print the event ID
+  react <room> <event-id> <key>       react to a message, print the event ID of the reaction
+  read <room> <event-id>              send a read receipt (m.read) for an event
   traq-login <user> <authorize-url>   approve the OAuth authorize URL as a traQ user, print the redirect URL
   traq <user> <METHOD> <path> [json]  call the traQ REST API (/api/v3 is prepended to path) as a traQ user
 EOF
@@ -234,12 +241,58 @@ management_room() {
   echo "$room"
 }
 
+# txn_id: a fresh transaction ID for a Matrix PUT.
+txn_id() { echo "dev$(date +%s%N)$RANDOM"; }
+
+# send_event <room> <type> <content-json>: send an event as @dev and print its event ID.
+send_event() {
+  mx PUT "/rooms/$(urlencode "$1")/send/$2/$(txn_id)" "$3" | jq -r .event_id
+}
+
 cmd_send() {
   [[ $# -eq 2 ]] || die "usage: send <room> <text>"
   need_dev
-  local txn
-  txn="dev$(date +%s%N)$RANDOM"
-  mx PUT "/rooms/$(urlencode "$1")/send/m.room.message/$txn" "$(jq -n --arg t "$2" '{msgtype: "m.text", body: $t}')" >/dev/null
+  send_event "$1" m.room.message "$(jq -n --arg t "$2" '{msgtype: "m.text", body: $t}')"
+}
+
+cmd_send_raw() {
+  [[ $# -eq 2 ]] || die "usage: send-raw <room> <content-json>"
+  need_dev
+  jq -e 'type == "object"' <<<"$2" >/dev/null || die "content must be a JSON object"
+  send_event "$1" m.room.message "$2"
+}
+
+cmd_reply() {
+  [[ $# -eq 3 ]] || die "usage: reply <room> <event-id> <text>"
+  need_dev
+  send_event "$1" m.room.message "$(jq -n --arg e "$2" --arg t "$3" \
+    '{msgtype: "m.text", body: $t, "m.relates_to": {"m.in_reply_to": {event_id: $e}}}')"
+}
+
+cmd_edit() {
+  [[ $# -eq 3 ]] || die "usage: edit <room> <event-id> <text>"
+  need_dev
+  send_event "$1" m.room.message "$(jq -n --arg e "$2" --arg t "$3" \
+    '{msgtype: "m.text", body: ("* " + $t), "m.new_content": {msgtype: "m.text", body: $t}, "m.relates_to": {rel_type: "m.replace", event_id: $e}}')"
+}
+
+cmd_redact() {
+  [[ $# -eq 2 ]] || die "usage: redact <room> <event-id>"
+  need_dev
+  mx PUT "/rooms/$(urlencode "$1")/redact/$(urlencode "$2")/$(txn_id)" '{}' | jq -r .event_id
+}
+
+cmd_react() {
+  [[ $# -eq 3 ]] || die "usage: react <room> <event-id> <key>"
+  need_dev
+  send_event "$1" m.reaction "$(jq -n --arg e "$2" --arg k "$3" \
+    '{"m.relates_to": {rel_type: "m.annotation", event_id: $e, key: $k}}')"
+}
+
+cmd_read() {
+  [[ $# -eq 2 ]] || die "usage: read <room> <event-id>"
+  need_dev
+  mx POST "/rooms/$(urlencode "$1")/receipt/m.read/$(urlencode "$2")" '{}' >/dev/null
 }
 
 cmd_bot() {
@@ -247,7 +300,7 @@ cmd_bot() {
   need_dev
   local room
   room=$(management_room)
-  cmd_send "$room" "$*"
+  cmd_send "$room" "$*" >/dev/null
 }
 
 cmd_tail() {
@@ -256,6 +309,13 @@ cmd_tail() {
   [[ -n $room ]] || room=$(management_room)
   mx GET "/rooms/$(urlencode "$room")/messages?dir=b&limit=20" |
     jq -r '.chunk | reverse | .[] | "\(.sender): \(.content.body // ("[" + .type + "]"))"'
+}
+
+cmd_events() {
+  [[ $# -ge 1 && $# -le 2 ]] || die "usage: events <room> [limit]"
+  need_dev
+  mx GET "/rooms/$(urlencode "$1")/messages?dir=b&limit=${2:-20}" |
+    jq -c '.chunk | reverse | .[] | {event_id, type, sender, content} + (if .unsigned.redacted_because then {redacted: true} else {} end)'
 }
 
 cmd_rooms() {
@@ -304,8 +364,15 @@ main() {
     bridge) cmd_bridge "$@" ;;
     bot) cmd_bot "$@" ;;
     tail) cmd_tail "$@" ;;
+    events) cmd_events "$@" ;;
     rooms) cmd_rooms "$@" ;;
     send) cmd_send "$@" ;;
+    send-raw) cmd_send_raw "$@" ;;
+    reply) cmd_reply "$@" ;;
+    edit) cmd_edit "$@" ;;
+    redact) cmd_redact "$@" ;;
+    react) cmd_react "$@" ;;
+    read) cmd_read "$@" ;;
     traq-login) cmd_traq_login "$@" ;;
     traq) cmd_traq "$@" ;;
     -h | --help | help) usage ;;

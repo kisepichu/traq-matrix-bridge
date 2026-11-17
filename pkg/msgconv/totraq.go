@@ -1,9 +1,7 @@
 package msgconv
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -22,9 +20,9 @@ const MaxTraQLength = 10000
 // message exceeds MaxTraQLength.
 var ErrTooLong = errors.New("message is too long for traQ")
 
-// TraQUserResolver maps a Matrix user (a ghost, or a Matrix user logged into the bridge) to a traQ user.
+// TraQUserResolver maps a Matrix user (a ghost, or a Matrix user logged into the bridge) to a traQ user name.
 type TraQUserResolver interface {
-	TraQUser(mxid id.UserID) (traqUserID, name string, ok bool)
+	TraQUserName(mxid id.UserID) (name string, ok bool)
 }
 
 // ToTraQInput is a Matrix message to convert.
@@ -37,8 +35,9 @@ type ToTraQInput struct {
 }
 
 // ToTraQ converts a Matrix message into the traQ Markdown to post with embed
-// enabled. traQ turns plain @name and #channel into embeds itself, so only
-// user pills are embedded here.
+// enabled. traQ turns plain @name and #channel into embeds itself, so a user
+// pill becomes "@name". It must not be an embed already: traQ also converts the
+// "@name" inside an embed's raw text, which nests one embed in another.
 func ToTraQ(ctx context.Context, in ToTraQInput, r TraQUserResolver) (string, error) {
 	var text string
 	if in.Format == string(event.FormatHTML) {
@@ -68,12 +67,12 @@ func ToTraQ(ctx context.Context, in ToTraQInput, r TraQUserResolver) (string, er
 	return text, nil
 }
 
-// traqPill renders a matrix.to link: a resolvable user becomes a traQ user
-// embed, an unknown user its display name, and a room or event link its URL.
+// traqPill renders a matrix.to link: a resolvable user becomes "@name" (which
+// traQ embeds), an unknown user its display name, and a room or event link its URL.
 func traqPill(r TraQUserResolver, displayname, mxid, eventID string) string {
 	if mxid == "" || mxid[0] == '@' {
-		if traqID, name, ok := r.TraQUser(id.UserID(mxid)); ok {
-			return traqUserEmbed(traqID, name)
+		if name, ok := r.TraQUserName(id.UserID(mxid)); ok {
+			return "@" + name
 		}
 		return displayname
 	}
@@ -82,19 +81,6 @@ func traqPill(r TraQUserResolver, displayname, mxid, eventID string) string {
 		link += "/" + eventID
 	}
 	return link
-}
-
-func traqUserEmbed(traqID, name string) string {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	// Encoding strings and a struct of strings cannot fail.
-	_ = enc.Encode(struct {
-		Type string `json:"type"`
-		Raw  string `json:"raw"`
-		ID   string `json:"id"`
-	}{"user", "@" + name, traqID})
-	return "!" + strings.TrimSuffix(buf.String(), "\n")
 }
 
 // trimReplyFallbackBody drops the "> <@user> ..." quote and the blank line

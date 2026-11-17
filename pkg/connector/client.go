@@ -12,7 +12,6 @@ import (
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/status"
-	"maunium.net/go/mautrix/event"
 
 	"github.com/kisepichu/traq-matrix-bridge/pkg/traq"
 )
@@ -41,7 +40,11 @@ const (
 	maxBackoff   = 5 * time.Minute
 )
 
-var errNotImplemented = errors.New("traq: not implemented yet")
+// errWSNotConnected: there is no WebSocket connection to send a command on.
+var errWSNotConnected = errors.New("the traQ WebSocket is not connected")
+
+// viewStateSendWait bounds how long a caller waits for a viewstate write (see sendViewState).
+const viewStateSendWait = 5 * time.Second
 
 // errTokenRejected is the cancel cause of a session whose token traQ rejected (HTTP 401).
 var errTokenRejected = errors.New("traq: access token rejected")
@@ -66,6 +69,12 @@ type TraQClient struct {
 
 	runMu   sync.Mutex
 	running *session // the last session started by Connect; nil before the first Connect
+
+	view *viewState // the channel traQ is told the user is viewing
+
+	wsMu  sync.Mutex
+	ws    *traq.WSConn    // the open WebSocket connection, nil while disconnected
+	wsCtx context.Context // the context of ws's connection; nil with ws
 }
 
 // session is one run of Connect, stopped by Disconnect.
@@ -168,6 +177,7 @@ func (c *TraQClient) runLoops(ctx context.Context, stop context.CancelCauseFunc)
 	syncRequests := make(chan struct{}, 1)
 	wg.Go(func() { c.eventWorker(ctx, queue, syncRequests) })
 	wg.Go(func() { c.subscriptionSyncLoop(ctx, stop, syncRequests) })
+	wg.Go(func() { c.viewStateLoop(ctx) })
 	c.websocketLoop(ctx, stop, queue)
 }
 
@@ -269,7 +279,7 @@ func (c *TraQClient) websocketLoop(ctx context.Context, stop context.CancelCause
 			c.Login.Log.Info().Msg("Connected to the traQ WebSocket")
 			c.Login.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 			// A catch-up of what was missed while disconnected belongs here, for every connection but the first
-			// (initialSync covers the time before Connect).
+			// (initialSync covers the time before Connect). The viewstate is sent again in readWebSocket.
 			start := time.Now()
 			err = c.readWebSocket(ctx, ws, queue)
 			_ = ws.Close()
@@ -300,6 +310,7 @@ func (c *TraQClient) dialWebSocket(ctx context.Context) (*traq.WSConn, error) {
 }
 
 // readWebSocket reads events and hands them to queue until the connection fails, a ping fails or ctx ends.
+// While it runs, ws is the connection that viewstate commands are sent on.
 func (c *TraQClient) readWebSocket(ctx context.Context, ws *traq.WSConn, queue chan<- traq.Event) error {
 	// One context for the whole connection: its end closes the connection and unblocks ReadEvent.
 	connCtx, cancel := context.WithCancelCause(ctx)
@@ -307,6 +318,10 @@ func (c *TraQClient) readWebSocket(ctx context.Context, ws *traq.WSConn, queue c
 	defer wg.Wait()
 	defer cancel(nil)
 	wg.Go(func() { keepAlive(connCtx, ws, cancel) })
+	c.setWebSocket(ws, connCtx)
+	defer c.setWebSocket(nil, nil)
+	// A new connection starts without a viewstate.
+	c.view.Resend(connCtx)
 	for {
 		evt, err := ws.ReadEvent(connCtx)
 		if err != nil {
@@ -336,6 +351,55 @@ func keepAlive(ctx context.Context, ws *traq.WSConn, fail context.CancelCauseFun
 		if err != nil {
 			fail(fmt.Errorf("ping traQ WebSocket: %w", err))
 			return
+		}
+	}
+}
+
+func (c *TraQClient) setWebSocket(ws *traq.WSConn, connCtx context.Context) {
+	c.wsMu.Lock()
+	defer c.wsMu.Unlock()
+	c.ws, c.wsCtx = ws, connCtx
+}
+
+// sendViewState is viewState's send function. It fails at once while the WebSocket is down.
+//
+// The write uses the connection's context, never a per-call timeout, because a context that ends during a
+// write closes the connection (see traq.WSConn). A write can block only on a connection that is dead but
+// not detected yet; keepAlive notices that within pingInterval + pingTimeout and ends the connection's
+// context, which ends the write. The caller, often a Matrix handler in a portal's event loop, waits for at
+// most viewStateSendWait (or until ctx ends) and gets an error; the write itself goes on in the background
+// and may still succeed.
+func (c *TraQClient) sendViewState(ctx context.Context, channelID string) error {
+	c.wsMu.Lock()
+	ws, connCtx := c.ws, c.wsCtx
+	c.wsMu.Unlock()
+	if ws == nil {
+		return errWSNotConnected
+	}
+	done := make(chan error, 1)
+	go func() { done <- ws.SetViewState(connCtx, channelID) }()
+	t := time.NewTimer(viewStateSendWait)
+	defer t.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-t.C:
+		return fmt.Errorf("the traQ WebSocket did not take the viewstate within %s", viewStateSendWait)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// viewStateLoop clears the viewstate after view_idle_timeout without Matrix activity, until ctx ends.
+func (c *TraQClient) viewStateLoop(ctx context.Context) {
+	t := time.NewTicker(viewStateTickInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			c.view.Tick(ctx)
 		}
 	}
 }
@@ -402,12 +466,4 @@ func (c *TraQClient) LogoutRemote(ctx context.Context) {
 
 func (c *TraQClient) IsThisUser(_ context.Context, userID networkid.UserID) bool {
 	return TraQUserID(userID) == string(c.Login.ID)
-}
-
-func (c *TraQClient) GetCapabilities(context.Context, *bridgev2.Portal) *event.RoomFeatures {
-	return &event.RoomFeatures{}
-}
-
-func (c *TraQClient) HandleMatrixMessage(context.Context, *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, error) {
-	return nil, fmt.Errorf("HandleMatrixMessage: %w", errNotImplemented)
 }

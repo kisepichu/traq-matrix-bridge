@@ -10,16 +10,15 @@ import (
 	"maunium.net/go/mautrix/id"
 )
 
-type fakeTraQUsers map[id.UserID][2]string
+type fakeTraQUsers map[id.UserID]string
 
-func (f fakeTraQUsers) TraQUser(mxid id.UserID) (string, string, bool) {
-	v, ok := f[mxid]
-	return v[0], v[1], ok
+func (f fakeTraQUsers) TraQUserName(mxid id.UserID) (string, bool) {
+	name, ok := f[mxid]
+	return name, ok
 }
 
 var traqUsers = fakeTraQUsers{
-	"@traq_alice:example.org": {uAlice, "alice"},
-	"@traq_odd:example.org":   {uBob, `a"b\c`},
+	"@traq_alice:example.org": "alice",
 }
 var origin = &url.URL{Scheme: "https", Host: "q.example.jp"}
 
@@ -32,11 +31,8 @@ func TestToTraQ(t *testing.T) {
 		{"plain body", ToTraQInput{Body: "hello"}, "hello"},
 		{"html bold", ToTraQInput{Body: "x", Format: "org.matrix.custom.html", FormattedBody: "<strong>x</strong>"}, "**x**"},
 		{"ghost pill", ToTraQInput{Body: "alice: hi", Format: "org.matrix.custom.html",
-			FormattedBody: `<a href="https://matrix.to/#/@traq_alice:example.org">alice</a>: hi`},
-			`!{"type":"user","raw":"@alice","id":"` + uAlice + `"}: hi`},
-		{"ghost pill with a name that needs JSON escaping", ToTraQInput{Body: "x", Format: "org.matrix.custom.html",
-			FormattedBody: `<a href="https://matrix.to/#/@traq_odd:example.org">x</a>`},
-			`!{"type":"user","raw":"@a\"b\\c","id":"` + uBob + `"}`},
+			FormattedBody: `<a href="https://matrix.to/#/@traq_alice:example.org">Alice A.</a>: hi`},
+			"@alice: hi"},
 		{"unknown pill", ToTraQInput{Body: "bob", Format: "org.matrix.custom.html",
 			FormattedBody: `<a href="https://matrix.to/#/@bob:example.org">bob</a>`}, "bob"},
 		{"room pill becomes its URL", ToTraQInput{Body: "r", Format: "org.matrix.custom.html",

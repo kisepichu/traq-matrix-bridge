@@ -44,8 +44,22 @@ testenv/dev.sh traq alice GET /users/me
 testenv/dev.sh traq alice POST /channels '{"name":"dev-ch","parent":null}'
 testenv/dev.sh traq alice POST /channels/<channel ID>/messages '{"content":"hi"}'
 testenv/dev.sh rooms                                       # @dev が入っている room (room ID と name)
-testenv/dev.sh send '<room ID>' 'hello'                    # @dev として room に送る
+testenv/dev.sh send '<room ID>' 'hello'                    # @dev として room に送り、event ID を表示する
 testenv/dev.sh tail '<room ID>'                            # room の最新 20 event を「sender: body」で表示
+testenv/dev.sh events '<room ID>' 5                        # 最新 5 event を JSON 1 行ずつ (event ID、type、sender、content)
+```
+
+Matrix 側の返信・編集・削除・reaction・既読も `@dev` として送れる。event ID は `$` で始まるので、shell では single quote で囲む。
+
+```sh
+ev=$(testenv/dev.sh send '<room ID>' 'hello')              # 送った event の ID
+testenv/dev.sh reply '<room ID>' "$ev" 'a reply'           # 返信 (m.in_reply_to)
+testenv/dev.sh edit '<room ID>' "$ev" 'hello (edited)'     # 編集 (m.replace)
+r=$(testenv/dev.sh react '<room ID>' "$ev" '👍')            # reaction (m.annotation)。key は絵文字か :stamp名:
+testenv/dev.sh redact '<room ID>' "$r"                     # reaction の取り消し (reaction を redact する)
+testenv/dev.sh redact '<room ID>' "$ev"                    # message の削除
+testenv/dev.sh read '<room ID>' "$ev"                      # 既読 (m.read receipt)
+testenv/dev.sh send-raw '<room ID>' '{"msgtype":"m.text","body":"hi bob","format":"org.matrix.custom.html","formatted_body":"hi <a href=\"https://matrix.to/#/@traq_<bob の ID>:localhost\">bob</a>"}'
 ```
 
 `traq <user> <METHOD> <path> [json]` は毎回 traQ に login し直した session で `/api/v3<path>` を叩き、response body を表示する。user のパスワードは `admin` (user 名 `traq`) が `traq`、それ以外は `<user>-password` (`alice` なら `alice-password`)。
@@ -66,8 +80,15 @@ testenv/dev.sh down        # container と volume を消し、testenv/.dev/ も�
 | `bridge` | `go build -tags goolm` して `testenv/.dev/config.yaml` で前景起動 |
 | `bot <text>` | management room に `@dev` として送る |
 | `tail [room]` | room (既定は management room) の最新 20 event を `sender: body` で表示 |
+| `events <room> [limit]` | room の最新 `limit` (既定 20) event を古い順に JSON 1 行ずつ (`event_id`、`type`、`sender`、`content`、redact 済みなら `redacted: true`) |
 | `rooms` | `@dev` が入っている room の `room ID<TAB>name` |
-| `send <room> <text>` | `@dev` として room に送る |
+| `send <room> <text>` | `@dev` として room に `m.text` を送り、event ID を表示する |
+| `send-raw <room> <content-json>` | 任意の content の `m.room.message` を送り、event ID を表示する (HTML、pill、`m.image` など) |
+| `reply <room> <event-id> <text>` | event への返信を送り、event ID を表示する |
+| `edit <room> <event-id> <text>` | message の本文を置き換える編集を送り、編集 event の ID を表示する |
+| `redact <room> <event-id>` | event を redact し、redaction の event ID を表示する。reaction を redact すると reaction の取り消しになる |
+| `react <room> <event-id> <key>` | reaction を送り、reaction の event ID を表示する |
+| `read <room> <event-id>` | event までの既読 (`m.read` receipt) を送る |
 | `traq-login <user> <authorize-url>` | traQ user の session で authorize URL を開き、同意画面を承認して、redirect URL (`code` と `state` 付き) を表示する |
 | `traq <user> <METHOD> <path> [json]` | traQ user の session で REST を叩く |
 
