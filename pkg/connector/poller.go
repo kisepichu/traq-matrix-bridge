@@ -135,18 +135,6 @@ func (c *TraQClient) pollOnce(ctx context.Context) (rejected bool) {
 	return false
 }
 
-// sleepCtx waits for d. It returns false if ctx ended first.
-func sleepCtx(ctx context.Context, d time.Duration) bool {
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-t.C:
-		return true
-	}
-}
-
 // pollChannel reads the newest poll.depth messages of a channel, compares them with what is bridged and
 // queues a message, an edit, a removal or a reaction sync for each difference.
 func (c *TraQClient) pollChannel(ctx context.Context, channelID string) error {

@@ -50,7 +50,7 @@ func catchUpChannels(targets map[string]channelInfo, unread []traq.UnreadChannel
 // catchUpCandidates reads the activity timeline and returns catchUpChannels of the current targets. If the
 // read fails, the error comes with the candidates without the timeline's channels.
 func (c *TraQClient) catchUpCandidates(ctx context.Context, unread []traq.UnreadChannel, since time.Time) (map[string]struct{}, error) {
-	timeline, err := c.API.ActivityTimeline(ctx, true)
+	timeline, err := c.API.ActivityTimeline(ctx)
 	if err != nil {
 		err = fmt.Errorf("get the activity timeline: %w", err)
 	}

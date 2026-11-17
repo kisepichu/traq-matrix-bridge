@@ -50,15 +50,6 @@ func (c *Client) Channels(ctx context.Context) (*ChannelList, error) {
 	return &out, nil
 }
 
-// Channel: GET /channels/{channelId}
-func (c *Client) Channel(ctx context.Context, channelID string) (*Channel, error) {
-	var out Channel
-	if err := c.doJSON(ctx, http.MethodGet, "/channels/"+esc(channelID), nil, nil, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
-}
-
 // Subscriptions: GET /users/me/subscriptions
 func (c *Client) Subscriptions(ctx context.Context) ([]Subscription, error) {
 	var out []Subscription
@@ -228,12 +219,13 @@ func (c *Client) Search(ctx context.Context, q SearchQuery) (*SearchResult, erro
 	return &out, nil
 }
 
-// ActivityTimeline: GET /activity/timeline?limit=50&all=false&per_channel=...
-func (c *Client) ActivityTimeline(ctx context.Context, perChannel bool) ([]ActivityMessage, error) {
+// ActivityTimeline: GET /activity/timeline?limit=50&all=false&per_channel=true (the newest message of each
+// subscribed channel)
+func (c *Client) ActivityTimeline(ctx context.Context) ([]ActivityMessage, error) {
 	query := url.Values{
 		"limit":       {"50"},
 		"all":         {"false"},
-		"per_channel": {strconv.FormatBool(perChannel)},
+		"per_channel": {"true"},
 	}
 	var out []ActivityMessage
 	err := c.doJSON(ctx, http.MethodGet, "/activity/timeline", query, nil, &out)

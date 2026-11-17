@@ -196,7 +196,7 @@ func (c *TraQClient) load(ctx context.Context, stop context.CancelCauseFunc) (*t
 		if err == nil {
 			return me, targets, unread, true
 		}
-		if !c.handleConnectError(ctx, stop, err, errCodeConnectFail, "Failed to load data from traQ") || !retry.wait(ctx, c.Login.Log) {
+		if !c.handleConnectError(ctx, stop, err, errCodeConnectFail, "Failed to load data from traQ") || !retry.wait(ctx, c.Login.Log, "Retrying the connection to traQ") {
 			return nil, nil, nil, false
 		}
 	}
@@ -255,11 +255,16 @@ func (c *TraQClient) handleConnectError(ctx context.Context, stop context.Cancel
 // backoff doubles the delay between attempts from min (minBackoff if zero) up to maxBackoff.
 type backoff struct{ next, min time.Duration }
 
-// wait sleeps for the next delay. It returns false if ctx ended first.
-func (b *backoff) wait(ctx context.Context, log zerolog.Logger) bool {
+// wait logs msg, which says what is retried, and sleeps for the next delay. It returns false if ctx ended first.
+func (b *backoff) wait(ctx context.Context, log zerolog.Logger, msg string) bool {
 	d := max(b.next, cmp.Or(b.min, minBackoff))
 	b.next = min(2*d, maxBackoff)
-	log.Info().Stringer("delay", d).Msg("Retrying the connection to traQ")
+	log.Info().Stringer("delay", d).Msg(msg)
+	return sleepCtx(ctx, d)
+}
+
+// sleepCtx waits for d. It returns false if ctx ended first.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {
@@ -298,7 +303,7 @@ func (c *TraQClient) websocketLoop(ctx context.Context, stop context.CancelCause
 				retry.reset()
 			}
 		}
-		if !c.handleConnectError(ctx, stop, err, errCodeWSDisconnected, "Lost the connection to traQ, reconnecting") || !retry.wait(ctx, c.Login.Log) {
+		if !c.handleConnectError(ctx, stop, err, errCodeWSDisconnected, "Lost the connection to traQ, reconnecting") || !retry.wait(ctx, c.Login.Log, "Retrying the connection to traQ") {
 			return
 		}
 	}

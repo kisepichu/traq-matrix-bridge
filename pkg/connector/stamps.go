@@ -173,7 +173,7 @@ func (c *TraQConnector) syncStamps(ctx context.Context) (bool, error) {
 				}
 			}
 			log.Warn().Err(err).Msg("Stamp sync failed")
-			if !retry.wait(ctx, *log) {
+			if !retry.wait(ctx, *log, "Retrying the stamp sync") {
 				return ctx.Err()
 			}
 		}
@@ -234,7 +234,7 @@ func (c *TraQConnector) syncStamps(ctx context.Context) (bool, error) {
 	}
 
 	for len(retrying) > 0 {
-		if !retry.wait(ctx, *log) {
+		if !retry.wait(ctx, *log, "Retrying the emoji of the Unicode stamps given up on") {
 			return false, ctx.Err()
 		}
 		api := c.stampAPI()
