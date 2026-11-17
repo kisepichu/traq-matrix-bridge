@@ -47,6 +47,10 @@ var errWSNotConnected = errors.New("the traQ WebSocket is not connected")
 // viewStateSendWait bounds how long a caller waits for a viewstate write (see sendViewState).
 const viewStateSendWait = 5 * time.Second
 
+// eventSyncSpacing is the least time between the start of a subscription sync and that of a sync triggered by
+// channel events (see subscriptionSyncLoop).
+const eventSyncSpacing = 30 * time.Second
+
 // errTokenRejected is the cancel cause of a session whose token traQ rejected (HTTP 401).
 var errTokenRejected = errors.New("traq: access token rejected")
 
@@ -423,16 +427,38 @@ func (c *TraQClient) viewStateLoop(ctx context.Context) {
 // subscriptionSyncLoop re-syncs the subscriptions every subscription_sync_interval and when the event worker
 // asks for it through requests (a channel was changed or deleted). A rejected token stops the session with
 // errTokenRejected.
+//
+// traQ sends the channel events of every public channel, and each sync reads the whole channel list, so a sync
+// for requests starts no sooner than eventSyncSpacing after the previous sync started; the requests made
+// meanwhile add up to that one sync. A periodic sync due meanwhile runs at once and covers them.
 func (c *TraQClient) subscriptionSyncLoop(ctx context.Context, stop context.CancelCauseFunc, requests <-chan struct{}) {
 	t := time.NewTicker(c.Main.Config.SubscriptionSyncInterval)
 	defer t.Stop()
+	var last time.Time // when the last sync started
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 		case <-requests:
+			if wait := time.Until(last.Add(eventSyncSpacing)); !last.IsZero() && wait > 0 {
+				spacing := time.NewTimer(wait)
+				select {
+				case <-ctx.Done():
+					spacing.Stop()
+					return
+				case <-t.C:
+				case <-spacing.C:
+				}
+				spacing.Stop()
+			}
 		}
+		// The sync reads traQ after every change requested so far, so it covers a request still pending.
+		select {
+		case <-requests:
+		default:
+		}
+		last = time.Now()
 		err := c.syncSubscriptions(ctx)
 		switch {
 		case err == nil || ctx.Err() != nil:
