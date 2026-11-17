@@ -96,6 +96,74 @@ bridge は最初に CONNECTED になった login の API で stamp の一覧を 
 testenv/dev.sh down        # container と volume を消し、testenv/.dev/ も消す
 ```
 
+## 通しの確認
+
+release の前と、受信・送信・portal の扱いを変えたときに、開発環境で次の表を全部確かめる。Matrix 側は `@dev`、traQ 側は login する `alice` と、相手役の `bob`。
+
+### 準備
+
+```sh
+TRAQ_INIT_EMOJIS=1 testenv/dev.sh up        # reaction の行で 👍 (Unicode stamp) を使う
+testenv/dev.sh setup
+testenv/.dev/cfgedit testenv/.dev/config.yaml 'bridge/split_portals=true'      # Beeper (bbctl) と同じにする。bridge を初めて起動する前に
+testenv/.dev/cfgedit testenv/.dev/config.yaml 'backfill/max_initial_messages=10' 'network/poll/interval=1m'   # 任意: 件数を数えやすく、poll を待つ時間を短くする
+```
+
+bridge を起動する前に、traQ 側に portal の元を作る。`e2e` (level 2)、その子の `quiet` (level 1)、購読しない `none` (level 0) を作り、`bob` が `e2e` に 15 件 (`max_initial_messages` より多く)、`quiet` と `none` と `alice` への DM に 1 件ずつ投稿する。
+
+```sh
+testenv/dev.sh traq alice GET /users/me                                         # alice の ID
+testenv/dev.sh traq alice POST /channels '{"name":"e2e","parent":null}'         # 返る id を E2E とする
+testenv/dev.sh traq alice POST /channels "{\"name\":\"quiet\",\"parent\":\"$E2E\"}"   # QUIET
+testenv/dev.sh traq alice POST /channels '{"name":"none","parent":null}'        # NONE
+testenv/dev.sh traq alice PUT "/users/me/subscriptions/$E2E" '{"level":2}'
+testenv/dev.sh traq alice PUT "/users/me/subscriptions/$QUIET" '{"level":1}'
+for i in $(seq 15); do testenv/dev.sh traq bob POST "/channels/$E2E/messages" "{\"content\":\"history $i\"}"; done
+testenv/dev.sh traq bob POST "/channels/$QUIET/messages" '{"content":"quiet hello"}'
+testenv/dev.sh traq bob POST "/channels/$NONE/messages" '{"content":"none hello"}'
+testenv/dev.sh traq bob POST "/users/<alice の ID>/messages" '{"content":"dm hello"}'
+```
+
+`dev.sh traq` は JSON しか送れないので、カスタムスタンプと file は curl の multipart で作る (session の cookie は使い終わったら消す)。
+
+```sh
+curl -sS -c /tmp/bob.jar -H 'Content-Type: application/json' -d '{"name":"bob","password":"bob-password"}' http://localhost:3080/api/v3/login
+curl -sS -b /tmp/bob.jar -F name=custom -F 'file=@icon.png;type=image/png' http://localhost:3080/api/v3/stamps    # カスタムスタンプ :custom:
+curl -sS -b /tmp/bob.jar -F "channelId=$E2E" -F file=@icon.png http://localhost:3080/api/v3/files                # 画像 (返る id を本文に書く)
+curl -sS -b /tmp/bob.jar -F "channelId=$E2E" -F file=@note.txt http://localhost:3080/api/v3/files                # 画像以外の file
+rm /tmp/bob.jar
+```
+
+その後 `testenv/dev.sh bridge` を別の terminal で起動し、表を上から確かめる。room ID は `testenv/dev.sh rooms`、bridge した event は `testenv/dev.sh events '<room>' <n>`、traQ 側は `testenv/dev.sh traq <user> GET ...` で見る。
+
+### 項目
+
+| 項目 | 確かめること | 操作 |
+| --- | --- | --- |
+| login | bot の DM で `login` → URL を承認 → redirect の URL を貼る → `Successfully logged in` | `bot login`、`tail`、`traq-login alice '<URL>'`、`bot '<redirect URL>'`、`tail` |
+| portal | level 2 / level 1 のチャンネルと DM の room ができ、名前がフルパス (`e2e/quiet`)、level 0 の room はできない。level 1 が mute (double puppet ありのとき) | `rooms`。mute は `@dev` の push rule (`GET /_matrix/client/v3/pushrules/`) の `global.room` に、level 1 の room の `actions: []` があること |
+| 受信 | traQ で別 user が投稿・編集・削除 → Matrix に message・edit・redaction | `traq bob POST /channels/$E2E/messages`、`PUT /messages/<id>`、`DELETE /messages/<id>`、`events` |
+| スタンプ | 閲覧中 (Matrix で既読を付けた) チャンネルで即時、他のチャンネルと DM は `poll.interval` 以内に reaction が付く・消える。DM の編集・削除も `poll.interval` 以内に届く | `read '<e2e の room>' '<event>'` の後に `traq bob POST /messages/<id>/stamps/<stamp ID>` と `DELETE` (stamp ID は `traq alice GET '/stamps?type=unicode'`)。`quiet` と DM の message にも同じことをし、`poll.interval` 待って `events` |
+| 送信 | Matrix から投稿・reply・編集・削除、`@name` の pill が traQ で mention になる | `send`、`reply`、`edit`、`redact`、`send-raw` (pill)。`traq bob GET "/channels/$E2E/messages?limit=5"` で reply が先頭行の引用 URL、pill が `!{"type":"user",...}` になっていること |
+| reaction | Matrix の 👍 と `:custom:` が traQ のスタンプになる。未知の key は message status の error | `react '<room>' '<bob の message>' '👍'`、`':custom:'`、`':nosuchstamp:'`。`traq bob GET /messages/<id>/stamps`。未知の key には bot が `Your reaction was not bridged: unknown stamp` の notice を返す。reaction を `redact` するとスタンプが消える |
+| 既読 | Matrix の既読で traQ の未読が消える。traQ で読むと Matrix に既読が付く | `traq alice GET /users/me/unread` → `read` → もう一度 `GET`。逆は、閲覧中でないチャンネル (閲覧中のチャンネルは traQ で未読にならない) に `bob` が投稿し、`traq alice DELETE /users/me/unread/<channel ID>`。下の「既読の見方」 |
+| file | traQ の画像と file が Matrix に image / file で届く | 準備で作った file の `http://localhost:3080/files/<id>` を本文に書いて `bob` が投稿し、`events` で `m.image` / `m.file` |
+| 過去ログ | 新しい portal に `max_initial_messages` 件入る | `e2e` の room に `history 6` から `history 15` の 10 件 (`max_initial_messages=10` のとき) |
+| 再接続 | traQ の container を止めて投稿できない間を挟み、再起動後に bridge を止めていた間の投稿が入る | `docker compose -p tmb stop traq` → bridge の log に `Lost the connection to traQ, reconnecting` → `docker compose -p tmb start traq` → `Connected to the traQ WebSocket` と `Catching up on messages missed while disconnected`、その後の投稿が届く。bridge を止めて `e2e`・`quiet`・DM に投稿し、起動し直すとそれが入る |
+| 検索 | `search in:#<path> <語>` が結果を返す | `bot 'search in:#e2e history 1'`、`tail`。投稿から約 70 秒は index されていない |
+
+購読レベルの変更 (level 0 で room が消える、level 1 に下げると後から mute が付く) も確かめるときは、`traq alice PUT /users/me/subscriptions/<id> '{"level":0}'` の後に bridge を起動し直す (自分の購読の変更は次の読み直しまで反映しない)。
+
+### 既読の見方
+
+`@dev` の既読は `/sync` の ephemeral の `m.receipt` に出るが、Synapse は同じ request の `/sync` (since 無し) の応答を短い間 cache するので、続けて叩くと古い値が返る。Synapse の DB を直接読むと確実。
+
+```sh
+docker compose -p tmb exec -T synapse python3 -c "
+import sqlite3
+for r in sqlite3.connect('/data/homeserver.db').execute(\"select room_id, event_id from receipts_linearized where user_id='@dev:localhost' and receipt_type='m.read'\"): print(*r)"
+```
+
 ## `dev.sh` の subcommand
 
 | subcommand | 内容 |
