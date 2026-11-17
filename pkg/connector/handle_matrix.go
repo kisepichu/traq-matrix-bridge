@@ -164,14 +164,14 @@ func (c *TraQClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matr
 		SenderID:  UserID(me.ID),
 		Timestamp: posted.CreatedAt,
 		// The hash of the content as traQ stored it (with embeds), which MESSAGE_UPDATED compares against.
-		Metadata: &MessageMetadata{ContentHash: ContentHash(posted.Content)},
+		Metadata: messageMetadata(posted),
 	}}, nil
 }
 
 // HandleMatrixEdit edits one of the user's messages. The reply quote line is rebuilt from the stored reply
-// target, and the URLs of the message's file parts are kept. The content hash is updated from the edited
-// message as traQ stored it, so the echo (MESSAGE_UPDATED) is recognized as already bridged; bridgev2 saves
-// EditTarget after this returns.
+// target, and the URLs of the message's file parts are kept. The content hash and updatedAt are updated from
+// the edited message as traQ stored it, so the echo (MESSAGE_UPDATED) is recognized as already bridged;
+// bridgev2 saves EditTarget after this returns.
 func (c *TraQClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdit) error {
 	me, err := c.requireMe()
 	if err != nil {
@@ -200,19 +200,18 @@ func (c *TraQClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixE
 	if err := c.API.EditMessage(ctx, messageID, content); err != nil {
 		return fmt.Errorf("edit message: %w", err)
 	}
-	stored := content
-	if edited, err := c.API.Message(ctx, messageID); err != nil {
-		// The edit went through; without the stored content the echo may be bridged as one more edit.
-		zerolog.Ctx(ctx).Warn().Err(err).Str("traq_message_id", messageID).Msg("Failed to read back the edited traQ message")
-	} else {
-		stored = edited.Content
-	}
 	meta, _ := target.Metadata.(*MessageMetadata)
 	if meta == nil {
 		meta = &MessageMetadata{}
 		target.Metadata = meta
 	}
-	meta.ContentHash = ContentHash(stored)
+	if edited, err := c.API.Message(ctx, messageID); err != nil {
+		// The edit went through; without the stored content the echo may be bridged as one more edit.
+		zerolog.Ctx(ctx).Warn().Err(err).Str("traq_message_id", messageID).Msg("Failed to read back the edited traQ message")
+		meta.ContentHash = ContentHash(content)
+	} else {
+		meta.ContentHash, meta.UpdatedAt = ContentHash(edited.Content), edited.UpdatedAt
+	}
 	return nil
 }
 

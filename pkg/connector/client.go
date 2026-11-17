@@ -61,11 +61,13 @@ type TraQClient struct {
 	// older read cannot overwrite a newer one.
 	syncMu sync.Mutex
 
-	stateMu       sync.RWMutex
-	me            *traq.Me               // nil until Connect has loaded it
-	channels      *channelTree           // nil until Connect has loaded it
-	targets       map[string]channelInfo // channels that have a portal, by ID: the last subscription snapshot
-	lastMessageAt time.Time              // CreatedAt of the newest message seen on the WebSocket
+	stateMu  sync.RWMutex
+	me       *traq.Me               // nil until Connect has loaded it
+	channels *channelTree           // nil until Connect has loaded it
+	targets  map[string]channelInfo // channels that have a portal, by ID: the last subscription snapshot
+	// lastActivity is the CreatedAt of the newest message known in each channel that has a portal, by
+	// channel ID: the poller re-reads the recently active ones. Connect fills it from the database.
+	lastActivity map[string]time.Time
 
 	runMu   sync.Mutex
 	running *session // the last session started by Connect; nil before the first Connect
@@ -158,8 +160,8 @@ func (c *TraQClient) run(ctx context.Context) {
 	}
 }
 
-// runLoops loads, syncs and runs the subscription sync and WebSocket loops until ctx ends. A loop that sees
-// the token rejected cancels ctx through stop with errTokenRejected.
+// runLoops loads, syncs and runs the event worker and the subscription sync, viewstate, poll and WebSocket
+// loops until ctx ends. A loop that sees the token rejected cancels ctx through stop with errTokenRejected.
 func (c *TraQClient) runLoops(ctx context.Context, stop context.CancelCauseFunc) {
 	var wg sync.WaitGroup
 	defer wg.Wait()
@@ -169,6 +171,7 @@ func (c *TraQClient) runLoops(ctx context.Context, stop context.CancelCauseFunc)
 	if !ok {
 		return
 	}
+	c.loadLastActivity(ctx, targets)
 	c.initialSync(ctx, me, targets, unread)
 	// One queue and one worker per session, so events are handled in the order traQ sent them, across
 	// reconnects too.
@@ -178,6 +181,7 @@ func (c *TraQClient) runLoops(ctx context.Context, stop context.CancelCauseFunc)
 	wg.Go(func() { c.eventWorker(ctx, queue, syncRequests) })
 	wg.Go(func() { c.subscriptionSyncLoop(ctx, stop, syncRequests) })
 	wg.Go(func() { c.viewStateLoop(ctx) })
+	wg.Go(func() { c.pollLoop(ctx, stop) })
 	c.websocketLoop(ctx, stop, queue)
 }
 
@@ -270,19 +274,24 @@ func (b *backoff) wait(ctx context.Context, log zerolog.Logger) bool {
 func (b *backoff) reset() { b.next = 0 }
 
 // websocketLoop keeps the WebSocket open, reconnecting with backoff, until ctx ends or the token is rejected.
-// Events go to queue.
+// Events go to queue. After a reconnect, the messages missed while disconnected are caught up on before the
+// new connection is read (initialSync covers the time before Connect).
 func (c *TraQClient) websocketLoop(ctx context.Context, stop context.CancelCauseFunc, queue chan<- traq.Event) {
 	var retry backoff
+	var lostAt time.Time // when the last connection ended; zero before the first one
 	for {
 		ws, err := c.dialWebSocket(ctx)
 		if err == nil {
 			c.Login.Log.Info().Msg("Connected to the traQ WebSocket")
 			c.Login.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
-			// A catch-up of what was missed while disconnected belongs here, for every connection but the first
-			// (initialSync covers the time before Connect). The viewstate is sent again in readWebSocket.
+			if !lostAt.IsZero() {
+				c.catchUp(ctx, lostAt.Add(-catchUpMargin))
+			}
+			// The viewstate is sent again in readWebSocket.
 			start := time.Now()
 			err = c.readWebSocket(ctx, ws, queue)
 			_ = ws.Close()
+			lostAt = time.Now()
 			// Only a connection that stayed up resets the backoff, so a server that drops every connection
 			// right away is not hammered.
 			if time.Since(start) > pingInterval {

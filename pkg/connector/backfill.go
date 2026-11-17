@@ -160,8 +160,6 @@ func (a *backfillAssembler) assemble(ctx context.Context, channelID string, forw
 		resp.Cursor = encodeCursor(msgs[0].CreatedAt)
 	}
 	if forward {
-		// Task 12: record the newest of resp.Messages as the channel's last activity here, so that the
-		// catch-up after the next reconnect starts after what this fetch brought in.
 		resp.MarkRead = len(resp.Messages) > 0 && a.channelRead(ctx, channelID)
 	}
 	return resp, nil
@@ -192,6 +190,10 @@ func (c *TraQClient) FetchMessages(ctx context.Context, params bridgev2.FetchMes
 	msgs, more, err := newestMessages(ctx, page, q, params.Count, skipID)
 	if err != nil {
 		return nil, fmt.Errorf("get messages of channel %s: %w", channelID, err)
+	}
+	if params.Forward && len(msgs) > 0 {
+		// A forward fetch brings the channel's newest messages: the poller re-reads it while recently active.
+		c.noteActivity(channelID, msgs[len(msgs)-1].CreatedAt)
 	}
 	a := &backfillAssembler{
 		convert: func(ctx context.Context, msg *traq.Message, earlier map[string]struct{}) (*bridgev2.BackfillMessage, error) {
