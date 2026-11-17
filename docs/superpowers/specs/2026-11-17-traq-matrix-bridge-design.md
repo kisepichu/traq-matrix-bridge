@@ -4,8 +4,10 @@
 
 traQ (traP の社内 SNS、OSS) と Matrix をつなぐ puppeting bridge を、mautrix-go の bridgev2 で書く。
 traQ のチャンネルと DM を Matrix の room にし、Matrix client (iamb など) から traQ を普段どおりに使えるようにする。
-1 つの bridge が扱う traQ server は 1 つ (設定の `network.server_url`)。最初の利用者は ex-traQ
-(`https://q.ex.trap.jp`) を Beeper の self-hosted bridge (bbctl) として leafeon で動かす。
+1 つの bridge が扱う traQ server は 1 つ (設定の `network.server_url`)。traQ (`https://q.trap.jp`) にも ex-traQ
+(`https://q.ex.trap.jp`) にも、それぞれ bridge を 1 本ずつ動かせば繋げる。homeserver は Matrix の appservice を
+登録できるもの (Synapse など) か、Beeper の self-hosted bridge (bbctl) を想定する (「動かし方」の節)。
+作者自身の deploy (ex-traQ を Beeper 経由で使う) の手順は作者の環境の repository に置き、ここには書かない。
 
 repository は `kisepichu/traq-matrix-bridge` (public、MIT)。
 
@@ -35,7 +37,7 @@ Matrix client から次ができる。
   すべて MIT の project から使える。mautrix-go のファイルは改変しない (MPL-2.0 の義務は改変したファイルに掛かる)。
 - **AGPL の bridge (mautrix-slack、mautrix-discord など) のコードは写さない**。bridgev2 の使い方は
   mautrix-go の interface と godoc から書く。他の bridge は挙動を理解するために読むだけにする。
-- end-to-bridge encryption は libolm を使う (leafeon の mautrix-discord と同じ)。Nix を使わない build のために
+- end-to-bridge encryption は libolm を使う (mautrix の upstream の build と同じ)。Nix を使わない build のために
   `-tags goolm` (libolm 無し) でも build できることを README に書く。
 - Go と依存の version は flake と `go.mod` で固定する。
 
@@ -74,7 +76,7 @@ flake.nix       package (buildGoModule)、開発環境
 |---|---|
 | `UserLoginID` | login した traQ user の UUID |
 | `PortalID` | channel の UUID (DM は DM channel の UUID)。DM の PortalKey は receiver に login を入れる |
-| `UserID` (ghost) | traQ user の UUID。MXID は bbctl の `username_template` (例 `@sh-extraq_<uuid>:beeper.local`) |
+| `UserID` (ghost) | traQ user の UUID。MXID は bridge 設定の `appservice.username_template` で決まる (例: `traq_{{.}}` なら `@traq_<uuid>:<homeserver の domain>`) |
 | `MessageID` | message の UUID |
 | reaction の `EmojiID` | stamp の UUID (1 user × 1 stamp で 1 reaction) |
 
@@ -83,16 +85,17 @@ flake.nix       package (buildGoModule)、開発環境
 ```yaml
 network:
   # traQ の origin。API は <server_url>/api/v3
-  server_url: https://q.ex.trap.jp
+  server_url: https://q.trap.jp
   oauth:
     # 運用者がその traQ に作った public client (scope: read write)
     client_id: ""
     # client の callbackUrl と同じ値。到達できなくてよい (login 時に URL を貼り返す)
     redirect_uri: http://localhost:29399/callback
   poll:
-    interval: 3m    # activity timeline を見る間隔
-    window: 6h      # 最新メッセージがこの時間内のチャンネルだけ読み直す
-    depth: 30       # 読み直す直近のメッセージ数
+    interval: 3m      # 読み直しの間隔
+    window: 6h        # 最終書き込みがこの時間内のチャンネルだけ読み直す
+    depth: 30         # 1 チャンネルで読み直す直近のメッセージ数
+    max_channels: 50  # 1 回に読み直すチャンネル数の上限 (最終書き込みの新しい順)
   view_idle_timeout: 10m          # Matrix で操作が無ければ viewstate を外す
   subscription_sync_interval: 10m # 購読状態を読み直す間隔
 ```
@@ -112,7 +115,7 @@ traQ は redirect 先が http(s) 以外なら PKCE (S256) を必須とし、`/oa
 4. token は `UserLogin` の metadata (bridge の database) にだけ置く。log に出さない。
 
 `code_verifier` は login 処理の memory にだけあり、外に出ない。貼り返す URL の `code` は verifier 無しでは
-token に換えられないので、provisioning API が Beeper (hungryserv) を経由しても token は漏れない。
+token に換えられないので、provisioning API が homeserver などの中継 (Beeper なら hungryserv) を通っても token は漏れない。
 
 token は期限の 1 日前と、REST が 401 を返したときに refresh する。refresh が失敗したら bridge state を
 `BAD_CREDENTIALS` にし、user に再 login を求める。logout では `/oauth2/revoke` で token を無効にする。
@@ -135,14 +138,19 @@ traQ の WebSocket は event ごとに届く相手が違う。
 - **今読んでいるチャンネル**: Matrix で read receipt (または message の送信) があった room のチャンネルに
   `viewstate:<channel>:monitoring` を送る。そのチャンネルの編集・削除・スタンプは WebSocket で届く。
   `view_idle_timeout` の間 Matrix で操作が無ければ `viewstate:null` を送る (traQ の閲覧者の表示に残り続けない)。
-- **それ以外のチャンネル** (poller): `poll.interval` ごとに `/activity/timeline?all=true&per_channel=true` を読み、
-  最新メッセージが `poll.window` 内で、portal があり、今 viewstate を向けていないチャンネルについて
-  `/channels/{id}/messages?limit=<poll.depth>` を読む。取れたメッセージと database の状態を比べて、
-  次の remote event を出す。
+- **それ以外のチャンネル** (poller): 新着は全部 bridge に届くので、bridge は portal ごとの最終書き込み時刻を
+  知っている (起動時は database の最新 message から、その後は受け取った event から)。`poll.interval` ごとに、
+  最終書き込みが `poll.window` 内で、今 viewstate を向けていない portal を新しい順に最大 `poll.max_channels` 件選び、
+  `/channels/{id}/messages?limit=<poll.depth>` を読む。DM もこれで対象になる。取れたメッセージと database の
+  状態を比べて、次の remote event を出す。
   - 本文か `updatedAt` が変わった → 編集
   - database にあり、取れた範囲 (最古〜最新) の中なのに無い → 削除
   - stamp の (user, stamp) の組が増えた・減った → reaction の追加・削除
-- **再接続**: WebSocket が切れたら指数 backoff で繋ぎ直し、繋がったら poller を 1 回すぐ回して取りこぼしを拾う。
+  
+  `/activity/timeline` は候補選びに使わない。`limit` が最大 50 で、public チャンネルしか返さない (DM が漏れる) ため。
+- **再接続**: WebSocket が切れたら指数 backoff で繋ぎ直す。繋がったら、切れていた間の新着を拾うため、
+  `/users/me/unread` に出ているチャンネルと `/activity/timeline?per_channel=true` (購読チャンネル) に出ている
+  チャンネルのうち、最終書き込みが切断時刻より後の portal について、database の最新 message より後を取り込む。
   `PING` を定期的に送り、応答が無ければ切って繋ぎ直す。
 - **user / stamp の変更**: `USER_UPDATED` / `USER_ICON_UPDATED` で ghost の表示名とアイコンを、
   `STAMP_CREATED` / `UPDATED` / `DELETED` で stamp の cache を更新する。
@@ -230,15 +238,17 @@ traQ の WebSocket は event ごとに届く相手が違う。
 ## 過去ログ
 
 - portal を作るときは bridgev2 の `max_initial_messages` 件を取り込む。
-- それより前は bridgev2 の backfill queue (Beeper 接続時) が `FetchMessages` を呼ぶ。
+- それより前は bridgev2 の backfill queue が `FetchMessages` を呼び、
   `/channels/{id}/messages?until=<anchor の createdAt>&order=desc&limit=…` で遡る。
+  backfill queue は、既存の room の履歴に message を差し込める homeserver (Beeper の hungryserv) でだけ動く。
+  標準の homeserver (Synapse など) では、room を作ったときの `max_initial_messages` 件までしか入らない。
 - 取り込んだ message にもスタンプを reaction として付ける。
 
 ## 失敗時の扱い
 
 - REST の 401: token を refresh して 1 回だけやり直す。だめなら `BAD_CREDENTIALS`。
 - REST の 429 / 5xx: `Retry-After` か backoff で待ってやり直す。Matrix からの送信が失敗したら message status で返す。
-- WebSocket の切断: bridge state を `TRANSIENT_DISCONNECT` にし、繋ぎ直したら poller で取りこぼしを拾う。
+- WebSocket の切断: bridge state を `TRANSIENT_DISCONNECT` にし、繋ぎ直したら「受信」の再接続の手順で取りこぼしを拾う。
 - poller の失敗: log に残し、次の間隔でやり直す。
 - 未知の stamp、上限超え、未対応の msgtype: traQ には送らず、理由付きの message status を返す。
 
@@ -251,15 +261,23 @@ traQ の WebSocket は event ごとに届く相手が違う。
    `ghcr.io/traptitech/traq:3.32.1`、MariaDB、Elasticsearch を立てる。テストの中で管理者 (`traq`/`traq`) で
    login し、OAuth client を作り、PKCE で認可して token に換える。その token で投稿・編集・削除、stamp、
    `timeline_streaming` と `viewstate` の event、既読、検索、token の refresh を確かめる。
-3. **通しの確認** (手動): leafeon で `sh-extraq` として動かし、Beeper 経由で iamb から目的の操作一式を試す。
+3. **通しの確認** (手動): 実際の traQ と homeserver に繋ぎ、Matrix client から「目的」の操作一式を試す。
 
 CI (GitHub Actions) は PR ごとに `go vet`、単体テスト、結合テスト (compose) を回す。
 
-## 配布と deploy (ex-traQ / leafeon)
+## 動かし方 (運用者向け)
 
-1. ex-traQ に public の OAuth client を作る (scope `read` `write`、callback `http://localhost:29399/callback`)。
-2. WSL で `bbctl config --type bridgev2 -o /tmp/sh-extraq.yaml sh-extraq` を実行し、`network:` 節を足し、
-   logging を info + stdout にして agenix で暗号化する。
-3. nixos-config-private: flake input に `traq-matrix-bridge` を足し、`hosts/leafeon/matrix-bridges.nix` の
-   `bridges` に追加する (既存の DynamicUser + LoadCredential の unit)。status.kisen.one にも出す。
-4. deploy し、bot に DM して `login` する。
+README に次を書く。
+
+- **traQ の OAuth client**: 運用者がその traQ に public client を 1 つ作る (scope `read` `write`、
+  callback は設定の `redirect_uri`)。作るには traQ の `create_client` 権限が要る。
+- **homeserver**: 次のどちらか。
+  - Matrix の appservice を登録できる homeserver: `traq-matrix-bridge -e` で設定の例を出し、`-g` で
+    registration を作って homeserver に登録する (mautrix の bridge と同じ手順)。
+  - Beeper: `bbctl config --type bridgev2 -o config.yaml sh-<name>` で設定を作り、`network:` 節を足す。
+- **double puppeting**: 自分の発言を自分の Matrix account の発言として出すこと、自分の既読、通知を切った room
+  (購読レベル 1) は double puppeting で動く。bridgev2 の `double_puppet` 設定が要る。
+  Beeper では bbctl の生成した設定に入っている。無い場合、自分の発言が ghost として出て、既読と通知の設定が付かない。
+- **encryption**: bridgev2 の `encryption` 設定に従う。Beeper は暗号化を必須にしている。
+- **build**: `nix build` (flake の package)、または `go build ./cmd/traq-matrix-bridge` (libolm が要る。
+  無ければ `-tags goolm`)。
