@@ -132,6 +132,25 @@ func TestBuildMessageReplyQuoteAlone(t *testing.T) {
 	}
 }
 
+// A mention of a traQ user who is logged into this bridge points to that login's Matrix user, whichever login
+// converts the message; any other traQ user is their ghost.
+func TestResolverUserMXID(t *testing.T) {
+	logins := map[networkid.UserLoginID]id.UserID{"u-me": "@me:example.org", "u-carol": "@carol:example.org"}
+	r := &resolver{
+		loginMXID: func(loginID networkid.UserLoginID) (id.UserID, bool) { mxid, ok := logins[loginID]; return mxid, ok },
+		ghostMXID: func(userID networkid.UserID) id.UserID { return id.UserID("@traq_" + string(userID) + ":example.org") },
+	}
+	for traqUserID, want := range map[string]id.UserID{
+		"u-me":    "@me:example.org",
+		"u-carol": "@carol:example.org",
+		"u-bob":   "@traq_u-bob:example.org",
+	} {
+		if got, ok := r.UserMXID(traqUserID); got != want || !ok {
+			t.Errorf("UserMXID(%q) = %q, %v; want %q", traqUserID, got, ok, want)
+		}
+	}
+}
+
 // A file that cannot be re-uploaded keeps its traQ URL in the text, and the text part is created for it.
 func TestBuildMessageFileNotUploaded(t *testing.T) {
 	up := &fakeUploader{errs: map[string]error{fileA: errFileTooLarge}}

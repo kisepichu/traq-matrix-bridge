@@ -63,7 +63,7 @@ func (c *TraQClient) convertMessage(ctx context.Context, portal *bridgev2.Portal
 // batch that are sent before this one, so a quote of one of them becomes a reply although the database
 // does not have it yet.
 func (c *TraQClient) convertMessageAfter(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *traq.Message, earlier map[string]struct{}) (*bridgev2.ConvertedMessage, error) {
-	res := msgconv.ToMatrix(c.toMatrixInput(msg.Content), &resolver{ctx: ctx, c: c, portal: portal, earlier: earlier})
+	res := msgconv.ToMatrix(c.toMatrixInput(msg.Content), c.newResolver(ctx, portal, earlier))
 	up := &portalUploader{api: c.API, files: c.Files, limit: c.Main.maxFileSize(), roomID: portal.MXID, intent: intent}
 	return buildMessage(ctx, res, messageMetadata(msg), c.origin(), up, messageFilesTimeout)
 }
@@ -72,7 +72,8 @@ func (c *TraQClient) convertMessageAfter(ctx context.Context, portal *bridgev2.P
 // to the message is linked in the text. The reply target cannot change, so only a quote of the original
 // reply target is turned into the reply; other quotes stay links.
 func (c *TraQClient) convertEdit(ctx context.Context, portal *bridgev2.Portal, _ bridgev2.MatrixAPI, existing []*database.Message, msg *traq.Message) (*bridgev2.ConvertedEdit, error) {
-	r := &resolver{ctx: ctx, c: c, portal: portal, edit: true}
+	r := c.newResolver(ctx, portal, nil)
+	r.edit = true
 	for _, part := range existing {
 		if part.ReplyTo.MessageID != "" {
 			r.editReplyTo = part.ReplyTo.MessageID
@@ -83,6 +84,8 @@ func (c *TraQClient) convertEdit(ctx context.Context, portal *bridgev2.Portal, _
 	return buildEdit(existing, res, messageMetadata(msg), c.origin())
 }
 
+// toMatrixInput is the input of a conversion. Group mentions notify only this login's user: whether another
+// login's user is in a group would need that login's groups, which the conversion does not have.
 func (c *TraQClient) toMatrixInput(content string) msgconv.ToMatrixInput {
 	in := msgconv.ToMatrixInput{Content: content, ServerURL: c.API.ServerURL(), SelfMXID: c.Login.UserMXID}
 	if me := c.self(); me != nil {
@@ -280,15 +283,35 @@ type resolver struct {
 	editReplyTo networkid.MessageID
 	// earlier is the IDs of the backfill batch's messages that are sent before the one being converted.
 	earlier map[string]struct{}
+	// loginMXID returns the Matrix user of a login of this bridge, if it exists.
+	loginMXID func(networkid.UserLoginID) (id.UserID, bool)
+	ghostMXID func(networkid.UserID) id.UserID
 }
 
 var _ msgconv.Resolver = (*resolver)(nil)
 
-func (r *resolver) UserMXID(traqUserID string) (id.UserID, bool) {
-	if me := r.c.self(); me != nil && me.ID == traqUserID {
-		return r.c.Login.UserMXID, true
+func (c *TraQClient) newResolver(ctx context.Context, portal *bridgev2.Portal, earlier map[string]struct{}) *resolver {
+	br := c.Login.Bridge
+	return &resolver{
+		ctx: ctx, c: c, portal: portal, earlier: earlier,
+		loginMXID: func(loginID networkid.UserLoginID) (id.UserID, bool) {
+			// bridgev2 loads every login at startup and caches it until it is deleted.
+			if login := br.GetCachedUserLoginByID(loginID); login != nil {
+				return login.UserMXID, true
+			}
+			return "", false
+		},
+		ghostMXID: br.Matrix.FormatGhostMXID,
 	}
-	return r.c.Login.Bridge.Matrix.FormatGhostMXID(UserID(traqUserID)), true
+}
+
+// UserMXID is the Matrix user of the traQ user's login on this bridge (the login's ID is the traQ user ID),
+// so that a mention notifies a logged-in user whichever login converts the message; else the ghost.
+func (r *resolver) UserMXID(traqUserID string) (id.UserID, bool) {
+	if mxid, ok := r.loginMXID(LoginID(traqUserID)); ok {
+		return mxid, true
+	}
+	return r.ghostMXID(UserID(traqUserID)), true
 }
 
 func (r *resolver) ChannelLink(channelID string) (string, bool) {
