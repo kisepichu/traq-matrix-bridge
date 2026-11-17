@@ -1707,17 +1707,18 @@ func pollCandidates(lastActivity map[string]time.Time, viewed string, now time.T
 
 **Interfaces:**
 - Consumes: Task 10 (`convertMessage`、`stampReactions`、`sender`)。bridgev2 §11。
-- Produces: `func (c *TraQClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams) (*bridgev2.FetchMessagesResponse, error)` と、副作用の無い `func fetchQuery(params bridgev2.FetchMessagesParams) traq.MessagesQuery`、`func encodeCursor(t time.Time) networkid.PaginationCursor` / `decodeCursor`。
+- Produces: `func (c *TraQClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams) (*bridgev2.FetchMessagesResponse, error)` と、副作用の無い `func fetchQuery(params bridgev2.FetchMessagesParams) (traq.MessagesQuery, error)` (読めない cursor は error)、`func newestMessages(ctx, fetch messagePage, q traq.MessagesQuery, count int, skipID string) ([]traq.Message, bool, error)` (1 page を取る callback の上の paging)、`func encodeCursor(t time.Time) networkid.PaginationCursor` / `decodeCursor`。
 
 決まり:
 
-- forward (`params.Forward`): `Since` = anchor の Timestamp (anchor が無ければ指定なし)、`Inclusive: false`、`Order: asc`、`Limit: min(params.Count, 200)`。
-- backward: `Until` = cursor (前回の最古の `CreatedAt`) か anchor の Timestamp、`Order: desc`、`Limit: min(params.Count, 200)`。返す前に古い順に並べ替える。`HasMore` は `X-TRAQ-MORE`、`Cursor` は最古の `CreatedAt` (RFC 3339 nano)。
-- 各 message は `BackfillMessage{ConvertedMessage: convertMessage(...), Sender, ID, Timestamp: CreatedAt, Reactions: stampReactions}`。intent は `params.Portal.GetIntentFor(ctx, sender, c.Login, bridgev2.RemoteEventMessage)`。変換に失敗した message は log に残して飛ばす。
+- forward (`params.Forward`) は、live の message と隙間無く繋がる**最新**の `params.Count` 件を返す。bridgev2 は forward の `FetchMessages` を 1 回しか呼ばず `HasMore` を見ない (`portalbackfill.go` の `doForwardBackfill`) ので、anchor の直後から古い順に取ると、取りきれなかった分が永久に抜ける。query は `Order: desc`、anchor があれば `Since` = anchor の Timestamp、`Inclusive: true` (同じ時刻の別 message を落とさない。anchor 自身は ID で除き、bridgev2 の `cutoffMessages` も ID と時刻で落とす)。anchor が無ければ範囲指定なし。
+- backward: `Until` = cursor (前回の最古の `CreatedAt`) か anchor の Timestamp、`Inclusive: false`、`Order: desc`。`HasMore` は `X-TRAQ-MORE`、`Cursor` は取得した中で最古の `CreatedAt` (RFC 3339 nano、取り込まなかった message でも)。
+- paging (両方向、`newestMessages`): traQ が more を返し、集めた数が `Count` 未満の間、`Until` = それまでの最古の `CreatedAt`、`Inclusive: true` で次の page を取る。境界の時刻の message は再び返るので ID で除き、その数だけ `Limit` を足す (`Limit: min(残り + 再び返る数, 200)`)。新しい message の無い page (同じ時刻が 200 件を超える) で止める。最後に古い順に並べ替える。これで `max_initial_messages` / `max_catchup_messages` の 200 件の上限も無くなる。
+- 各 message は `BackfillMessage{ConvertedMessage: convertMessage(...), Sender, ID, Timestamp: CreatedAt, Reactions: stampReactions}`。intent は `params.Portal.GetIntentFor(ctx, sender, c.Login, bridgev2.RemoteEventMessage)`。変換に失敗した message は log に残して飛ばす。変換の loop は ctx が終わったら止める。組み立て (`backfillAssembler`) は変換と `Unread` を差し替えられる形にして、bridge 無しで test する。
 - forward で返した message の分だけ、最終書き込み時刻 (Task 12) を更新する。
-- `MarkRead`: forward の取り込みで、そのチャンネルが `Unread` に無ければ true。
+- `MarkRead`: forward の取り込みで、取り込む message があり、そのチャンネルが `Unread` に無ければ true (`Unread` の error は未読扱い)。
 
-- [ ] **Step 1: 失敗するテストを書く** (`backfill_test.go`): `fetchQuery` が forward / backward / cursor あり / Count > 200 で上の決まりどおり。`encodeCursor` と `decodeCursor` の往復 (nano 秒を保つ)。
+- [ ] **Step 1: 失敗するテストを書く** (`backfill_test.go`): `fetchQuery` が forward / backward / cursor あり / 読めない cursor で上の決まりどおり。`newestMessages` を traQ と同じ範囲の意味を持つ偽の fetch で: 複数 page、`Count` で止まる、more が無ければ止まる、anchor の境界、page の境界で同じ時刻 (重複も抜けも無い)、同じ時刻が 200 件超で止まる。`backfillAssembler`: 順序、飛ばした message が `earlier` に入らない、`Cursor`、`MarkRead` (空・既読・未読・`Unread` の error)、ctx の終了。`encodeCursor` と `decodeCursor` の往復 (nano 秒を保つ)。
 - [ ] **Step 2: 失敗を確かめる** → FAIL
 - [ ] **Step 3: 実装する**
 - [ ] **Step 4: 通す** — `go test -race ./...` → PASS
