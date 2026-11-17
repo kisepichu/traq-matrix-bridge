@@ -1,10 +1,12 @@
 package connector
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	"gopkg.in/yaml.v3"
+	"maunium.net/go/mautrix/bridgev2/bridgeconfig"
 )
 
 func validConfig() NetworkConfig {
@@ -58,5 +60,32 @@ func TestServerURLTrailingSlashIsAccepted(t *testing.T) {
 	c.ServerURL = "https://q.trap.jp/"
 	if err := c.Validate(); err != nil {
 		t.Errorf("trailing slash: %v", err)
+	}
+}
+
+// backfill.enabled off and bridge.async_events on each give one warning; the settings the connector needs
+// give none.
+func TestBridgeConfigWarnings(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  bridgeconfig.BridgeConfig
+		want []string
+	}{
+		{"required settings", bridgeconfig.BridgeConfig{Backfill: bridgeconfig.BackfillConfig{Enabled: true}}, nil},
+		{"backfill disabled", bridgeconfig.BridgeConfig{}, []string{"backfill.enabled"}},
+		{"async events", bridgeconfig.BridgeConfig{AsyncEvents: true, Backfill: bridgeconfig.BackfillConfig{Enabled: true}}, []string{"bridge.async_events"}},
+		{"both", bridgeconfig.BridgeConfig{AsyncEvents: true}, []string{"backfill.enabled", "bridge.async_events"}},
+	}
+	for _, tc := range cases {
+		got := bridgeConfigWarnings(&tc.cfg)
+		if len(got) != len(tc.want) {
+			t.Errorf("%s: warnings = %q, want one each for %q", tc.name, got, tc.want)
+			continue
+		}
+		for i, key := range tc.want {
+			if !strings.Contains(got[i], key) {
+				t.Errorf("%s: warning %d = %q, want it to name %s", tc.name, i, got[i], key)
+			}
+		}
 	}
 }
