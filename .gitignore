@@ -41,3 +41,6 @@ go.work.sum
 *.db-*
 /logs/
 /.superpowers/
+
+# Development environment state (testenv/dev.sh)
+/testenv/.dev/

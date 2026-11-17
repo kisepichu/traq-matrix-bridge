@@ -36,3 +36,28 @@ services:
       interval: 2s
       timeout: 10s
       retries: 90
+  synapse:
+    # Only started with `--profile matrix` (testenv/dev.sh); integration tests and CI start the traQ services alone.
+    profiles: ["matrix"]
+    image: matrixdotorg/synapse:v1.165.0
+    environment:
+      SYNAPSE_CONFIG_PATH: /config/homeserver.yaml
+      # The image drops to uid 991, which cannot write the root-owned named volume; this is a throwaway dev server.
+      UID: "0"
+      GID: "0"
+    volumes:
+      - ./synapse:/config:ro
+      - ./.dev:/bridge:ro
+      - synapse-data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:8008:8008"
+    healthcheck:
+      test: curl -fsS http://localhost:8008/health || exit 1
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+volumes:
+  synapse-data:

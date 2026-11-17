@@ -25,7 +25,9 @@ Spec: `docs/superpowers/specs/2026-11-17-traq-matrix-bridge-design.md`
 - bridgev2 の API は `docs/notes/bridgev2-v0.33.0.md`、traQ の API と WebSocket は `docs/notes/traq-api.md` (冒頭の実測を優先) を見る。どちらも要約なので、使う前に module cache の source (`go env GOMODCACHE`) か `/tmp/traq-v3.yaml` 相当の OpenAPI (`https://raw.githubusercontent.com/traPtitech/traQ/v3.32.1/docs/v3-api.yaml`) で確かめる。
 - 単体テストは `go test -race ./...` で、network にも docker にも触らない。traQ に繋ぐテストは build tag `integration` を付け、`TRAQ_TEST_URL` (既定 `http://localhost:3080`) の traQ を使う。
 
-Task の依存: 1 → (2, 3, 6, 7 は並行できる) → 4, 5 (3 の後) → 8 (1, 3 の後) → 9 (5, 8) → 10 (2, 6, 9) → 11 (7, 9) → 12, 13, 14, 15 (10 の後) → 16。connector の task (8 以降) は同じ file を触るので 1 つずつ進める。
+Task の依存: 1 → (2, 3, 6, 7 は並行できる) → 4, 5 (3 の後) → 7.5 (4 の後) → 8 (1, 3, 7.5 の後) → 9 (5, 8) → 10 (2, 6, 9) → 11 (7, 9) → 12, 13, 14, 15 (10 の後) → 16。connector の task (8 以降) は同じ file を触るので 1 つずつ進める。
+
+connector の task (8 以降) は、単体テストに加えて Task 7.5 の開発環境 (testenv の traQ + 開発用 synapse + `testenv/dev.sh`) で bridge を実際に起動し、その task で変えた経路を動かして確かめ、操作と結果 (bot の返答、room の event、traQ 側の状態) を report に書く。
 
 ---
 
@@ -1362,6 +1364,51 @@ func TestToTraQLength(t *testing.T) {
 - [ ] **Step 4: 通す** — `go test -race ./pkg/msgconv/` → PASS
 - [ ] **Step 5: commit** — `git commit -m "feat(msgconv): convert Matrix messages to traQ markdown"`
 
+### Task 7.5: 開発環境 (開発用 homeserver と操作用 script)
+
+**Files:**
+- Create: `testenv/synapse/homeserver.yaml`、`testenv/synapse/log.config` (開発用 synapse の設定)
+- Modify: `testenv/compose.yaml` (profile `matrix` の service `synapse`。profile を付けない起動 (結合テスト、CI) には影響させない)
+- Create: `testenv/dev.sh` (開発用の操作 script)、`testenv/cfgedit/main.go` (コメントを保ったまま YAML の値を差し替える小さな Go program。`${NAME}` を環境変数で置換するので、secret を引数に出さずに渡せる)
+- Create: `docs/development.md` (開発者向けの手順、日本語)
+- Modify: `.gitignore` (`/testenv/.dev/`)
+
+**Interfaces:**
+- Consumes: Task 1 の binary (`-e`、`-g`)、Task 4 の testenv。
+- Produces (Task 8 以降の確認に使う): `testenv/dev.sh` の subcommand。状態 (生成した設定、registration、DB、token) は `testenv/.dev/` に置く。
+
+```text
+testenv/dev.sh up            # bridge の binary と cfgedit をビルドし、bridge の設定と registration 2 つ (appservice、double puppet) を作ってから
+                             # docker compose -p tmb -f testenv/compose.yaml --profile matrix up -d、traQ と synapse の起動を待つ
+                             # bridge: -e で設定を作り、homeserver / appservice / database / permissions / double puppet /
+                             #         network.server_url=http://localhost:3080 を埋め、-g で registration を作る (synapse は registration を起動時にしか読まない)
+testenv/dev.sh down          # docker compose ... down -v、testenv/.dev/ を消す
+testenv/dev.sh setup         # traQ: OAuth client を作り (admin traq/traq)、bridge の設定の network.oauth.client_id を埋める。traQ user alice / bob を作る
+                             # synapse: Matrix user @dev:localhost を作る、access token を .dev/ に保存
+testenv/dev.sh bridge        # go build -tags goolm して、.dev/config.yaml で前景で起動する (log は stdout)
+testenv/dev.sh bot <text>    # @dev として bot (management room。無ければ作る) に text を送る
+testenv/dev.sh tail [room]   # room (既定 management room) の最新 20 event を「sender: body」で表示する
+testenv/dev.sh rooms         # @dev が入っている room の一覧 (room ID と name)
+testenv/dev.sh send <room> <text>   # @dev として room に送る
+testenv/dev.sh traq-login <user> <authorize-url>   # traQ user として OAuth の authorize URL を承認し、bot に貼る redirect URL を表示する (Task 8 の login 用)
+testenv/dev.sh traq <user> <METHOD> <path> [json]  # traQ user の session で REST を叩く (相手側の操作の再現用)
+```
+
+決まり:
+
+- synapse の image は実装時点の最新の安定版 tag に固定する。server name `localhost`、client API は host の `127.0.0.1:8008` だけに公開する。registration は無効、user は `register_new_matrix_user` (shared secret) で作る。
+- appservice の registration file は `testenv/.dev/registration.yaml` を container に mount し、`app_service_config_files` で読ませる。bridge は host で動くので、registration の `url` は `http://host.docker.internal:29338` (compose の `extra_hosts: ["host.docker.internal:host-gateway"]`)。
+- double puppeting: bridgev2 の `double_puppet.secrets` に `localhost: "as_token:<token>"` を入れ、user namespace `@.*:localhost` (exclusive: false) を持つ 2 つ目の registration (`testenv/.dev/doublepuppet.yaml`) を synapse に読ませる。方式は mautrix の double puppeting の文書どおり (確かめて使う)。
+- bridge の設定: database は SQLite (`testenv/.dev/bridge.db`)、`encryption.allow: false`、`bridge.permissions` は `"localhost": admin`、`backfill.enabled: true`、`bridge.mute_only_on_create: false`。log は console に debug。
+- `dev.sh` は bash、`set -euo pipefail`、依存は curl と jq と docker と go (go は bridge と `cfgedit` のビルド用)。token は `.dev/` の file に置き、表示しない (`traq-login` が表示する redirect URL は例外: bot に貼るためのもの)。double puppet の `as_token` は `cfgedit` に環境変数で渡し、引数に出さない。bridge の appservice listener は docker の synapse から届くよう `0.0.0.0:29338` で待ち受ける (理由は `docs/development.md`)。
+- `docs/development.md`: 上の subcommand を使った開発の流れ (up → setup → bridge → bot に login → 確認 → down)、単体・結合テストの実行、bridge の設定のどこを dev.sh が書き換えるか。開発環境と結合テストは同じ port 3080 の traQ を使うので、開発環境を立てている間は結合テストをその traQ に対して実行する (テストは毎回新しい user とチャンネルを作るので干渉しない)。
+
+- [ ] **Step 1: compose の profile と synapse の設定を書く** — `docker compose -p tmb -f testenv/compose.yaml --profile matrix up -d` で 4 service が起動し、`curl localhost:8008/_matrix/client/versions` が返る。profile 無しの `up` では synapse が起動しない。
+- [ ] **Step 2: `dev.sh` を書く** — `up`、`setup`、`bridge` (Task 1 の binary は login 無しでも起動し、bot が応答する) を通し、`bot help` に bot の help が返る (`tail` で見る)。`traq alice POST /channels/<id>/messages '{"content":"hi"}'` が traQ に投稿できる。
+- [ ] **Step 3: `docs/development.md` を書く**
+- [ ] **Step 4: 片付けを確かめる** — `down` の後に container と `testenv/.dev/` が残らない。
+- [ ] **Step 5: commit** — `git commit -m "chore(testenv): add a development homeserver and helper script"`
+
 ### Task 8: connector の ID、metadata、login (OAuth + PKCE)、logout
 
 **Files:**
@@ -1751,21 +1798,20 @@ func formatSearchHit(hit traq.Message, channelPath, userName string, link string
 - [ ] **Step 4: 通す** — `go test -race ./...` → PASS
 - [ ] **Step 5: commit** — `git commit -m "feat(connector): add a search command for traQ messages"`
 
-### Task 16: README (運用者向け)、開発用 homeserver、通しの確認
+### Task 16: README (運用者向け) と通しの確認
 
 **Files:**
 - Modify: `README.md` (日本語)
-- Create: `testenv/synapse/` (開発用 homeserver の設定。compose の profile `matrix` で起動)、`docs/development.md` (開発者向けの手順)
-- Modify: `testenv/compose.yaml` (profile `matrix` の synapse service。traQ だけの結合テストには影響させない)
+- Modify: `docs/development.md` (通しの確認の項目表を足す)
 
 決まり:
 
 - README: 概要、できること / できないこと (spec の「目的」「対象外」)、「動かし方」(spec の同名の節: traQ の OAuth client の作り方、appservice 方式 (`-e` → 設定 → `-g` → homeserver に登録 → 起動)、Beeper 方式 (`bbctl config --type bridgev2 -o config.yaml sh-<name>` → `network:` 節を足す → 起動)、double puppeting、encryption、`backfill.enabled: true` にしないと過去ログが入らないこと、購読レベル 1 の mute を後から反映するには `bridge.mute_only_on_create: false`)、login の手順 (bot に `login` → URL を開いて承認 → 開いた URL を貼る)、`search` の使い方、build (`nix build`、`go build`、`-tags goolm`)、license。
-- `docs/development.md`: testenv の起動 (`docker compose -p tmb -f testenv/compose.yaml --profile matrix up -d`)、traQ の管理者 (`traq`/`traq`) と OAuth client の作り方 (curl)、開発用 synapse の user 作成と bridge の登録、単体・結合テストの実行、通しの確認の項目表。
-- 開発用 synapse: image は実装時点の最新の安定版 tag に固定。server name `localhost`、registration は shared secret、appservice の registration file を mount。暗号化はしない (bridge の `encryption.allow: false`)。
+- `docs/development.md`: 通しの確認の項目表 (下の表と、各項目で使う `dev.sh` の操作) を足す。
+- 通しの確認は Task 7.5 の開発環境 (`testenv/dev.sh`) で行う。
 
-- [ ] **Step 1: 開発用 homeserver を作る** — compose の profile と synapse の設定を書き、`docker compose -p tmb -f testenv/compose.yaml --profile matrix up -d` で traQ と synapse が起動することを確かめる。
-- [ ] **Step 2: 通しの確認** — bridge を build して testenv の traQ と synapse に繋ぎ、Matrix の client-server API (curl、または Element web) で次を全部確かめ、結果を PR の本文に表で書く:
+- [ ] **Step 1: 開発環境を立てる** — `testenv/dev.sh up && testenv/dev.sh setup`
+- [ ] **Step 2: 通しの確認** — `testenv/dev.sh bridge` で bridge を起動し、`dev.sh` と traQ の REST (相手側の操作) で次を全部確かめ、結果を PR の本文に表で書く:
 
 | 項目 | 確かめ方 |
 |---|---|
@@ -1782,8 +1828,8 @@ func formatSearchHit(hit traq.Message, channelPath, userName string, link string
 | 検索 | `search in:#<path> <語>` が結果を返す |
 
 - [ ] **Step 3: README と `docs/development.md` を書く**
-- [ ] **Step 4: 片付ける** — `docker compose -p tmb -f testenv/compose.yaml --profile matrix down -v`
-- [ ] **Step 5: commit** — `git commit -m "docs: add the operator guide and development setup"`
+- [ ] **Step 4: 片付ける** — `testenv/dev.sh down`
+- [ ] **Step 5: commit** — `git commit -m "docs: add the operator guide"`
 
 ## Self-Review のメモ
 
