@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -71,7 +72,8 @@ func TestSyncStamps(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	store := newTestStampDB(t)
 	for _, s := range []stampconv.Stamp{{ID: "u1", Name: "thumbsup", Unicode: true, Emoji: "👍"}, {ID: "gone", Name: "old"}} {
 		if err := store.Put(ctx, s, "f-"+s.ID); err != nil {
@@ -255,7 +257,10 @@ func TestSyncStampsRetryBudget(t *testing.T) {
 				done, err := c.syncStamps(ctx)
 				res <- result{done, err}
 			}()
-			for later.count("f-bad") < 2 {
+			for deadline := time.Now().Add(5 * time.Second); later.count("f-bad") < 2; {
+				if time.Now().After(deadline) {
+					t.Fatalf("the failing stamp was retried %d times in the background, want 2", later.count("f-bad"))
+				}
 				select {
 				case r := <-res:
 					t.Fatalf("syncStamps = %v, %v before traQ recovered, want it to retry the failing stamp", r.done, r.err)
@@ -352,21 +357,26 @@ func TestReactionKeyRetriesAGivenUpStampLater(t *testing.T) {
 }
 
 // The completion log counts as resolved only the stamps that got an emoji: not those deleted while their
-// file meta was read, nor those that got another file meanwhile (whose meta failed, so they are retried).
+// file meta was read, nor those that got another file meanwhile (whose meta failed, so they are retried). A
+// stamp that stopped being a Unicode stamp meanwhile is not counted, and is not retried.
 func TestSyncStampsCompletionCounts(t *testing.T) {
 	var metas countingHandler
-	releaseDel, releaseMove := make(chan struct{}), make(chan struct{})
+	releaseDel, releaseMove, releaseFlip := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v3/stamps", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`[
 			{"id":"u1","name":"thumbsup","fileId":"f-u1","isUnicode":true},
 			{"id":"u2","name":"gone_file","fileId":"f-u2","isUnicode":true},
 			{"id":"u3","name":"deleted","fileId":"f-u3","isUnicode":true},
-			{"id":"u4","name":"moved","fileId":"f-u4","isUnicode":true}
+			{"id":"u4","name":"moved","fileId":"f-u4","isUnicode":true},
+			{"id":"u5","name":"flipped","fileId":"f-u5","isUnicode":true}
 		]`))
 	})
 	mux.HandleFunc("GET /api/v3/stamps/u4", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"id":"u4","name":"moved","fileId":"f-new","isUnicode":true}`))
+	})
+	mux.HandleFunc("GET /api/v3/stamps/u5", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"u5","name":"flipped","fileId":"f-custom","isUnicode":false}`))
 	})
 	mux.HandleFunc("GET /api/v3/files/{id}/meta", func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
@@ -380,6 +390,9 @@ func TestSyncStampsCompletionCounts(t *testing.T) {
 		case id == "f-u4":
 			<-releaseMove
 			_, _ = w.Write([]byte(`{"id":"f-u4","name":"1f601.svg"}`))
+		case id == "f-u5":
+			<-releaseFlip
+			_, _ = w.Write([]byte(`{"id":"f-u5","name":"1f602.svg"}`))
 		case id == "f-new" && metas.count(id) == 1: // the STAMP_UPDATED refresh
 			http.Error(w, `{"message":"boom"}`, http.StatusInternalServerError)
 		case id == "f-new":
@@ -392,10 +405,12 @@ func TestSyncStampsCompletionCounts(t *testing.T) {
 	c := newStampConnector(t)
 	c.stampSync.clients = []*TraQClient{{API: api}}
 	c.stampSync.retryMin = time.Millisecond
-	var logs bytes.Buffer
+	var logs syncBuffer
+	jobCtx, cancel := context.WithTimeout(zerolog.New(&logs).WithContext(context.Background()), 10*time.Second)
+	defer cancel()
 	res := make(chan error, 1)
 	go func() {
-		_, err := c.syncStamps(zerolog.New(&logs).WithContext(context.Background()))
+		_, err := c.syncStamps(jobCtx)
 		res <- err
 	}()
 	ctx := zerolog.Nop().WithContext(context.Background())
@@ -405,6 +420,9 @@ func TestSyncStampsCompletionCounts(t *testing.T) {
 	awaitRequest(t, &metas, "f-u4", releaseMove)
 	within(t, "STAMP_UPDATED", func() error { return c.refreshStamp(ctx, api, "u4") })
 	close(releaseMove)
+	awaitRequest(t, &metas, "f-u5", releaseFlip)
+	within(t, "STAMP_UPDATED to a custom stamp", func() error { return c.refreshStamp(ctx, api, "u5") })
+	close(releaseFlip)
 	if err := <-res; err != nil {
 		t.Fatalf("syncStamps: %v", err)
 	}
@@ -669,7 +687,9 @@ func TestReactionKeyStampDeletedMeanwhile(t *testing.T) {
 	}
 }
 
-// A STAMP_* refresh whose file meta fails still stores the stamp, pending, so it is resolved later.
+// A STAMP_* refresh whose file meta fails still stores the stamp, pending, so it is resolved later. Like a
+// stamp the job has given up on, it gets a retry time: the conversions do not ask traQ for it before then,
+// and meanwhile an emoji the table does not have may be its emoji, so it is not reported unknown.
 func TestRefreshStampFileMetaFailure(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v3/stamps/{id}", func(w http.ResponseWriter, _ *http.Request) {
@@ -693,6 +713,79 @@ func TestRefreshStampFileMetaFailure(t *testing.T) {
 	if !strings.Contains(logs.String(), "boom") {
 		t.Errorf("log = %q, want the FileMeta failure", logs.String())
 	}
+	if at, ok := c.Stamps.RetryAfter("u1"); !ok || !at.After(time.Now()) {
+		t.Errorf("RetryAfter(u1) = %v, %v; want a time to come", at, ok)
+	}
+	c.Stamps.SetComplete(true)
+	if _, err := c.Stamps.Resolve("❤"); !errors.Is(err, stampconv.ErrEmojiTableIncomplete) {
+		t.Errorf("Resolve(❤) = %v, want ErrEmojiTableIncomplete", err)
+	}
+}
+
+// resolveEmoji's resolution runs on singleflight's own goroutine, where a panic would stop the bridge. A panic
+// there is returned as an error, with the stack, and leaves the stamp pending.
+func TestResolveEmojiPanic(t *testing.T) {
+	c := newStampConnector(t, stampconv.Stamp{ID: "u1", Name: "thumbsup", Unicode: true})
+	// A nil client panics on its first request.
+	s, err := c.resolveEmoji(zerolog.Nop().WithContext(context.Background()), nil, "u1")
+	if err == nil || !strings.Contains(err.Error(), "panic") || !strings.Contains(err.Error(), "resolveEmoji") {
+		t.Errorf("err = %v, want the panic with its stack", err)
+	}
+	if s.ID != "u1" || !s.EmojiPending() {
+		t.Errorf("stamp = %+v, want u1 still pending", s)
+	}
+}
+
+// While traQ fails, each background retry round makes one request: it stops at its first failure instead of
+// asking for every stamp given up on. The next round starts after the stamp that failed, so one stamp that
+// keeps failing cannot keep the others from being retried.
+func TestSyncStampsRetryRoundStopsAtFirstFailure(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const outage = 4 // background requests that fail
+		var mu sync.Mutex
+		walk := map[string]int{}
+		var later []string
+		mux := http.NewServeMux()
+		mux.HandleFunc("GET /api/v3/stamps", func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`[{"id":"a","name":"a","fileId":"f-a","isUnicode":true},
+				{"id":"b","name":"b","fileId":"f-b","isUnicode":true},
+				{"id":"c","name":"c","fileId":"f-c","isUnicode":true}]`))
+		})
+		mux.HandleFunc("GET /api/v3/files/{id}/meta", func(w http.ResponseWriter, r *http.Request) {
+			id := r.PathValue("id")
+			mu.Lock()
+			defer mu.Unlock()
+			if walk[id] < stampResolveAttempts {
+				walk[id]++
+				http.Error(w, `{"message":"boom"}`, http.StatusInternalServerError)
+				return
+			}
+			later = append(later, id)
+			if len(later) <= outage {
+				http.Error(w, `{"message":"boom"}`, http.StatusInternalServerError)
+				return
+			}
+			_, _ = w.Write([]byte(`{"id":"` + id + `","name":"1f44d.svg"}`))
+		})
+		c := newStampConnector(t)
+		c.stampSync.clients = []*TraQClient{{API: newMemAPI(t, mux)}}
+		var logs syncBuffer
+		done, err := c.syncStamps(zerolog.New(&logs).WithContext(t.Context()))
+		if !done || err != nil {
+			t.Fatalf("syncStamps = %v, %v; want true, nil", done, err)
+		}
+		if want := []string{"f-a", "f-b", "f-c", "f-a"}; !slices.Equal(later[:outage], want) {
+			t.Errorf("background requests during the outage = %v, want %v (one per round, each round starting after the stamp that failed)", later[:outage], want)
+		}
+		if n := strings.Count(logs.String(), "Failed to resolve the emoji of Unicode stamps again"); n != outage {
+			t.Errorf("failed rounds = %d, want %d (one per failed request)", n, outage)
+		}
+		for _, id := range []string{"a", "b", "c"} {
+			if s, _ := c.Stamps.ByID(id); s.Emoji != "👍" {
+				t.Errorf("stamp %s = %+v, want it resolved after the outage", id, s)
+			}
+		}
+	})
 }
 
 // Once the bridge is stopping (BackgroundCtx is done), a login that connects does not start the job: Stop may
