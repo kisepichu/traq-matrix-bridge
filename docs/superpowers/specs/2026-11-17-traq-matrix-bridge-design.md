@@ -252,7 +252,7 @@ traQ の WebSocket は event ごとに届く相手が違う。
 ## 失敗時の扱い
 
 - REST / WebSocket の 401: `BAD_CREDENTIALS` にし、再 login を求める。
-- REST の 429 / 5xx: `Retry-After` か backoff で待ってやり直す。Matrix からの送信が失敗したら message status で返す。
+- REST の 429 / 502 / 504: `Retry-After` か backoff で待ってやり直す。ただし POST (投稿、スタンプ) は 429 のときだけやり直す (502 / 504 では traQ が保存済みのことがあり、二重投稿になる)。Matrix からの送信が失敗したら message status で返す。
 - WebSocket の切断: bridge state を `TRANSIENT_DISCONNECT` にし、繋ぎ直したら「受信」の再接続の手順で取りこぼしを拾う。
 - poller の失敗: log に残し、次の間隔でやり直す。
 - 未知の stamp、上限超え、未対応の msgtype: traQ には送らず、理由付きの message status を返す。

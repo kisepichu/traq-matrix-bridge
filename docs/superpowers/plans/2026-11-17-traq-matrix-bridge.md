@@ -669,7 +669,7 @@ var ErrStateMismatch, ErrNoCode error
 
 - JSON は `encoding/json` の既定 (未知の field は無視) で decode する。`DisallowUnknownFields` を使わない。
 - `Authorization: Bearer <token>`。401 はやり直さずに `*HTTPError` で返す (呼び出し側が再 login を求める)。
-- 429、502、504 は最大 3 回やり直す。待ち時間は `Retry-After` (秒) があればそれ、無ければ 1s → 2s → 4s。`ctx` が切れたら待たずに返す。503 はやり直さずに `*HTTPError` で返す (search の「検索が無効」を呼び出し側が判定するため)。
+- 429 はどの method でも、502 と 504 は GET / PUT / DELETE だけ、最大 3 回やり直す (POST は 502 / 504 の時点で traQ が保存済みのことがあり、やり直すと二重投稿になる)。待ち時間は `Retry-After` (秒、上限 60 秒) があればそれ、無ければ 1s → 2s → 4s。`ctx` が切れたら待たずに返す。503 はやり直さずに `*HTTPError` で返す (search の「検索が無効」を呼び出し側が判定するため)。
 - 2xx 以外は `*HTTPError{Status, Message}`。`Message` は body の JSON `{"message": "..."}` か、無ければ body の先頭 200 byte。
 - `ParseRedirect` は URL の query の `state` が `expectedState` と違えば `ErrStateMismatch`、`error` があれば `fmt.Errorf("authorization denied: %s", error)`、`code` が無ければ `ErrNoCode`。前後の空白は取り除く。
 - token の `expires_in` は秒。`ExpiresAt = now + expires_in`。
