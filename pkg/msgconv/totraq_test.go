@@ -10,16 +10,15 @@ import (
 	"maunium.net/go/mautrix/id"
 )
 
-type fakeTraQUsers map[id.UserID][2]string
+type fakeTraQUsers map[id.UserID]string
 
-func (f fakeTraQUsers) TraQUser(mxid id.UserID) (string, string, bool) {
-	v, ok := f[mxid]
-	return v[0], v[1], ok
+func (f fakeTraQUsers) TraQUserName(mxid id.UserID) (string, bool) {
+	name, ok := f[mxid]
+	return name, ok
 }
 
 var traqUsers = fakeTraQUsers{
-	"@traq_alice:example.org": {uAlice, "alice"},
-	"@traq_odd:example.org":   {uBob, `a"b\c`},
+	"@traq_alice:example.org": "alice",
 }
 var origin = &url.URL{Scheme: "https", Host: "q.example.jp"}
 
@@ -32,11 +31,8 @@ func TestToTraQ(t *testing.T) {
 		{"plain body", ToTraQInput{Body: "hello"}, "hello"},
 		{"html bold", ToTraQInput{Body: "x", Format: "org.matrix.custom.html", FormattedBody: "<strong>x</strong>"}, "**x**"},
 		{"ghost pill", ToTraQInput{Body: "alice: hi", Format: "org.matrix.custom.html",
-			FormattedBody: `<a href="https://matrix.to/#/@traq_alice:example.org">alice</a>: hi`},
-			`!{"type":"user","raw":"@alice","id":"` + uAlice + `"}: hi`},
-		{"ghost pill with a name that needs JSON escaping", ToTraQInput{Body: "x", Format: "org.matrix.custom.html",
-			FormattedBody: `<a href="https://matrix.to/#/@traq_odd:example.org">x</a>`},
-			`!{"type":"user","raw":"@a\"b\\c","id":"` + uBob + `"}`},
+			FormattedBody: `<a href="https://matrix.to/#/@traq_alice:example.org">Alice A.</a>: hi`},
+			"@alice: hi"},
 		{"unknown pill", ToTraQInput{Body: "bob", Format: "org.matrix.custom.html",
 			FormattedBody: `<a href="https://matrix.to/#/@bob:example.org">bob</a>`}, "bob"},
 		{"room pill becomes its URL", ToTraQInput{Body: "r", Format: "org.matrix.custom.html",
@@ -52,6 +48,25 @@ func TestToTraQ(t *testing.T) {
 		{"mx-reply stripped", ToTraQInput{Body: "yes", Format: "org.matrix.custom.html",
 			FormattedBody: "<mx-reply><blockquote>old</blockquote></mx-reply>yes", ReplyTo: m1},
 			"https://q.example.jp/messages/" + m1 + "\nyes"},
+		{"pill followed by a name character is separated", ToTraQInput{Body: "x", Format: "org.matrix.custom.html",
+			FormattedBody: `<a href="https://matrix.to/#/@traq_alice:example.org">Alice</a>san`}, "@alice san"},
+		{"pill followed by a hyphen is separated", ToTraQInput{Body: "x", Format: "org.matrix.custom.html",
+			FormattedBody: `<a href="https://matrix.to/#/@traq_alice:example.org">Alice</a>-x`}, "@alice -x"},
+		{"pill followed by an underscore is separated", ToTraQInput{Body: "x", Format: "org.matrix.custom.html",
+			FormattedBody: `<a href="https://matrix.to/#/@traq_alice:example.org">Alice</a>_1`}, "@alice _1"},
+		{"pill followed by a non-name character is kept", ToTraQInput{Body: "x", Format: "org.matrix.custom.html",
+			FormattedBody: `<a href="https://matrix.to/#/@traq_alice:example.org">Alice</a>さん`}, "@aliceさん"},
+		{"pill after a colon is separated", ToTraQInput{Body: "x", Format: "org.matrix.custom.html",
+			FormattedBody: `cc:<a href="https://matrix.to/#/@traq_alice:example.org">Alice</a>`}, "cc: @alice"},
+		{"pill after a colon and before a name character", ToTraQInput{Body: "x", Format: "org.matrix.custom.html",
+			FormattedBody: `cc:<a href="https://matrix.to/#/@traq_alice:example.org">Alice</a>san`}, "cc: @alice san"},
+		{"pill after a space is kept", ToTraQInput{Body: "x", Format: "org.matrix.custom.html",
+			FormattedBody: `cc: <a href="https://matrix.to/#/@traq_alice:example.org">Alice</a>`}, "cc: @alice"},
+		{"unknown pill followed by a name character is kept", ToTraQInput{Body: "x", Format: "org.matrix.custom.html",
+			FormattedBody: `<a href="https://matrix.to/#/@bob:example.org">bob</a>by`}, "bobby"},
+		{"private-use characters in the text are kept", ToTraQInput{Body: "x", Format: "org.matrix.custom.html",
+			FormattedBody: "\ue000&#xe001;<a href=\"https://matrix.to/#/@traq_alice:example.org\">A</a>x\ue000\ue001"},
+			"\ue000\ue001@alice x\ue000\ue001"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

@@ -104,6 +104,7 @@ func (c *TraQConnector) ValidateConfig() error {
 	return c.Config.Validate()
 }
 
+// GetBridgeInfoVersion: bump capabilities whenever roomFeatures changes, so bridgev2 resends them to every room.
 func (c *TraQConnector) GetBridgeInfoVersion() (info, capabilities int) {
-	return 1, 1
+	return 1, 2
 }

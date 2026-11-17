@@ -33,10 +33,18 @@ var fileHTTPClient = &http.Client{}
 // errFileTooLarge: the file is larger than the homeserver accepts, so it is linked instead.
 var errFileTooLarge = errors.New("the file is larger than the homeserver's upload limit")
 
-// textPartID is the part ID of the text part; file parts are "file:<fileID>".
-const textPartID networkid.PartID = ""
+// textPartID is the part ID of the text part; file parts are filePartPrefix + the file ID.
+const (
+	textPartID     networkid.PartID = ""
+	filePartPrefix                  = "file:"
+)
 
-func filePartID(fileID string) networkid.PartID { return networkid.PartID("file:" + fileID) }
+func filePartID(fileID string) networkid.PartID { return networkid.PartID(filePartPrefix + fileID) }
+
+// fileIDOfPart returns the file ID of a file part.
+func fileIDOfPart(partID networkid.PartID) (string, bool) {
+	return strings.CutPrefix(string(partID), filePartPrefix)
+}
 
 func fileURL(origin, fileID string) string { return origin + "/files/" + fileID }
 
