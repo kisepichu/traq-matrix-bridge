@@ -26,6 +26,8 @@ func TestParseSearchQuery(t *testing.T) {
 		{"quotes", `"hello world" in:"a/b c"`, parsedQuery{Words: `"hello world"`, In: "a/b c"}},
 		{"quoted from", `from:"@x y" z`, parsedQuery{Words: "z", From: []string{"x y"}}},
 		{"quoted hash inside the value", `in:"#a b"`, parsedQuery{In: "a b"}},
+		{"hash before the quotes", `in:#"a b"`, parsedQuery{In: "a b"}},
+		{"at before the quotes", `from:@"x y"`, parsedQuery{From: []string{"x y"}}},
 		{"filter between words", "foo in:#a bar", parsedQuery{Words: "foo bar", In: "a"}},
 		{"empty filter value is a word", "in: from:@ foo", parsedQuery{Words: "in: from:@ foo"}},
 		{"unterminated quote", `"foo bar in:a`, parsedQuery{Words: `"foo bar in:a`}},
@@ -67,6 +69,11 @@ func TestFormatSearchHit(t *testing.T) {
 			"#gps  @bob  2026-01-02 15:04  " + strings.Repeat("\\*", 80) + "  " + link},
 		{"names are escaped", hit("x"), "a_b/c_d", "#a\\_b/c\\_d  @bob  2026-01-02 15:04  x  " + link},
 		{"DM has no path", hit("x"), "", "DM  @bob  2026-01-02 15:04  x  " + link},
+		{"embeds show as their text", hit(`hi !{"type":"user","raw":"@alice","id":"u1"} in !{"type":"channel","raw":"#gps/x","id":"c1"}`), "gps",
+			"#gps  @bob  2026-01-02 15:04  hi @alice in #gps/x  " + link},
+		{"embed text counts toward the limit", hit(`!{"type":"user","raw":"@alice","id":"u1"}` + strings.Repeat("x", 80)), "gps",
+			"#gps  @bob  2026-01-02 15:04  @alice" + strings.Repeat("x", 74) + "…  " + link},
+		{"broken embed stays", hit(`!{"type":"user",`), "gps", "#gps  @bob  2026-01-02 15:04  !{\"type\":\"user\",  " + link},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -74,6 +81,15 @@ func TestFormatSearchHit(t *testing.T) {
 				t.Errorf("formatSearchHit =\n%q\nwant\n%q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestFormatSearchHitEscapesTheLink(t *testing.T) {
+	at := time.Date(2026, 1, 2, 6, 4, 5, 0, time.UTC)
+	got := formatSearchHit(traq.Message{CreatedAt: at, Content: "x"}, "g", "u", "https://matrix.to/#/!r:example.org/$ev_id_1?via=example.org", time.UTC)
+	want := "  https://matrix.to/#/!r:example.org/$ev\\_id\\_1?via=example.org"
+	if !strings.HasSuffix(got, want) {
+		t.Errorf("got %q, want suffix %q", got, want)
 	}
 }
 

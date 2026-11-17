@@ -3,6 +3,7 @@ package msgconv
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 
 	"github.com/yuin/goldmark/ast"
 	"github.com/yuin/goldmark/parser"
@@ -14,6 +15,30 @@ type Embed struct {
 	Type string `json:"type"` // "user", "group", "channel", "file", "message"
 	Raw  string `json:"raw"`
 	ID   string `json:"id"`
+}
+
+// PlainEmbeds replaces each valid traQ embed in content with its raw text ("@name", "#channel", ...). An
+// invalid embed stays as it is. It does not know about code spans: it is for one-line excerpts, not for
+// converting messages.
+func PlainEmbeds(content string) string {
+	var b strings.Builder
+	for {
+		i := strings.Index(content, "!{")
+		if i < 0 {
+			break
+		}
+		e, n, ok := parseEmbed([]byte(content[i:]))
+		if !ok {
+			b.WriteString(content[:i+2])
+			content = content[i+2:]
+			continue
+		}
+		b.WriteString(content[:i])
+		b.WriteString(e.Raw)
+		content = content[i+n:]
+	}
+	b.WriteString(content)
+	return b.String()
 }
 
 // parseEmbed parses an embed at the start of line, which must begin with `!{`.

@@ -8,6 +8,7 @@ import (
 
 	"maunium.net/go/mautrix/format"
 
+	"github.com/kisepichu/traq-matrix-bridge/pkg/msgconv"
 	"github.com/kisepichu/traq-matrix-bridge/pkg/traq"
 )
 
@@ -74,6 +75,7 @@ func filterValue(tok, prefix string, sigil byte) (string, bool) {
 	if !ok {
 		return "", false
 	}
+	v = strings.TrimPrefix(v, string(sigil))
 	v = strings.TrimSuffix(strings.TrimPrefix(v, `"`), `"`)
 	v = strings.TrimPrefix(v, string(sigil))
 	return v, v != ""
@@ -98,13 +100,14 @@ func formatSearchHit(hit traq.Message, channelPath, userName string, link string
 	b.WriteString("  ")
 	b.WriteString(format.EscapeMarkdown(excerpt(hit.Content)))
 	b.WriteString("  ")
-	b.WriteString(link)
+	b.WriteString(format.EscapeMarkdown(link))
 	return b.String()
 }
 
-// excerpt is the first excerptRunes code points of content on one line, with … if it was cut.
+// excerpt is the first excerptRunes code points of content on one line, with … if it was cut. traQ embeds
+// show as their text.
 func excerpt(content string) string {
-	content = strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(content)
+	content = strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(msgconv.PlainEmbeds(content))
 	if utf8.RuneCountInString(content) <= excerptRunes {
 		return content
 	}
