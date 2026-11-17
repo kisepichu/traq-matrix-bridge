@@ -658,7 +658,7 @@ type Token struct {
 	ExpiresAt   time.Time // zero if the server did not send expires_in
 }
 func NewPKCE() (PKCE, error)                                          // 32 random bytes each, base64url without padding; Challenge = base64url(sha256(Verifier))
-func (c OAuthConfig) AuthorizeURL(p PKCE) string                      // <origin>/api/v3/oauth2/authorize?response_type=code&client_id&redirect_uri&scope=read write&state&code_challenge&code_challenge_method=S256
+func (c OAuthConfig) AuthorizeURL(p PKCE) (string, error)             // <origin>/api/v3/oauth2/authorize?response_type=code&client_id&redirect_uri&scope=read write&state&code_challenge&code_challenge_method=S256; error if ServerURL is not an absolute http(s) URL; origin parsed by the same code as NewClient
 func ParseRedirect(redirected, expectedState string) (code string, err error)
 func (c OAuthConfig) Exchange(ctx context.Context, code, verifier string) (Token, error)       // POST /oauth2/token, form: grant_type=authorization_code, code, redirect_uri, client_id, code_verifier
 func (c OAuthConfig) Revoke(ctx context.Context, token string) error                           // POST /oauth2/revoke, form: token
@@ -851,7 +851,11 @@ func TestPKCEChallengeIsS256OfVerifier(t *testing.T) {
 
 func TestAuthorizeURL(t *testing.T) {
 	cfg := OAuthConfig{ServerURL: "https://q.example.jp", ClientID: "cid", RedirectURI: "http://localhost:29399/callback"}
-	u, err := url.Parse(cfg.AuthorizeURL(PKCE{Verifier: "v", Challenge: "ch", State: "st"}))
+	authURL, err := cfg.AuthorizeURL(PKCE{Verifier: "v", Challenge: "ch", State: "st"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := url.Parse(authURL)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -18,6 +18,8 @@ import (
 	"time"
 )
 
+const mimeJSON = "application/json"
+
 const (
 	apiPath         = "/api/v3"
 	maxRetries      = 3
@@ -117,14 +119,33 @@ func newHTTPError(resp *http.Response) *HTTPError {
 	return &HTTPError{Status: resp.StatusCode, Message: msg}
 }
 
-func isRetryable(status int) bool {
-	return status == http.StatusTooManyRequests || status == http.StatusBadGateway || status == http.StatusGatewayTimeout
+// isRetryable reports whether a response with status to a method request may be sent again. 429 means the
+// server did not process the request, so it is retried for every method. 502 and 504 can come from a
+// proxy after traQ already handled the request, so they are retried only for idempotent methods: retrying
+// a POST (PostMessage, AddStamp) could duplicate it.
+func isRetryable(method string, status int) bool {
+	switch status {
+	case http.StatusTooManyRequests:
+		return true
+	case http.StatusBadGateway, http.StatusGatewayTimeout:
+		return method == http.MethodGet || method == http.MethodPut || method == http.MethodDelete
+	}
+	return false
 }
 
-// retryDelay returns the Retry-After seconds if present and valid, else 1s, 2s, 4s for attempts 0, 1, 2.
+// maxRetryAfter caps a server-supplied Retry-After.
+const maxRetryAfter = 60
+
+// retryDelay returns the Retry-After seconds (clamped to maxRetryAfter) if present and valid, else
+// 1s, 2s, 4s for attempts 0, 1, 2. The value is clamped before it is multiplied into a Duration, so a huge
+// value cannot overflow.
 func retryDelay(resp *http.Response, attempt int) time.Duration {
 	if s := strings.TrimSpace(resp.Header.Get("Retry-After")); s != "" {
-		if secs, err := strconv.Atoi(s); err == nil && secs >= 0 {
+		secs, err := strconv.ParseUint(s, 10, 64)
+		if err == nil || errors.Is(err, strconv.ErrRange) {
+			if err != nil || secs > maxRetryAfter {
+				secs = maxRetryAfter
+			}
 			return time.Duration(secs) * time.Second
 		}
 	}
@@ -147,9 +168,10 @@ func sleep(ctx context.Context, d time.Duration) error {
 }
 
 // do sends a request and returns the 2xx response; the caller closes its body. Non-2xx responses become
-// *HTTPError. 429, 502 and 504 are retried up to maxRetries times; 401 and 503 are not retried.
-// body, if non-nil, is sent as JSON.
-func (c *Client) do(ctx context.Context, method, path string, query url.Values, body any) (*http.Response, error) {
+// *HTTPError. 429 is retried for every method and 502/504 for GET, PUT and DELETE (see isRetryable), up
+// to maxRetries times; 401 and 503 are not retried. body, if non-nil, is sent as JSON. accept, if
+// non-empty, is sent as the Accept header; binary endpoints pass "".
+func (c *Client) do(ctx context.Context, method, path string, query url.Values, body any, accept string) (*http.Response, error) {
 	var payload []byte
 	if body != nil {
 		var err error
@@ -171,7 +193,9 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 			return nil, err
 		}
 		req.Header.Set("Authorization", "Bearer "+c.token)
-		req.Header.Set("Accept", "application/json")
+		if accept != "" {
+			req.Header.Set("Accept", accept)
+		}
 		if payload != nil {
 			req.Header.Set("Content-Type", "application/json")
 		}
@@ -185,7 +209,7 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			return resp, nil
 		}
-		if !isRetryable(resp.StatusCode) || attempt >= maxRetries {
+		if !isRetryable(method, resp.StatusCode) || attempt >= maxRetries {
 			herr := newHTTPError(resp)
 			resp.Body.Close()
 			return nil, herr
@@ -201,7 +225,7 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 
 // doJSON sends a request and decodes the JSON response into out (skipped if out is nil).
 func (c *Client) doJSON(ctx context.Context, method, path string, query url.Values, body, out any) error {
-	resp, err := c.do(ctx, method, path, query, body)
+	resp, err := c.do(ctx, method, path, query, body, mimeJSON)
 	if err != nil {
 		return err
 	}

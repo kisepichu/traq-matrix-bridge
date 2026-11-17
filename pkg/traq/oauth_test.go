@@ -29,7 +29,11 @@ func TestPKCEChallengeIsS256OfVerifier(t *testing.T) {
 
 func TestAuthorizeURL(t *testing.T) {
 	cfg := OAuthConfig{ServerURL: "https://q.example.jp", ClientID: "cid", RedirectURI: "http://localhost:29399/callback"}
-	u, err := url.Parse(cfg.AuthorizeURL(PKCE{Verifier: "v", Challenge: "ch", State: "st"}))
+	got, err := cfg.AuthorizeURL(PKCE{Verifier: "v", Challenge: "ch", State: "st"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := url.Parse(got)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,9 +48,35 @@ func TestAuthorizeURL(t *testing.T) {
 
 func TestAuthorizeURLTrailingSlash(t *testing.T) {
 	cfg := OAuthConfig{ServerURL: "https://q.example.jp/", ClientID: "cid", RedirectURI: "http://localhost/cb"}
-	got := cfg.AuthorizeURL(PKCE{})
+	got, err := cfg.AuthorizeURL(PKCE{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !strings.HasPrefix(got, "https://q.example.jp/api/v3/oauth2/authorize?") {
 		t.Errorf("authorize URL = %s", got)
+	}
+}
+
+// OAuthConfig and Client must agree on the origin, including when ServerURL carries a query or fragment.
+func TestAuthorizeURLUsesClientOrigin(t *testing.T) {
+	for _, server := range []string{"https://q.example.jp/?x=1#f", "https://q.example.jp//", " https://q.example.jp "} {
+		c, err := NewClient(server, nil, "tok", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := OAuthConfig{ServerURL: server}.AuthorizeURL(PKCE{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := c.apiBase + "/oauth2/authorize?"; !strings.HasPrefix(got, want) {
+			t.Errorf("ServerURL %q: authorize URL = %s, want prefix %s", server, got, want)
+		}
+	}
+}
+
+func TestAuthorizeURLRejectsBadServerURL(t *testing.T) {
+	if _, err := (OAuthConfig{ServerURL: "q.example.jp"}).AuthorizeURL(PKCE{}); err == nil {
+		t.Error("want an error for a ServerURL without scheme")
 	}
 }
 

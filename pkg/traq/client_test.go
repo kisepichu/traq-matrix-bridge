@@ -249,3 +249,133 @@ func TestDownloadFileStreamsBody(t *testing.T) {
 		t.Errorf("body = %q", buf[:n])
 	}
 }
+
+func TestRetryPolicyByMethod(t *testing.T) {
+	const okMessage = `{"id":"m2","userId":"u1","channelId":"c1","content":"hi","createdAt":"2026-01-02T03:04:05Z","updatedAt":"2026-01-02T03:04:05Z","stamps":[]}`
+	tests := []struct {
+		name      string
+		first     int // status of the first response; later responses are success
+		call      func(c *Client) error
+		wantCalls int32
+		wantErr   int // expected HTTPError status, 0 for success
+	}{
+		{"POST 502 is not retried", http.StatusBadGateway, func(c *Client) error {
+			_, err := c.PostMessage(context.Background(), "c1", "hi")
+			return err
+		}, 1, http.StatusBadGateway},
+		{"POST 504 is not retried", http.StatusGatewayTimeout, func(c *Client) error {
+			return c.AddStamp(context.Background(), "m1", "s1")
+		}, 1, http.StatusGatewayTimeout},
+		{"GET 502 is retried", http.StatusBadGateway, func(c *Client) error {
+			_, err := c.Stamps(context.Background())
+			return err
+		}, 2, 0},
+		{"DELETE 504 is retried", http.StatusGatewayTimeout, func(c *Client) error {
+			return c.DeleteMessage(context.Background(), "m1")
+		}, 2, 0},
+		{"POST 429 is retried", http.StatusTooManyRequests, func(c *Client) error {
+			_, err := c.PostMessage(context.Background(), "c1", "hi")
+			return err
+		}, 2, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if calls.Add(1) == 1 {
+					w.Header().Set("Retry-After", "0")
+					w.WriteHeader(tt.first)
+					return
+				}
+				if r.Method == http.MethodPost {
+					w.WriteHeader(http.StatusCreated)
+				}
+				if r.URL.Path == "/api/v3/stamps" {
+					_, _ = w.Write([]byte(`[]`))
+					return
+				}
+				_, _ = w.Write([]byte(okMessage))
+			}))
+			defer srv.Close()
+			c, _ := NewClient(srv.URL, srv.Client(), "t", "test")
+			err := tt.call(c)
+			if calls.Load() != tt.wantCalls {
+				t.Errorf("calls = %d, want %d", calls.Load(), tt.wantCalls)
+			}
+			if tt.wantErr == 0 && err != nil {
+				t.Errorf("err = %v", err)
+			}
+			var he *HTTPError
+			if tt.wantErr != 0 && (!errors.As(err, &he) || he.Status != tt.wantErr) {
+				t.Errorf("err = %v, want HTTPError %d", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestHugeRetryAfterIsClamped(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Retry-After", "99999999999")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+	c, _ := NewClient(srv.URL, srv.Client(), "t", "test")
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := c.Stamps(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("err = %v, want context deadline exceeded", err)
+	}
+	if calls.Load() != 1 {
+		t.Errorf("calls = %d, want 1 (a huge Retry-After must wait, not retry at once)", calls.Load())
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Errorf("call blocked for %v", time.Since(start))
+	}
+}
+
+func TestRetryDelayClamp(t *testing.T) {
+	for _, tt := range []struct {
+		header string
+		want   time.Duration
+	}{
+		{"5", 5 * time.Second},
+		{"60", 60 * time.Second},
+		{"61", 60 * time.Second},
+		{"99999999999", 60 * time.Second},
+		{"99999999999999999999999999", 60 * time.Second},
+		{"-1", 2 * time.Second},
+		{"soon", 2 * time.Second},
+		{"", 2 * time.Second},
+	} {
+		resp := &http.Response{Header: http.Header{}}
+		if tt.header != "" {
+			resp.Header.Set("Retry-After", tt.header)
+		}
+		if got := retryDelay(resp, 1); got != tt.want {
+			t.Errorf("Retry-After %q: delay = %v, want %v", tt.header, got, tt.want)
+		}
+	}
+}
+
+func TestDownloadFileDoesNotRequestJSON(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Accept"); strings.Contains(got, "application/json") {
+			t.Errorf("Accept = %q on a binary endpoint", got)
+		}
+		_, _ = w.Write([]byte("bytes"))
+	}))
+	defer srv.Close()
+	c, _ := NewClient(srv.URL, srv.Client(), "t", "test")
+	body, err := c.DownloadFile(context.Background(), "f1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body.Close()
+	if _, _, err := c.PublicIcon(context.Background(), "kise"); err != nil {
+		t.Fatal(err)
+	}
+}

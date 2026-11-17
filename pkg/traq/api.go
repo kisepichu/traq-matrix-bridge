@@ -97,7 +97,7 @@ func (c *Client) Messages(ctx context.Context, channelID string, q MessagesQuery
 		query.Set("order", q.Order)
 	}
 	path := "/channels/" + esc(channelID) + "/messages"
-	resp, err := c.do(ctx, http.MethodGet, path, query, nil)
+	resp, err := c.do(ctx, http.MethodGet, path, query, nil, mimeJSON)
 	if err != nil {
 		return nil, false, err
 	}
@@ -180,7 +180,7 @@ func (c *Client) FileMeta(ctx context.Context, fileID string) (*FileInfo, error)
 
 // DownloadFile: GET /files/{fileId}. The body is streamed; the caller closes it.
 func (c *Client) DownloadFile(ctx context.Context, fileID string) (io.ReadCloser, error) {
-	resp, err := c.do(ctx, http.MethodGet, "/files/"+esc(fileID), nil, nil)
+	resp, err := c.do(ctx, http.MethodGet, "/files/"+esc(fileID), nil, nil, "")
 	if err != nil {
 		return nil, err
 	}
@@ -189,7 +189,7 @@ func (c *Client) DownloadFile(ctx context.Context, fileID string) (io.ReadCloser
 
 // PublicIcon: GET /public/icon/{username}. mime is the response Content-Type.
 func (c *Client) PublicIcon(ctx context.Context, username string) (data []byte, mime string, err error) {
-	resp, err := c.do(ctx, http.MethodGet, "/public/icon/"+esc(username), nil, nil)
+	resp, err := c.do(ctx, http.MethodGet, "/public/icon/"+esc(username), nil, nil, "")
 	if err != nil {
 		return nil, "", err
 	}

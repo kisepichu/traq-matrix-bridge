@@ -65,8 +65,13 @@ func randomString(n int) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
-func (c OAuthConfig) endpoint(path string) string {
-	return strings.TrimRight(strings.TrimSpace(c.ServerURL), "/") + apiPath + path
+// endpoint returns <origin>/api/v3<path>, parsing ServerURL exactly as NewClient does.
+func (c OAuthConfig) endpoint(path string) (string, error) {
+	origin, err := parseOrigin(c.ServerURL)
+	if err != nil {
+		return "", err
+	}
+	return origin.String() + apiPath + path, nil
 }
 
 func (c OAuthConfig) httpClient() *http.Client {
@@ -76,8 +81,9 @@ func (c OAuthConfig) httpClient() *http.Client {
 	return http.DefaultClient
 }
 
-// AuthorizeURL returns the URL the user opens in a browser to approve the bridge.
-func (c OAuthConfig) AuthorizeURL(p PKCE) string {
+// AuthorizeURL returns the URL the user opens in a browser to approve the bridge. It fails if ServerURL is
+// not an absolute http(s) URL.
+func (c OAuthConfig) AuthorizeURL(p PKCE) (string, error) {
 	q := url.Values{
 		"response_type":         {"code"},
 		"client_id":             {c.ClientID},
@@ -87,7 +93,11 @@ func (c OAuthConfig) AuthorizeURL(p PKCE) string {
 		"code_challenge":        {p.Challenge},
 		"code_challenge_method": {"S256"},
 	}
-	return c.endpoint("/oauth2/authorize") + "?" + q.Encode()
+	base, err := c.endpoint("/oauth2/authorize")
+	if err != nil {
+		return "", err
+	}
+	return base + "?" + q.Encode(), nil
 }
 
 // ParseRedirect extracts the authorization code from the URL the browser was redirected to.
@@ -153,12 +163,16 @@ func (c OAuthConfig) Revoke(ctx context.Context, token string) error {
 
 // postForm POSTs a form and returns the 2xx response; the caller closes its body.
 func (c OAuthConfig) postForm(ctx context.Context, path string, form url.Values) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint(path), strings.NewReader(form.Encode()))
+	target, err := c.endpoint(path)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept", mimeJSON)
 	resp, err := c.httpClient().Do(req)
 	if err != nil {
 		return nil, err
