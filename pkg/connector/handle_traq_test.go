@@ -103,8 +103,9 @@ func TestChannelEventsCoalesceSyncs(t *testing.T) {
 	}
 	c := &TraQClient{
 		Main: &TraQConnector{
-			Config: NetworkConfig{SubscriptionSyncInterval: time.Hour},
-			Stamps: stampconv.NewTable([]stampconv.Stamp{{ID: "s1", Name: "good"}}, false),
+			Config:  NetworkConfig{SubscriptionSyncInterval: time.Hour},
+			Stamps:  stampconv.NewTable([]stampconv.Stamp{{ID: "s1", Name: "good"}}, false),
+			stampDB: newTestStampDB(t),
 		},
 		Login: &bridgev2.UserLogin{UserLogin: &database.UserLogin{}, Log: zerolog.Nop()},
 		API:   api,

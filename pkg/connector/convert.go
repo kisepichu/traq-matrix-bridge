@@ -404,13 +404,11 @@ func (c *TraQClient) reactionKey(ctx context.Context, stampID string) (string, e
 	if err != nil {
 		return "", fmt.Errorf("get stamp %s: %w", stampID, err)
 	}
-	s := stampFromTraQ(st)
-	c.Main.Stamps.Put(s)
-	return stampconv.ReactionKey(s), nil
+	return stampconv.ReactionKey(c.Main.tableStamp(stampFromTraQ(st))), nil
 }
 
-// stampFromTraQ converts a traQ stamp for the table. Emoji stays empty: Unicode stamps are resolved to their
-// emoji elsewhere, and until then their reaction key is ":name:".
+// stampFromTraQ converts a traQ stamp for the table. Emoji stays empty: the stamp sync job (stamps.go) resolves
+// the emoji of Unicode stamps, and until then their reaction key is ":name:".
 func stampFromTraQ(s *traq.Stamp) stampconv.Stamp {
 	return stampconv.Stamp{ID: s.ID, Name: s.Name, Unicode: s.IsUnicode}
 }

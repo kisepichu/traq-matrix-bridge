@@ -5,7 +5,14 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 DEV=$ROOT/testenv/.dev
-COMPOSE=(docker compose -p tmb -f "$ROOT/testenv/compose.yaml" --profile matrix)
+COMPOSE=(docker compose -p tmb -f "$ROOT/testenv/compose.yaml")
+# TRAQ_INIT_EMOJIS=1: traQ installs the Unicode stamps when it initializes its database (see compose.emojis.yaml).
+TRAQ_WAIT=180
+if [[ ${TRAQ_INIT_EMOJIS:-} == 1 ]]; then
+  COMPOSE+=(-f "$ROOT/testenv/compose.emojis.yaml")
+  TRAQ_WAIT=1800
+fi
+COMPOSE+=(--profile matrix)
 
 MATRIX=http://localhost:8008
 TRAQ=http://localhost:3080
@@ -50,17 +57,17 @@ urlencode() { jq -rn --arg s "$1" '$s | @uri'; }
 
 random_hex() { od -An -N"$1" -tx1 /dev/urandom | tr -d ' \n'; }
 
-# wait_for <what> <url>: poll until the URL answers 2xx.
+# wait_for <what> <url> [seconds]: poll until the URL answers 2xx, for at most seconds (default 180).
 wait_for() {
-  local what=$1 url=$2 i
-  for ((i = 0; i < 180; i++)); do
+  local what=$1 url=$2 limit=${3:-180} i
+  for ((i = 0; i < limit; i++)); do
     if curl -fs -o /dev/null "$url"; then
       echo "$what is ready"
       return 0
     fi
     sleep 1
   done
-  die "$what did not become ready at $url within 180s"
+  die "$what did not become ready at $url within ${limit}s"
 }
 
 # mx <METHOD> <path> [json]: Matrix client API as @dev. The token stays in a header file so it never appears in argv.
@@ -165,7 +172,7 @@ cmd_up() {
   build_tools
   [[ -f $DEV/registration.yaml ]] || generate_bridge_files
   "${COMPOSE[@]}" up -d
-  wait_for traQ "$TRAQ/api/v3/version"
+  wait_for traQ "$TRAQ/api/v3/version" "$TRAQ_WAIT"
   wait_for Synapse "$MATRIX/_matrix/client/versions"
 }
 

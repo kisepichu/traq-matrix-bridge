@@ -62,9 +62,23 @@ testenv/dev.sh read '<room ID>' "$ev"                      # 既読 (m.read rece
 testenv/dev.sh send-raw '<room ID>' '{"msgtype":"m.text","body":"hi bob","format":"org.matrix.custom.html","formatted_body":"hi <a href=\"https://matrix.to/#/@traq_<bob の ID>:localhost\">bob</a>"}'
 ```
 
-(*) key は traQ に作った custom stamp の `:stamp名:` を使う。`👍` のような Unicode 絵文字の key は絵文字と stamp の対応表ができてから (Task 14) 通る。それまでは「the emoji to stamp table is still being built」の notice で拒否される。
+(*) key は traQ の stamp の `:stamp名:` か、Unicode stamp の絵文字 (`👍` など)。絵文字の key は、bridge が Unicode stamp の絵文字を解決し終えるまで (下の「Unicode stamp」) 「the emoji to stamp table is still being built」の notice で拒否される。標準の開発環境には Unicode stamp が無いので、絵文字の key は「unknown stamp」になる。
 
 `traq <user> <METHOD> <path> [json]` は毎回 traQ に login し直した session で `/api/v3<path>` を叩き、response body を表示する。user のパスワードは `admin` (user 名 `traq`) が `traq`、それ以外は `<user>-password` (`alice` なら `alice-password`)。
+
+### Unicode stamp
+
+`compose.yaml` の traQ は `--skip-init-emojis` で起動するので、Unicode stamp (twemoji の絵文字) が無い。Unicode stamp を使うときは、環境変数 `TRAQ_INIT_EMOJIS=1` を付けて新しく立てる。
+
+```sh
+testenv/dev.sh down                        # 既に立てている時だけ。traQ が絵文字を入れるのは DB を初期化する時だけ
+TRAQ_INIT_EMOJIS=1 testenv/dev.sh up       # traQ は twemoji を GitHub から取得して約 1700 個の stamp を作り終えてから応答する (回線次第で数十秒から数分)
+testenv/dev.sh setup
+```
+
+`TRAQ_INIT_EMOJIS=1` は `testenv/compose.emojis.yaml` を重ねて traQ を `--skip-init-emojis` 無しで起動し、traQ が応答するまで最大 30 分待つ。絵文字の取得に失敗しても traQ はそのまま起動するので、stamp が少ない時は `docker compose -p tmb logs traq` で `failed to install unicode emojis` を確かめる。結合テストと CI は `compose.yaml` だけを使うので影響しない。
+
+bridge は最初に CONNECTED になった login の API で stamp の一覧を DB (`traq_stamp`) に取り込み、Unicode stamp の file 名 (`1f44d.svg` など) から絵文字を 100ms に 1 件ずつ解決する (約 1700 個で 3 分ほど)。進み具合は 500 件ごとに、終わると `The stamp table is complete` が log に出る。解決した表は DB に残るので、再起動後は解決し直さない。
 
 ### 片付け
 
@@ -76,7 +90,7 @@ testenv/dev.sh down        # container と volume を消し、testenv/.dev/ も�
 
 | subcommand | 内容 |
 | --- | --- |
-| `up` | bridge の binary と `cfgedit` をビルドし、設定と registration が無ければ作り、`docker compose -p tmb --profile matrix up -d` で traQ と Synapse を起動して、両方が応答するまで待つ |
+| `up` | bridge の binary と `cfgedit` をビルドし、設定と registration が無ければ作り、`docker compose -p tmb --profile matrix up -d` で traQ と Synapse を起動して、両方が応答するまで待つ。`TRAQ_INIT_EMOJIS=1` を付けると traQ に Unicode stamp を入れる (上の「Unicode stamp」) |
 | `down` | `docker compose ... down -v` と `testenv/.dev/` の削除 |
 | `setup` | traQ: admin (`traq`/`traq`) の OAuth client (public、scope read/write、callback `http://localhost:29399/callback`) と user `alice` / `bob`。Synapse: `@dev:localhost` (パスワード `dev-password`) を `register_new_matrix_user` で作り、access token を保存。client ID を bridge の設定に書く。何度実行しても壊れない |
 | `bridge` | `go build -tags goolm` して `testenv/.dev/config.yaml` で前景起動 |
