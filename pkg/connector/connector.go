@@ -37,6 +37,7 @@ var (
 
 func (c *TraQConnector) Init(br *bridgev2.Bridge) {
 	c.Bridge = br
+	c.registerCommands()
 }
 
 // Start upgrades the connector's tables (bridgev2 has upgraded its own just before) and loads the stamp table.
