@@ -13,6 +13,17 @@
         "aarch64-darwin"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
+      # self.lastModifiedDate is YYYYMMDDhhmmss in UTC; main.BuildTime has to be RFC 3339 to be parsed.
+      # It comes from the commit, so the build stays reproducible.
+      buildTime =
+        let
+          d = self.lastModifiedDate or null;
+          part = start: len: builtins.substring start len d;
+        in
+        if d == null then
+          "unknown"
+        else
+          "${part 0 4}-${part 4 2}-${part 6 2}T${part 8 2}:${part 10 2}:${part 12 2}Z";
       # olm is marked insecure in nixpkgs. It is only used for end-to-bridge encryption.
       pkgsFor =
         system:
@@ -40,7 +51,7 @@
               "-w"
               "-X main.Tag=v${version}"
               "-X main.Commit=${self.shortRev or self.dirtyShortRev or "unknown"}"
-              "-X main.BuildTime=${self.lastModifiedDate or "unknown"}"
+              "-X main.BuildTime=${buildTime}"
             ];
             meta = {
               description = "A Matrix bridge for traQ";

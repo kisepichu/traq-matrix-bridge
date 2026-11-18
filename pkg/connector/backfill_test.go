@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/bridgeconfig"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 
@@ -342,5 +343,34 @@ func TestAssembleBackfill(t *testing.T) {
 				t.Errorf("MarkRead = %v, Forward = %v, unread calls = %d, err = %v", resp.MarkRead, resp.Forward, calls, err)
 			}
 		})
+	}
+}
+
+func TestBackfillMaxBatches(t *testing.T) {
+	q := bridgeconfig.BackfillQueueConfig{
+		MaxBatches:         0,
+		MaxBatchesOverride: map[string]int{"channel": 10, "dm": -1, "group_dm": -1},
+	}
+	if got := backfillMaxBatches(&q, true); got != -1 {
+		t.Errorf("DM = %d, want -1 (unlimited)", got)
+	}
+	if got := backfillMaxBatches(&q, false); got != 10 {
+		t.Errorf("channel = %d, want 10", got)
+	}
+
+	onlyDM := bridgeconfig.BackfillQueueConfig{MaxBatches: 3, MaxBatchesOverride: map[string]int{"dm": 7}}
+	if got := backfillMaxBatches(&onlyDM, true); got != 7 {
+		t.Errorf("DM with dm key = %d, want 7", got)
+	}
+	if got := backfillMaxBatches(&onlyDM, false); got != 3 {
+		t.Errorf("channel without channel key = %d, want max_batches 3", got)
+	}
+
+	none := bridgeconfig.BackfillQueueConfig{MaxBatches: 5}
+	if got := backfillMaxBatches(&none, true); got != 5 {
+		t.Errorf("DM without overrides = %d, want 5", got)
+	}
+	if got := backfillMaxBatches(&none, false); got != 5 {
+		t.Errorf("channel without overrides = %d, want 5", got)
 	}
 }

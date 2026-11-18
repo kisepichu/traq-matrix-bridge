@@ -166,6 +166,17 @@ Matrix で room に既読を付ける、message を送る、reaction を付け�
 
 起動時と WebSocket の再接続時に、未読のあるチャンネル、切断中に投稿のあったチャンネル、全 DM について、bridge が知る最新の message より後を取り込む (`backfill.enabled: true` が要る)。1 portal で `backfill.max_catchup_messages` 件を超えた分は古い方から入らない。
 
+### 古い履歴 (backward backfill)
+
+Beeper では、room を作るときに入る `backfill.max_initial_messages` 件より古い履歴は backward backfill queue (`backfill.queue`) が埋める。portal ごとに何 batch まで遡るかは `backfill.queue.max_batches_override` の key で決まる。
+
+| portal | key |
+| --- | --- |
+| 公開チャンネル | `channel` |
+| DM | `dm` |
+
+該当する key が無ければ `backfill.queue.max_batches` を使う。負の値は無制限、`0` は遡らない。bbctl の既定は channel が 10 batch、DM が無制限 (`-1`) で、`max_batches` は `0`。1 batch の件数は `backfill.queue.batch_size`。
+
 ### 既読
 
 - Matrix で既読を付けると、traQ のチャンネル全体が既読になる (traQ の既読はチャンネル単位なので、途中まで読んだときも全部既読になる)。
