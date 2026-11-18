@@ -296,10 +296,15 @@ func (c *TraQClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridge
 }
 
 // HandleMatrixReadReceipt marks the whole channel read (traQ has no per-message read state) and makes it
-// the viewed channel.
+// the viewed channel. The echo of a receipt bridged from traQ is ignored (see ownReceipt): the channel is
+// already read on traQ, and the user did nothing on Matrix.
 func (c *TraQClient) HandleMatrixReadReceipt(ctx context.Context, msg *bridgev2.MatrixReadReceipt) error {
 	if c.API == nil {
 		return bridgev2.ErrNotLoggedIn
+	}
+	if c.ownReceipts.isEcho(msg.Portal.PortalKey, msg.ExactMessage) {
+		zerolog.Ctx(ctx).Debug().Msg("Ignoring the echo of the read receipt bridged from traQ")
+		return nil
 	}
 	channelID := ChannelID(msg.Portal.PortalKey)
 	c.view.Touch(ctx, channelID)

@@ -386,15 +386,7 @@ func (c *TraQClient) handleMessageRead(ctx context.Context, evt traq.Event) erro
 	if !ok || me == nil {
 		return nil
 	}
-	c.queue(&simplevent.Receipt{
-		EventMeta: simplevent.EventMeta{
-			Type:       bridgev2.RemoteEventReadReceipt,
-			LogContext: func(lc zerolog.Context) zerolog.Context { return lc.Str("traq_channel_id", body.ID) },
-			PortalKey:  key,
-			Sender:     c.selfSender(me),
-		},
-		ReadUpTo: time.Now(),
-	})
+	c.queue(c.ownReceipt(key, me, func(lc zerolog.Context) zerolog.Context { return lc.Str("traq_channel_id", body.ID) }, time.Now()))
 	return nil
 }
 

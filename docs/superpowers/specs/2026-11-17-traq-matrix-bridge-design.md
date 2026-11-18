@@ -305,6 +305,15 @@ traQ の WebSocket は event ごとに届く相手が違う。
 - **traQ → Matrix**: `MESSAGE_READ` で、その room の最新の bridge 済み message に自分の read receipt を付ける (double puppet)。
 - **接続時**: `/users/me/unread` に無い portal は最新 message まで既読にする (その portal の作成・更新の直後に)。
   bridge 済みの message が 1 つも無い portal は飛ばす (既読にするものが無く、新しい room は過去ログの取り込みが既読を付ける)。
+- **自分の receipt の echo**: traQ → Matrix と接続時の receipt は homeserver から Matrix の receipt として戻ってくる。
+  bridgev2 は receipt の extra content の目印 (`fi.mau.double_puppet_source`) でこの echo を捨てるが、Synapse は
+  extra を保存しないので目印が消え、echo が Matrix の既読として届く。そのまま扱うと `readChannel` に加えて
+  viewstate がそのチャンネルに移り、traQ が新着を未読に数えなくなる (次に traQ で読んでも `MESSAGE_READ` が来ない)。
+  そこで receipt の対象 message を connector が自分で決める: bridgev2 がその receipt を処理する直前に、portal の
+  event loop の中で bridgev2 と同じ query (`ReadUpTo` 以前で最新の bridge 済み message) で引き、receipt の対象に
+  指定して、portal ごとに 1 件 (対象 message の時刻、送った時刻) を覚える。送ってから 2 分以内に届いた Matrix の
+  receipt が、その対象か、それより古い message に付いたものなら echo とみなし、`readChannel` も viewstate も
+  送らずに捨てる。新しい message への receipt と、2 分を過ぎた receipt は今までどおり扱う。
 
 ## 検索
 

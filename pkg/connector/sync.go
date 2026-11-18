@@ -341,15 +341,7 @@ func (c *TraQClient) initialSync(ctx context.Context, l loaded) {
 			r.needsBackfill = c.newerMessages(id)
 		}
 		if !isUnread && c.hasBridgedMessages(id) {
-			r.after = append(r.after, &simplevent.Receipt{
-				EventMeta: simplevent.EventMeta{
-					Type:       bridgev2.RemoteEventReadReceipt,
-					LogContext: channelLogContext(ch),
-					PortalKey:  key,
-					Sender:     c.selfSender(l.me),
-				},
-				ReadUpTo: now,
-			})
+			r.after = append(r.after, c.ownReceipt(key, l.me, channelLogContext(ch), now))
 		}
 		c.addResync(ctx, r)
 		resyncs++
