@@ -9,6 +9,8 @@ import (
 
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/bridgeconfig"
+	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 
 	"github.com/kisepichu/traq-matrix-bridge/pkg/traq"
@@ -18,6 +20,24 @@ import (
 const maxMessagesPerFetch = 200
 
 var _ bridgev2.BackfillingNetworkAPI = (*TraQClient)(nil)
+var _ bridgev2.BackfillingNetworkAPIWithLimits = (*TraQClient)(nil)
+
+// backfillMaxBatches is the backward backfill batch limit of a portal: the max_batches_override of "dm" or
+// "channel", else max_batches. Negative means unlimited, and 0 means no backward backfill at all.
+func backfillMaxBatches(q *bridgeconfig.BackfillQueueConfig, isDM bool) int {
+	if isDM {
+		return q.GetOverride("dm")
+	}
+	return q.GetOverride("channel")
+}
+
+// GetBackfillMaxBatchCount implements bridgev2.BackfillingNetworkAPIWithLimits. Without it bridgev2 uses
+// max_batches (0 in bbctl's config) for every portal, and each backward task is re-dispatched endlessly
+// while backfilling nothing.
+func (c *TraQClient) GetBackfillMaxBatchCount(_ context.Context, portal *bridgev2.Portal, _ *database.BackfillTask) int {
+	meta, _ := portal.Metadata.(*PortalMetadata)
+	return backfillMaxBatches(&portal.Bridge.Config.Backfill.Queue, meta != nil && meta.IsDM)
+}
 
 // encodeCursor is the pagination cursor for a backward fetch: the CreatedAt of the oldest message returned,
 // in RFC 3339 with nanoseconds.
