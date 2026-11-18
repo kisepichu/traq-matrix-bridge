@@ -66,7 +66,7 @@ traq-matrix-bridge -c config.yaml -e                        # 設定の例を co
 $EDITOR config.yaml                                         # homeserver、appservice、database、bridge.permissions、network: 節 (下の「設定」)
 traq-matrix-bridge -c config.yaml -r registration.yaml -g   # registration.yaml を作り、as_token / hs_token を config.yaml に書き戻す
 # registration.yaml を homeserver に登録して homeserver を再起動する (Synapse なら app_service_config_files)
-traq-matrix-bridge -c config.yaml -r registration.yaml      # 起動
+traq-matrix-bridge -c config.yaml      # 起動
 ```
 
 #### Beeper (bbctl)
@@ -144,7 +144,7 @@ traQ は refresh token を出さず、access token の有効期間は 1 年。to
 
 - room にするのは、購読レベル 1 (未読管理) 以上のチャンネルと DM。room 名はチャンネルのフルパス (`gps/times/kise`)、DM は相手の表示名。
 - 購読レベル 2 (未読管理 + 通知) は通常の room、1 は通知を切った room (double puppeting が要る)。
-- 購読を 0 にしたチャンネルは room を消す。room の Matrix の履歴と bridge の記録も消える。購読し直すと room を作り直し、`max_initial_messages` 件だけ取り込み直す。1 回の読み直しで公開チャンネルの room の半分より多く (かつ 5 件以上) が消える答えは、traQ の一時的な異常とみなしてその回は消さず、warning を log に出す。次の読み直しでも同じなら消す。
+- 購読を 0 にしたチャンネルは、その room に他の login がいなければ room を消す (`bridge.split_portals: false` で複数の login が公開チャンネルの portal を共有しているときは、他の login のために room が残る)。room の Matrix の履歴と bridge の記録も消える。購読し直すと room を作り直し、`max_initial_messages` 件だけ取り込み直す。1 回の読み直しで公開チャンネルの room の半分より多く (かつ 5 件以上) が消える応答は、traQ の一時的な異常とみなしてその回は消さず、warning を log に出す。購読が 1 件もない snapshot で公開 portal が消える場合も同様に保留する。次の読み直しでも同じなら消す。
 - 購読状態は接続時と `subscription_sync_interval` ごとに読む。チャンネルの変更 event (`CHANNEL_UPDATED` / `DELETED`) でも読み直す (前回から 30 秒は空ける)。traQ で自分の購読レベルを変えたことは、次の読み直しか再接続のときに反映する。
 - DM の room は遅延して作る。接続時に作るのは未読のある DM だけで、他は最初の新着で作る (traQ は DM のページを開いただけで DM チャンネルを作るため)。
 - room の作成・更新は 1 秒に 4 件までに抑える。購読の多い account では、最初の login から全部の room ができるまで時間がかかる。
@@ -185,7 +185,7 @@ traQ の画像は `m.image`、それ以外は `m.file` として本文とは別�
 
 ## 検索
 
-bot の `search <query>` が traQ の message を検索し、新しい順に最大 20 件を返す。management room でも portal の room でも使える (portal では、その room の login で検索する)。
+bot の `search <query>` が traQ の message を検索し、新しい順に最大 20 件を返す。management room では prefix なしで使えるが、それ以外の room では `!traq search <query>` と prefix を付ける (既定の prefix は `!traq`)。portal では、その room の login で検索する。
 
 ```
 search in:#gps/times from:@bob hello
@@ -193,7 +193,7 @@ search "two words" from:@alice
 ```
 
 - `in:#<チャンネルのフルパス>` でチャンネル、`from:@<ID>` で投稿者を絞る。残りが検索語 (`"..."` で空白を含む語を 1 語にできる)。
-- 1 件 1 行: `#チャンネル  @user  日時  抜粋  link`。link は bridge 済みの message なら Matrix の event、そうでなければ traQ の URL。
+- 1 件 1 行: `#チャンネル  @user  日時  抜粋  link`。DM の hit は `#チャンネル` の代わりに `DM` と出す。link は bridge 済みの message なら Matrix の event、そうでなければ traQ の URL。
 - 日時は bridge の process の time zone で出す。container で動かすなら `TZ` (例: `TZ=Asia/Tokyo`) を設定する。
 - traQ の検索は Elasticsearch が index してから効くので、投稿直後の message は出ないことがある。検索機能が無効な traQ ではそう返す。
 
