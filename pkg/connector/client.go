@@ -86,6 +86,8 @@ type TraQClient struct {
 	// viewPolls holds the channel the viewstate last switched to, for the poll loop to poll once (see
 	// requestViewPoll). Size 1.
 	viewPolls chan string
+	// ownReceipts remembers the read receipts bridged from traQ, to ignore their echo (see ownReceipt).
+	ownReceipts ownReceipts
 	// resyncs paces the portal resyncs of the running session; nil between sessions.
 	resyncs atomic.Pointer[resyncPacer]
 
